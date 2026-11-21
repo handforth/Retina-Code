@@ -34,6 +34,9 @@ Visual Studio 2012 Dark:
 <img width="832" height="646" alt="Screenshot 2026-11-21 at 9 52 35 AM" src="https://github.com/user-attachments/assets/15387282-9866-4f31-ad1e-dfe69882352f" />
 <img width="832" height="646" alt="image" src="https://github.com/user-attachments/assets/b792a7c8-7252-47cf-9b00-252898185a70" />
 
+## Building
+Run `./build.sh` in the project's root directory.
+
 ## Disclaimers
 All theme credits and licenses are in THEME_CREDITS.txt.
 AI Disclaimer: This project was made with Codex ChatGPT
