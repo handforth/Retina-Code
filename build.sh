@@ -15,6 +15,7 @@ elif [ -d /Library/Developer/CommandLineTools/SDKs/MacOSX26.sdk ]; then
     sdk=/Library/Developer/CommandLineTools/SDKs/MacOSX26.sdk
 fi
 
+set -x
 mkdir -p "$macos" "$resources"
 xcrun --sdk macosx clang++ \
     -std=c++20 -fobjc-arc -O2 -Wall -Wextra -Wpedantic \
