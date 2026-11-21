@@ -1,0 +1,27 @@
+# Build output
+/build/
+/out/
+/output/
+/dist/
+*.app/
+*.dSYM/
+*.o
+
+# Xcode and clangd
+/DerivedData/
+xcuserdata/
+*.xcuserstate
+/.cache/clangd/
+/compile_commands.json
+
+# Temporary files from Run
+.retina-code-*
+.source-editor-*
+
+# macOS metadata and editor backups
+.DS_Store
+.AppleDouble/
+._*
+*.swp
+*.swo
+*~
