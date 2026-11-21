@@ -746,8 +746,8 @@ struct BuildError {
     bool paletteChanged = !_theme || _theme->ink != theme->ink;
     bool italicChanged = !_theme || _theme->italicTypes != theme->italicTypes ||
                          _theme->italicComments != theme->italicComments;
-    auto previousBrackets = _bracketColors.count ? _theme->bracketColors : std::span<const uint32_t>{};
-    auto nextBrackets = brackets ? theme->bracketColors : std::span<const uint32_t>{};
+    auto previousBrackets = _bracketColors.count ? _theme->bracketColors : std::span<const Col32>{};
+    auto nextBrackets = brackets ? theme->bracketColors : std::span<const Col32>{};
     bool bracketsChanged = !std::ranges::equal(previousBrackets, nextBrackets);
     _theme = theme;
     if (!paletteChanged && !italicChanged && !bracketsChanged && _font == font && !restyle)
@@ -761,8 +761,8 @@ struct BuildError {
         [_storage addAttribute:NSFontAttributeName value:font range:NSMakeRange(0, _storage.length)];
     if (paletteChanged) {
         NSMutableArray<NSColor *> *colors = [NSMutableArray arrayWithCapacity:size_t(Ink::Count)];
-        for (uint32_t rgb : theme->ink)
-            [colors addObject:SRGBHex(rgb)];
+        for (Col32 color : theme->ink)
+            [colors addObject:SRGBColor(color)];
         _colors = colors;
     }
     if (bracketsChanged) {
@@ -774,8 +774,8 @@ struct BuildError {
             _bracketNodes.shrink_to_fit();
         } else {
             NSMutableArray<NSColor *> *colors = [NSMutableArray arrayWithCapacity:nextBrackets.size()];
-            for (uint32_t color : nextBrackets)
-                [colors addObject:SRGBHex(color)];
+            for (Col32 color : nextBrackets)
+                [colors addObject:SRGBColor(color)];
             _bracketColors = colors;
         }
     }
@@ -991,9 +991,9 @@ static constexpr NSUInteger completionLimit = 8;
 - (void)drawRect:(NSRect)dirty
 {
     const EditorAccents &accents = _theme->accents;
-    [SRGBHex(accents.completionBorder) setFill];
+    [SRGBColor(accents.completionBorder) setFill];
     NSRectFill(self.bounds);
-    [SRGBHex(accents.completionPaper) setFill];
+    [SRGBColor(accents.completionPaper) setFill];
     NSRectFill(NSInsetRect(self.bounds, 1, 1));
     for (NSUInteger i = 0; i < _items.count; ++i) {
         NSRect row = NSMakeRect(completionInset, completionInset + i * completionRowHeight,
@@ -1001,11 +1001,11 @@ static constexpr NSUInteger completionLimit = 8;
         if (!NSIntersectsRect(dirty, row))
             continue;
         if (i == _selectedRow) {
-            [SRGBHex(accents.completionSelection) setFill];
+            [SRGBColor(accents.completionSelection) setFill];
             NSRectFill(row);
         }
         _label.stringValue = _items[i];
-        _label.textColor = SRGBHex(i == _selectedRow ? accents.completionSelectedText : _theme->ink[size_t(Ink::Text)]);
+        _label.textColor = SRGBColor(i == _selectedRow ? accents.completionSelectedText : _theme->ink[size_t(Ink::Text)]);
         [_label drawInteriorWithFrame:NSInsetRect(row, 5, 0) inView:self];
     }
 }
@@ -1833,7 +1833,7 @@ static bool IdentifierAt(NSString *text, NSUInteger offset)
     NSUInteger end = std::min(NSMaxRange(characters) + padding, text.length);
     const Theme &theme = *self.theme;
     bool lisp = self.syntax.language == Language::CommonLisp;
-    [[SRGBHex(theme.accents.wordMatch) colorWithAlphaComponent:theme.dark ? 0.19 : 0.15] setFill];
+    [[SRGBColor(theme.accents.wordMatch) colorWithAlphaComponent:theme.dark ? 0.19 : 0.15] setFill];
     while (start < end && end - start >= _selectedWord.length) {
         NSRange match = [text rangeOfString:_selectedWord options:NSLiteralSearch range:NSMakeRange(start, end - start)];
         if (match.location == NSNotFound)
@@ -1922,13 +1922,13 @@ static bool IdentifierAt(NSString *text, NSUInteger offset)
         NSRect rect = NSIntersectionRect([self visibleBracketRect:_brackets.mate], dirty);
         if (!NSIsEmptyRect(rect)) {
             CGFloat fade = std::clamp(1 - (NSProcessInfo.processInfo.systemUptime - _bracketFlashStart) / 0.22, 0.0, 1.0);
-            [[SRGBHex(theme.accents.bracketMatch) colorWithAlphaComponent:0.32 * fade * fade] setFill];
+            [[SRGBColor(theme.accents.bracketMatch) colorWithAlphaComponent:0.32 * fade * fade] setFill];
             NSRectFillUsingOperation(rect, NSCompositingOperationSourceOver);
         }
         return;
     }
 
-    NSColor *outline = theme.dark || theme.blockCaretText ? SRGBHex(theme.accents.bracketMatch) : self.insertionPointColor;
+    NSColor *outline = theme.dark || theme.blockCaretText ? SRGBColor(theme.accents.bracketMatch) : self.insertionPointColor;
     [[outline colorWithAlphaComponent:theme.dark ? 0.48 : 0.38] setStroke];
     CGFloat scale = std::abs(CGContextGetCTM(NSGraphicsContext.currentContext.CGContext).d);
     for (NSUInteger position : {_brackets.at, _brackets.mate}) {
@@ -1942,16 +1942,16 @@ static bool IdentifierAt(NSString *text, NSUInteger offset)
     }
 }
 
-static NSColor *ContrastingSelectionColor(uint32_t background)
+static NSColor *ContrastingSelectionColor(Col32 background)
 {
-    auto linear = [](uint32_t channel) {
-        double value = (channel & 255U) / 255.0;
+    auto linear = [](uint8_t channel) {
+        double value = channel / 255.0;
         return value <= 0.04045 ? value / 12.92 : std::pow((value + 0.055) / 1.055, 2.4);
     };
-    double luminance = 0.2126 * linear(background >> 16) +
-                       0.7152 * linear(background >> 8) + 0.0722 * linear(background);
+    double luminance = 0.2126 * linear(ColorRed(background)) +
+                       0.7152 * linear(ColorGreen(background)) + 0.0722 * linear(ColorBlue(background));
     // At this luminance black and white have the same contrast.
-    return SRGBHex(luminance >= 0.17913 ? 0x000000 : 0xFFFFFF);
+    return SRGBColor(luminance >= 0.17913 ? rgb(0, 0, 0) : rgb(255, 255, 255));
 }
 
 - (void)applyAppearance
@@ -1966,9 +1966,9 @@ static NSColor *ContrastingSelectionColor(uint32_t background)
     const Theme *theme = _palette.get();
     self.theme = theme;
     self.rendering = RenderingPreference();
-    self.backgroundColor = SRGBHex(theme->paper);
-    self.insertionPointColor = SRGBHex(theme->caret == automaticCaret ? theme->ink[size_t(Ink::Text)] : theme->caret);
-    NSColor *selection = SRGBHex(theme->selection);
+    self.backgroundColor = SRGBColor(theme->paper);
+    self.insertionPointColor = SRGBColor(theme->caret.value_or(theme->ink[size_t(Ink::Text)]));
+    NSColor *selection = SRGBColor(theme->selection);
     if (theme->contrastingSelectionText) {
         self.selectedTextAttributes = @{NSBackgroundColorAttributeName:selection,
                                         NSForegroundColorAttributeName:ContrastingSelectionColor(theme->selection)};
@@ -1998,14 +1998,14 @@ static NSColor *ContrastingSelectionColor(uint32_t background)
             self.font = font;
         }
         self.typingAttributes = @{NSFontAttributeName:font, NSParagraphStyleAttributeName:paragraph,
-                                  NSForegroundColorAttributeName:SRGBHex(theme->ink[size_t(Ink::Text)]),
+                                  NSForegroundColorAttributeName:SRGBColor(theme->ink[size_t(Ink::Text)]),
                                   NSLigatureAttributeName:@0};
         _editorFont = font;
         _fontTabStop = tabStop;
     } else {
         NSMutableDictionary *typing = [self.typingAttributes mutableCopy];
         typing[NSFontAttributeName] = _editorFont;
-        typing[NSForegroundColorAttributeName] = SRGBHex(theme->ink[size_t(Ink::Text)]);
+        typing[NSForegroundColorAttributeName] = SRGBColor(theme->ink[size_t(Ink::Text)]);
         self.typingAttributes = typing;
     }
     [self.syntax setPalette:_palette font:_editorFont restyle:typographyChanged
@@ -2031,7 +2031,7 @@ static NSColor *ContrastingSelectionColor(uint32_t background)
     NSRange characters = [layout characterRangeForGlyphRange:glyphs actualGlyphRange:nullptr];
     NSUInteger last = NSNotFound;
     const auto &hidden = [layout hiddenEditorRanges];
-    NSDictionary *ink = @{NSFontAttributeName:self.editorFont, NSForegroundColorAttributeName:SRGBHex(self.theme->lineNumber)};
+    NSDictionary *ink = @{NSFontAttributeName:self.editorFont, NSForegroundColorAttributeName:SRGBColor(self.theme->lineNumber)};
     for (const auto &fold : folds) {
         if (fold.header >= NSMaxRange(characters))
             break;
@@ -2125,7 +2125,7 @@ static NSColor *ContrastingSelectionColor(uint32_t background)
         NSRect underline = NSMakeRect(NSMinX(rect), NSMaxY(rect) - 2, NSWidth(rect), 2);
         if (!NSIntersectsRect(underline, dirty))
             return;
-        [SRGBHex(self.theme->dark ? 0xFF5353 : 0xD21923) setStroke];
+        [SRGBColor(self.theme->dark ? rgb(255, 83, 83) : rgb(210, 25, 35)) setStroke];
         constexpr CGFloat amplitude = 0.5;
         CGFloat y = NSMidY(underline);
         CGFloat start = NSMinX(rect);
@@ -2149,7 +2149,7 @@ static NSColor *ContrastingSelectionColor(uint32_t background)
     NSPoint origin = self.textContainerOrigin;
     NSString *source = self.string;
     NSColor *fill = self.insertionPointColor;
-    NSColor *ink = SRGBHex(*self.theme->blockCaretText);
+    NSColor *ink = SRGBColor(*self.theme->blockCaretText);
     CGContextRef context = NSGraphicsContext.currentContext.CGContext;
     for (const auto &caret : carets) {
         NSRect box = [self backingAlignedRect:caret.rect options:NSAlignAllEdgesNearest];
@@ -2182,7 +2182,7 @@ static NSColor *ContrastingSelectionColor(uint32_t background)
         [self.backgroundColor setFill];
         NSRectFill(rect);
         if (self.theme && NSIntersectsRect(self.currentLine, rect)) {
-            [SRGBHex(self.theme->line) setFill];
+            [SRGBColor(self.theme->line) setFill];
             NSRectFill(NSIntersectionRect(self.currentLine, rect));
         }
         [self drawWordOccurrences:rect];
@@ -2202,8 +2202,8 @@ static NSColor *ContrastingSelectionColor(uint32_t background)
         }
         size_t firstColoredRange = activeSelection ? 0 : selections.size();
         if (self.vimEnabled || self.cursorCount > 1) {
-            NSColor *flash = SRGBHex(self.theme->accents.vimFlash);
-            [self drawVimOverlays:rect selection:SRGBHex(self.theme->selection) flash:flash
+            NSColor *flash = SRGBColor(self.theme->accents.vimFlash);
+            [self drawVimOverlays:rect selection:SRGBColor(self.theme->selection) flash:flash
                    selectedRanges:showWhitespace || selectionColor ? &selections : nullptr
                       blockCarets:self.theme->blockCaretText ? &blockCarets : nullptr];
         }
@@ -2347,7 +2347,7 @@ NSView *CreateEditorPreview()
         return;
     RenderSettings settings{.smoothing = Smoothing::System, .saturation = self.editor.rendering.saturation,
                             .brightness = self.editor.rendering.brightness};
-    DrawEditorSurface(self, dirty, settings, SRGBHex(theme->gutter), nil, ^(NSRect rect) {
+    DrawEditorSurface(self, dirty, settings, SRGBColor(theme->gutter), nil, ^(NSRect rect) {
         [self drawNumbersInRect:rect];
     });
 }
@@ -2357,9 +2357,9 @@ NSView *CreateEditorPreview()
     CodeView *editor = self.editor;
     SyntaxBuffer *buffer = self.buffer;
     const Theme &theme = *editor.theme;
-    [SRGBHex(theme.gutter) setFill];
+    [SRGBColor(theme.gutter) setFill];
     NSRectFill(dirty);
-    [SRGBHex(theme.rule) setFill];
+    [SRGBColor(theme.rule) setFill];
     NSRectFill(NSMakeRect(NSWidth(self.bounds) - 1, NSMinY(dirty), 1, NSHeight(dirty)));
 
     NSLayoutManager *layout = editor.layoutManager;
@@ -2370,8 +2370,8 @@ NSView *CreateEditorPreview()
     NSRange glyphs = [layout glyphRangeForBoundingRect:area inTextContainer:container];
     NSUInteger current = [buffer lineForOffset:std::min(editor.vimDisplayedCursor, editor.string.length)];
     NSFont *font = self.numberFont;
-    NSDictionary *numberInk = @{NSFontAttributeName:font, NSForegroundColorAttributeName:SRGBHex(theme.lineNumber)};
-    NSDictionary *activeInk = @{NSFontAttributeName:font, NSForegroundColorAttributeName:SRGBHex(theme.activeNumber)};
+    NSDictionary *numberInk = @{NSFontAttributeName:font, NSForegroundColorAttributeName:SRGBColor(theme.lineNumber)};
+    NSDictionary *activeInk = @{NSFontAttributeName:font, NSForegroundColorAttributeName:SRGBColor(theme.activeNumber)};
     CGContextRef context = NSGraphicsContext.currentContext.CGContext;
     CGFloat scale = std::abs(CGContextGetCTM(context).d);
 
@@ -2437,8 +2437,8 @@ NSView *CreateEditorPreview()
             NSAppearanceNameAqua, NSAppearanceNameDarkAqua
         ]];
         BOOL dark = [appearance isEqualToString:NSAppearanceNameDarkAqua];
-        _gradient = [[NSGradient alloc] initWithStartingColor:SRGBHex(dark ? 0x36373A : 0xF2F2F3)
-                                                   endingColor:SRGBHex(dark ? 0x292A2D : 0xE1E1E4)];
+        _gradient = [[NSGradient alloc] initWithStartingColor:SRGBColor(dark ? rgb(54, 55, 58) : rgb(242, 242, 243))
+                                                   endingColor:SRGBColor(dark ? rgb(41, 42, 45) : rgb(225, 225, 228))];
     }
     NSRect bounds = self.bounds;
     [_gradient drawInRect:bounds angle:-90];
@@ -2466,7 +2466,7 @@ static void SetRunButton(NSButton *button, BOOL running)
     NSImage *symbol = [NSImage imageWithSystemSymbolName:running ? @"stop.fill" : @"play.fill" accessibilityDescription:title];
     NSImageSymbolConfiguration *size = [NSImageSymbolConfiguration configurationWithPointSize:18 weight:NSFontWeightRegular];
     button.image = [symbol imageWithSymbolConfiguration:size];
-    button.contentTintColor = running ? nil : SRGBHex(0x2E9445);
+    button.contentTintColor = running ? nil : SRGBColor(rgb(46, 148, 69));
     button.accessibilityLabel = title;
     button.toolTip = title;
 }
@@ -3751,7 +3751,7 @@ static char selectedOutputTabContext;
                          NSForegroundColorAttributeName:_position.textColor}];
         if (promptCaret < prompt.length)
             [prompt addAttribute:NSBackgroundColorAttributeName
-                           value:SRGBHex(editor.theme->accents.commandCaret) range:NSMakeRange(promptCaret, 1)];
+                           value:SRGBColor(editor.theme->accents.commandCaret) range:NSMakeRange(promptCaret, 1)];
         _position.attributedStringValue = prompt;
     } else if (editor.vimCommandLine)
         _position.stringValue = editor.vimStatus;
@@ -3960,10 +3960,10 @@ static char selectedOutputTabContext;
     ]];
     BOOL dark = [appearance isEqualToString:NSAppearanceNameDarkAqua];
     NSRect bounds = self.bounds;
-    NSGradient *gradient = [[NSGradient alloc] initWithStartingColor:SRGBHex(dark ? 0x48494C : 0xF5F5F5)
-                                                        endingColor:SRGBHex(dark ? 0x29292C : 0xC7C7CA)];
+    NSGradient *gradient = [[NSGradient alloc] initWithStartingColor:SRGBColor(dark ? rgb(72, 73, 76) : rgb(245, 245, 245))
+                                                        endingColor:SRGBColor(dark ? rgb(41, 41, 44) : rgb(199, 199, 202))];
     [gradient drawInRect:bounds angle:-90];
-    [SRGBHex(dark ? 0x18181A : 0xA4A4A8) setFill];
+    [SRGBColor(dark ? rgb(24, 24, 26) : rgb(164, 164, 168)) setFill];
     NSRectFill(NSIntersectionRect(dirty, NSMakeRect(0, 0, NSWidth(bounds), 1)));
 }
 
@@ -4430,7 +4430,7 @@ static NSMutableSet<SourceWindowController *> *EmptyProjectWindows()
 - (void)drawRect:(NSRect)dirty
 {
     auto palette = _themePreview ? _themePreview : SelectedTheme();
-    [SRGBHex(palette->paper) setFill];
+    [SRGBColor(palette->paper) setFill];
     NSRectFill(dirty);
 }
 

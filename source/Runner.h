@@ -5,8 +5,9 @@
 
 enum class OutputTone { Text, Warning, Error };
 
-inline constexpr uint32_t defaultOutputColor = 0xFFFFFFFF;
-inline constexpr uint32_t outputPaletteStart = 0x1000000;
+// ANSI truecolors are opaque RGBA. The low values hold the default and palette indices.
+inline constexpr uint32_t defaultOutputColor = 0;
+inline constexpr uint32_t outputPaletteStart = 1;
 
 struct OutputColors {
     uint32_t foreground = defaultOutputColor;

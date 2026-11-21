@@ -1,4 +1,5 @@
 #import "Runner.h"
+#include "Color.h"
 #import "Preferences.h"
 #import "Workspace.h"
 
@@ -600,7 +601,7 @@ static uint32_t ExtendedOutputColor(std::string_view &parameters, char separator
     int blue = ColorParameter(TakeColorParameter(parameters, separator));
     if (red < 0 || green < 0 || blue < 0)
         return defaultOutputColor;
-    return uint32_t((red << 16) | (green << 8) | blue);
+    return rgb(red, green, blue);
 }
 
 struct TerminalDecoder {

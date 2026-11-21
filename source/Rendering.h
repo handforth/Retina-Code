@@ -1,6 +1,7 @@
 #pragma once
 
 #import <AppKit/AppKit.h>
+#include "Color.h"
 #include <span>
 #include <vector>
 
@@ -17,8 +18,8 @@ struct RenderSettings {
     WhitespaceMode whitespace = WhitespaceMode::None;
 };
 
-NSColor *SRGBHex(uint32_t rgb);
-NSColor *RenderedEditorColor(uint32_t rgb, const RenderSettings &settings);
+NSColor *SRGBColor(Col32 color);
+NSColor *RenderedEditorColor(Col32 color, const RenderSettings &settings);
 
 struct EditorFold {
     NSUInteger header;
@@ -35,6 +36,6 @@ struct EditorFold {
 
 void DrawEditorSurface(NSView *view, NSRect dirty, RenderSettings settings, NSColor *paper, CodeLayoutManager *layout,
                        void (^draw)(NSRect));
-void DrawEditorWhitespace(NSTextView *view, NSRect dirty, NSFont *font, WhitespaceMode mode, uint32_t color,
-                          uint32_t selectionBackground, std::vector<NSRange> &selections,
+void DrawEditorWhitespace(NSTextView *view, NSRect dirty, NSFont *font, WhitespaceMode mode, Col32 color,
+                          Col32 selectionBackground, std::vector<NSRange> &selections,
                           std::vector<NSRange> &inactiveSelections);

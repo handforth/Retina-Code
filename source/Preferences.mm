@@ -298,9 +298,10 @@ static constexpr size_t whitespaceColorIndex = 8;
 template<typename Palette>
 static auto ColorFields(Palette &theme)
 {
+    // Keep a slot for the optional caret in the existing color order.
     return std::array{
         &theme.paper, &theme.line, &theme.selection, &theme.gutter, &theme.rule, &theme.lineNumber,
-        &theme.activeNumber, &theme.caret, &theme.whitespace,
+        &theme.activeNumber, decltype(&theme.paper){}, &theme.whitespace,
         &theme.ink[size_t(Ink::Text)], &theme.ink[size_t(Ink::Keyword)], &theme.ink[size_t(Ink::Control)],
         &theme.ink[size_t(Ink::Type)], &theme.ink[size_t(Ink::Function)], &theme.ink[size_t(Ink::Name)],
         &theme.ink[size_t(Ink::String)], &theme.ink[size_t(Ink::Number)], &theme.ink[size_t(Ink::Comment)],
@@ -311,13 +312,31 @@ static auto ColorFields(Palette &theme)
     };
 }
 
+static std::optional<Col32> EditableThemeColor(const Theme &theme, const Col32 *field)
+{
+    return field ? std::optional{*field} : theme.caret;
+}
+
+static std::optional<Col32> SavedThemeColor(id value, bool packed)
+{
+    if (![value isKindOfClass:NSNumber.class])
+        return {};
+    auto color = [value unsignedLongLongValue];
+    if (packed)
+        return color <= UINT32_MAX ? std::optional{Col32(color)} : std::nullopt;
+    if (color > (UINT32_MAX >> 8))
+        return {};
+    // Earlier versions stored opaque colors as RRGGBB.
+    return rgb(color >> 16, color >> 8, color);
+}
+
 struct CustomTheme {
     NSString *identifier;
     NSString *title;
     Theme palette;
-    std::vector<uint32_t> brackets;
+    std::vector<Col32> brackets;
 
-    CustomTheme(NSString *identifier, NSString *title, Theme palette, std::vector<uint32_t> brackets)
+    CustomTheme(NSString *identifier, NSString *title, Theme palette, std::vector<Col32> brackets)
         : identifier([identifier copy]), title([title copy]), palette(palette), brackets(std::move(brackets))
     {
         this->palette.name = nullptr;
@@ -344,15 +363,17 @@ static auto &CustomThemes()
                 (values.count != fields.size() && values.count != fields.size() - 1))
                 continue;
 
-            bool legacyColors = values.count < fields.size();
+            bool packed = [row[@"colorFormat"] isEqual:@"RGBA"];
+            bool missingWhitespace = values.count < fields.size();
             bool hasWhitespaceColor = false;
             for (size_t i = 0; i < values.count; ++i) {
-                uint32_t *color = fields[i + (legacyColors && i >= whitespaceColorIndex)];
-                id value = values[i];
-                if ([value isKindOfClass:NSNumber.class] && [value unsignedLongLongValue] <=
-                    (color == &theme.caret ? automaticCaret : 0xFFFFFF)) {
-                    *color = [value unsignedIntValue];
-                    hasWhitespaceColor |= color == &theme.whitespace;
+                Col32 *field = fields[i + (missingWhitespace && i >= whitespaceColorIndex)];
+                auto color = SavedThemeColor(values[i], packed);
+                if (!field) {
+                    theme.caret = color;
+                } else if (color) {
+                    *field = *color;
+                    hasWhitespaceColor |= field == &theme.whitespace;
                 }
             }
             id dark = row[@"dark"];
@@ -364,16 +385,14 @@ static auto &CustomThemes()
             theme.italicComments = [italicComments isKindOfClass:NSNumber.class] && [italicComments boolValue];
             theme.contrastingSelectionText = [contrastingSelectionText isKindOfClass:NSNumber.class] &&
                                               [contrastingSelectionText boolValue];
-            id blockCaretText = row[@"blockCaretText"];
-            if ([blockCaretText isKindOfClass:NSNumber.class] && [blockCaretText unsignedLongLongValue] <= 0xFFFFFF)
-                theme.blockCaretText = [blockCaretText unsignedIntValue];
+            theme.blockCaretText = SavedThemeColor(row[@"blockCaretText"], packed);
             if (!hasWhitespaceColor)
                 theme.whitespace = DefaultWhitespaceColor(theme.paper, theme.line, theme.selection, theme.lineNumber, theme.dark);
-            std::vector<uint32_t> brackets;
+            std::vector<Col32> brackets;
             if ([row[@"brackets"] isKindOfClass:NSArray.class]) {
                 for (id value in row[@"brackets"]) {
-                    if ([value isKindOfClass:NSNumber.class] && [value unsignedLongLongValue] <= 0xFFFFFF)
-                        brackets.push_back([value unsignedIntValue]);
+                    if (auto color = SavedThemeColor(value, packed))
+                        brackets.push_back(*color);
                 }
             }
             list.push_back(std::make_shared<const CustomTheme>(identifier, title, theme, std::move(brackets)));
@@ -615,12 +634,15 @@ static void SaveCustomThemes()
     for (const auto &record : CustomThemes()) {
         auto fields = ColorFields(record->palette);
         NSMutableArray *colors = [NSMutableArray arrayWithCapacity:fields.size()];
-        for (auto field : fields)
-            [colors addObject:@(*field)];
+        for (auto field : fields) {
+            auto color = EditableThemeColor(record->palette, field);
+            [colors addObject:color ? @(*color) : @(-1)];
+        }
         NSMutableArray *brackets = [NSMutableArray arrayWithCapacity:record->brackets.size()];
-        for (uint32_t color : record->brackets)
+        for (Col32 color : record->brackets)
             [brackets addObject:@(color)];
         NSMutableDictionary *row = [@{@"id":record->identifier, @"name":record->title, @"colors":colors,
+            @"colorFormat":@"RGBA",
             @"dark":@(record->palette.dark), @"italicTypes":@(record->palette.italicTypes),
             @"italicComments":@(record->palette.italicComments), @"brackets":brackets} mutableCopy];
         if (record->palette.blockCaretText)
@@ -649,7 +671,7 @@ static NSString *UniqueThemeName(NSString *name, NSInteger except = -1)
     }
 }
 
-static NSInteger DuplicateTheme(NSInteger index, std::vector<uint32_t> brackets)
+static NSInteger DuplicateTheme(NSInteger index, std::vector<Col32> brackets)
 {
     auto theme = ThemeAt(index);
     NSString *title = UniqueThemeName([ThemeRowTitle(index) stringByAppendingString:@" Copy"]);
@@ -663,7 +685,7 @@ static NSInteger DuplicateTheme(NSInteger index, std::vector<uint32_t> brackets)
 }
 
 static void UpdateCustomTheme(NSInteger index, NSString *title, const Theme &theme,
-                              std::vector<uint32_t> brackets)
+                              std::vector<Col32> brackets)
 {
     if (!IsCustomTheme(index))
         return;
@@ -675,12 +697,12 @@ static void UpdateCustomTheme(NSInteger index, NSString *title, const Theme &the
     PublishPreferences();
 }
 
-static std::vector<uint32_t> CopyBrackets(const Theme &theme)
+static std::vector<Col32> CopyBrackets(const Theme &theme)
 {
     return {theme.bracketColors.begin(), theme.bracketColors.end()};
 }
 
-static void SetBracketPalette(NSInteger index, std::vector<uint32_t> brackets)
+static void SetBracketPalette(NSInteger index, std::vector<Col32> brackets)
 {
     if (!IsCustomTheme(index)) {
         DuplicateTheme(index, std::move(brackets));
@@ -690,16 +712,15 @@ static void SetBracketPalette(NSInteger index, std::vector<uint32_t> brackets)
     UpdateCustomTheme(index, ThemeRowTitle(index), *theme, std::move(brackets));
 }
 
-static std::optional<uint32_t> RGBValue(NSColor *color)
+static std::optional<Col32> RGBValue(NSColor *color)
 {
-    NSColor *rgb = [color colorUsingColorSpace:NSColorSpace.sRGBColorSpace];
-    if (!rgb)
+    NSColor *srgb = [color colorUsingColorSpace:NSColorSpace.sRGBColorSpace];
+    if (!srgb)
         return {};
     auto component = [](CGFloat value) {
-        return uint32_t(std::lround(std::clamp(value, CGFloat(0), CGFloat(1)) * 255));
+        return uint8_t(std::lround(std::clamp(value, CGFloat(0), CGFloat(1)) * 255));
     };
-    return (component(rgb.redComponent) << 16) | (component(rgb.greenComponent) << 8) |
-           component(rgb.blueComponent);
+    return rgb(component(srgb.redComponent), component(srgb.greenComponent), component(srgb.blueComponent));
 }
 
 void SetEditorPreference(NSString *key, id value)
@@ -1438,7 +1459,7 @@ static_assert(std::size(colorTitles) == std::tuple_size_v<decltype(ColorFields(s
         }
     }
     for (size_t i = 0; i < colors.size(); ++i)
-        _bracketWells[i].color = SRGBHex(colors[i]);
+        _bracketWells[i].color = SRGBColor(colors[i]);
     _bracketScroll.hidden = colors.empty();
     _removeBracket.hidden = colors.empty();
     CGFloat left = colors.empty() ? _bracketX : NSMaxX(_bracketScroll.frame) + 4;
@@ -1468,8 +1489,14 @@ static_assert(std::size(colorTitles) == std::tuple_size_v<decltype(ColorFields(s
     NSInteger index = ThemePreference();
     auto theme = ThemeAt(index);
     auto colors = CopyBrackets(*theme);
-    constexpr uint32_t light[] = {0x165A94, 0x773893, 0x8A6100, 0x176A4A, 0xA12D46, 0x006978};
-    constexpr uint32_t dark[] = {0x87CEFA, 0xDA70D6, 0xFFD700, 0x9DD384, 0xFFA58C, 0x7FD5CB};
+    constexpr Col32 light[] = {
+        rgb(22, 90, 148), rgb(119, 56, 147), rgb(138, 97, 0),
+        rgb(23, 106, 74), rgb(161, 45, 70), rgb(0, 105, 120),
+    };
+    constexpr Col32 dark[] = {
+        rgb(135, 206, 250), rgb(218, 112, 214), rgb(255, 215, 0),
+        rgb(157, 211, 132), rgb(255, 165, 140), rgb(127, 213, 203),
+    };
     auto level = colors.size();
     colors.push_back((theme->dark ? dark : light)[level % std::size(light)]);
     SetBracketPalette(index, std::move(colors));
@@ -1480,14 +1507,14 @@ static_assert(std::size(colorTitles) == std::tuple_size_v<decltype(ColorFields(s
 {
     NSInteger index = ThemePreference();
     auto theme = ThemeAt(index);
-    auto rgb = RGBValue(sender.color);
-    if (!rgb || index != _bracketTheme || sender.tag < 0 || size_t(sender.tag) >= theme->bracketColors.size() ||
-        theme->bracketColors[sender.tag] == *rgb)
+    auto color = RGBValue(sender.color);
+    if (!color || index != _bracketTheme || sender.tag < 0 || size_t(sender.tag) >= theme->bracketColors.size() ||
+        theme->bracketColors[sender.tag] == *color)
         return;
     NSUInteger level = sender.tag;
     bool keepActive = sender.isActive && !IsCustomTheme(index);
     auto colors = CopyBrackets(*theme);
-    colors[level] = *rgb;
+    colors[level] = *color;
     SetBracketPalette(index, std::move(colors));
     if (keepActive)
         [self chooseBracketColor:level];
@@ -1572,8 +1599,8 @@ static_assert(std::size(colorTitles) == std::tuple_size_v<decltype(ColorFields(s
         }
         Label(form, colorTitles[i], NSMakeRect(22, y + 1, formWidth - 105, 18), NSTextAlignmentLeft);
         NSColorWell *well = [[NSColorWell alloc] initWithFrame:NSMakeRect(formWidth - 68, y, 54, 21)];
-        uint32_t color = *fields[i];
-        well.color = SRGBHex(color == automaticCaret ? theme->ink[size_t(Ink::Text)] : color);
+        auto color = EditableThemeColor(*theme, fields[i]);
+        well.color = SRGBColor(color.value_or(theme->ink[size_t(Ink::Text)]));
         well.continuous = YES;
         well.tag = NSInteger(i);
         well.target = self;
@@ -1656,15 +1683,21 @@ static_assert(std::size(colorTitles) == std::tuple_size_v<decltype(ColorFields(s
 
 - (IBAction)changeThemeColor:(NSColorWell *)sender
 {
-    auto rgb = RGBValue(sender.color);
-    if (!rgb || !IsCustomTheme(_editingTheme))
+    auto color = RGBValue(sender.color);
+    if (!color || !IsCustomTheme(_editingTheme))
         return;
     auto source = ThemeAt(_editingTheme);
     Theme theme = *source;
     auto fields = ColorFields(theme);
-    if (sender.tag < 0 || size_t(sender.tag) >= fields.size() || *fields[sender.tag] == *rgb)
+    if (sender.tag < 0 || size_t(sender.tag) >= fields.size())
         return;
-    *fields[sender.tag] = *rgb;
+    Col32 *field = fields[sender.tag];
+    if (EditableThemeColor(theme, field) == color)
+        return;
+    if (field)
+        *field = *color;
+    else
+        theme.caret = color;
     UpdateCustomTheme(_editingTheme, ThemeRowTitle(_editingTheme), theme, CopyBrackets(*source));
 }
 

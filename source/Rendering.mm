@@ -10,11 +10,12 @@
 #include <utility>
 #include <vector>
 
-NSColor *SRGBHex(uint32_t rgb)
+NSColor *SRGBColor(Col32 color)
 {
-    return [NSColor colorWithSRGBRed:((rgb >> 16) & 255) / 255.0
-                              green:((rgb >> 8) & 255) / 255.0
-                               blue:(rgb & 255) / 255.0 alpha:1.0];
+    return [NSColor colorWithSRGBRed:ColorRed(color) / 255.0
+                              green:ColorGreen(color) / 255.0
+                               blue:ColorBlue(color) / 255.0
+                              alpha:ColorAlpha(color) / 255.0];
 }
 
 struct GlyphMask {
@@ -321,8 +322,9 @@ struct Surface {
     int height = 0;
 };
 
+template<bool translucent>
 static void BlendMask(const Surface &surface, const GlyphMask &mask, int x, int y,
-                      CGRect clip, const std::array<int, 3> &ink)
+                      CGRect clip, const std::array<int, 3> &ink, int opacity)
 {
     int left = x + mask.left;
     int top = surface.height - (y + mask.bottom + mask.height);
@@ -340,6 +342,8 @@ static void BlendMask(const Surface &surface, const GlyphMask &mask, int x, int 
         for (int column = firstX; column < lastX; ++column, pixel += 4, alpha += 3) {
             for (int channel = 0; channel < 3; ++channel) {
                 int coverage = alpha[channel];
+                if constexpr (translucent)
+                    coverage = (coverage * opacity + 127) / 255;
                 if (coverage)
                     pixel[channel] = uint8_t((pixel[channel] * (255 - coverage) +
                                              ink[channel] * coverage + 127) / 255);
@@ -606,7 +610,10 @@ static void MergeRanges(std::vector<NSRange> &ranges)
     NSColor *color = _glyphColor ? _glyphColor : attributes[NSForegroundColorAttributeName];
     color = [color colorUsingColorSpace:NSColorSpace.sRGBColorSpace];
     if (!color)
-        color = SRGBHex(0);
+        color = SRGBColor(rgb(0, 0, 0));
+    int opacity = int(std::lround(color.alphaComponent * 255));
+    if (!opacity)
+        return;
     std::array<int, 3> ink = {int(std::lround(color.redComponent * 255)),
                              int(std::lround(color.greenComponent * 255)),
                              int(std::lround(color.blueComponent * 255))};
@@ -637,8 +644,10 @@ static void MergeRanges(std::vector<NSRange> &ranges)
         if (mask->width < 0) {
             [color setFill];
             DrawCoreText(entry->coreFont, glyphs + i, positions + i, 1, textMatrix, context);
+        } else if (opacity == 255) {
+            BlendMask<false>(_surface, *mask, x, y, clip, ink, opacity);
         } else {
-            BlendMask(_surface, *mask, x, y, clip, ink);
+            BlendMask<true>(_surface, *mask, x, y, clip, ink, opacity);
         }
     }
 }
@@ -660,17 +669,17 @@ static uint8_t BrightnessLevel(int channel, int brightness)
     return uint8_t(std::clamp((channel * brightness + 128) >> 8, 0, 255));
 }
 
-NSColor *RenderedEditorColor(uint32_t rgb, const RenderSettings &settings)
+NSColor *RenderedEditorColor(Col32 color, const RenderSettings &settings)
 {
     int saturation = int(std::lround(settings.saturation * 256));
     int brightness = int(std::lround(settings.brightness * 256));
-    int gray = GrayLevel((rgb >> 16) & 255, (rgb >> 8) & 255, rgb & 255);
-    uint32_t filtered = 0;
+    int gray = GrayLevel(ColorRed(color), ColorGreen(color), ColorBlue(color));
+    Col32 filtered = Col32(ColorAlpha(color)) << 24;
     for (unsigned shift : {0U, 8U, 16U}) {
-        int channel = SaturatedChannel((rgb >> shift) & 255, gray, saturation);
-        filtered |= uint32_t(BrightnessLevel(channel, brightness)) << shift;
+        int channel = SaturatedChannel(uint8_t(color >> shift), gray, saturation);
+        filtered |= Col32(BrightnessLevel(channel, brightness)) << shift;
     }
-    return SRGBHex(filtered);
+    return SRGBColor(filtered);
 }
 
 template<bool adjustBrightness>
@@ -841,12 +850,12 @@ static NSColor *SelectedWhitespaceColor(NSColor *background)
     NSColor *rgb = [background colorUsingColorSpace:NSColorSpace.sRGBColorSpace];
     CGFloat brightness = 0.2126 * rgb.redComponent + 0.7152 * rgb.greenComponent + 0.0722 * rgb.blueComponent;
     if (brightness > 0.54)
-        return [SRGBHex(0x000000) colorWithAlphaComponent:0.32];
-    return [SRGBHex(0xFFFFFF) colorWithAlphaComponent:0.38];
+        return SRGBColor(rgba(0, 0, 0, 0.32f));
+    return SRGBColor(rgba(255, 255, 255, 0.38f));
 }
 
-void DrawEditorWhitespace(NSTextView *view, NSRect dirty, NSFont *font, WhitespaceMode mode, uint32_t color,
-                          uint32_t selectionBackground, std::vector<NSRange> &selections,
+void DrawEditorWhitespace(NSTextView *view, NSRect dirty, NSFont *font, WhitespaceMode mode, Col32 color,
+                          Col32 selectionBackground, std::vector<NSRange> &selections,
                           std::vector<NSRange> &inactiveSelections)
 {
     if (mode == WhitespaceMode::None ||
@@ -890,8 +899,8 @@ void DrawEditorWhitespace(NSTextView *view, NSRect dirty, NSFont *font, Whitespa
     CGContextSetBlendMode(context, kCGBlendModeNormal);
     enum MarkColor { Ordinary, Selected, Inactive, MarkColorCount };
     std::array<NSColor *, MarkColorCount> inks = {
-        SRGBHex(color),
-        selections.empty() ? nil : SelectedWhitespaceColor(SRGBHex(selectionBackground)),
+        SRGBColor(color),
+        selections.empty() ? nil : SelectedWhitespaceColor(SRGBColor(selectionBackground)),
         inactiveSelections.empty() ? nil : SelectedWhitespaceColor(NSColor.unemphasizedSelectedTextBackgroundColor),
     };
     // Solid theme ink is the default. Selected marks blend into the selection.

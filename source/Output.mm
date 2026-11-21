@@ -10,26 +10,30 @@ static NSAttributedStringKey const outputBackgroundKey = @"RetinaCodeTerminalBac
 
 static NSColor *TerminalColor(uint32_t color, BOOL dark)
 {
-    if (color < outputPaletteStart)
-        return SRGBHex(color);
-    constexpr uint32_t darkPalette[] = {
-        0x000000, 0xDF4A44, 0x4DB864, 0xD3AD38, 0x588BE4, 0xBC69D7, 0x47ADB5, 0xCCCCCC,
-        0x808080, 0xFF5555, 0x69DE83, 0xFFD94D, 0x7BA9FF, 0xE592FF, 0x71D9DF, 0xFFFFFF,
+    if (ColorAlpha(color) == 255)
+        return SRGBColor(color);
+    constexpr Col32 darkPalette[] = {
+        rgb(0, 0, 0), rgb(223, 74, 68), rgb(77, 184, 100), rgb(211, 173, 56),
+        rgb(88, 139, 228), rgb(188, 105, 215), rgb(71, 173, 181), rgb(204, 204, 204),
+        rgb(128, 128, 128), rgb(255, 85, 85), rgb(105, 222, 131), rgb(255, 217, 77),
+        rgb(123, 169, 255), rgb(229, 146, 255), rgb(113, 217, 223), rgb(255, 255, 255),
     };
-    constexpr uint32_t lightPalette[] = {
-        0x000000, 0xA51A21, 0x14632C, 0x765600, 0x234997, 0x80248D, 0x136A73, 0x666666,
-        0x666666, 0xC4252C, 0x207B37, 0x876100, 0x315AC0, 0x9639A4, 0x127985, 0xFFFFFF,
+    constexpr Col32 lightPalette[] = {
+        rgb(0, 0, 0), rgb(165, 26, 33), rgb(20, 99, 44), rgb(118, 86, 0),
+        rgb(35, 73, 151), rgb(128, 36, 141), rgb(19, 106, 115), rgb(102, 102, 102),
+        rgb(102, 102, 102), rgb(196, 37, 44), rgb(32, 123, 55), rgb(135, 97, 0),
+        rgb(49, 90, 192), rgb(150, 57, 164), rgb(18, 121, 133), rgb(255, 255, 255),
     };
     uint32_t index = color - outputPaletteStart;
     if (index < 16)
-        return SRGBHex((dark ? darkPalette : lightPalette)[index]);
+        return SRGBColor((dark ? darkPalette : lightPalette)[index]);
     if (index < 232) {
         constexpr uint32_t levels[] = {0, 95, 135, 175, 215, 255};
         index -= 16;
-        return SRGBHex((levels[index / 36] << 16) | (levels[index / 6 % 6] << 8) | levels[index % 6]);
+        return SRGBColor(rgb(levels[index / 36], levels[index / 6 % 6], levels[index % 6]));
     }
     uint32_t gray = 8 + (index - 232) * 10;
-    return SRGBHex(gray * 0x010101);
+    return SRGBColor(rgb(gray, gray, gray));
 }
 
 static void SetTerminalColor(NSTextStorage *storage, NSRange range, uint32_t color, BOOL dark,
@@ -243,7 +247,7 @@ static bool OutputLineEnding(unichar character)
     dirty = NSIntersectionRect(dirty, self.bounds);
     [_text.backgroundColor setFill];
     NSRectFill(dirty);
-    [SRGBHex(_dark ? 0x555555 : 0xA0A0A0) setFill];
+    [SRGBColor(_dark ? rgb(85, 85, 85) : rgb(160, 160, 160)) setFill];
     NSRectFill(NSIntersectionRect(dirty, NSMakeRect(0, NSHeight(self.bounds) - 1, NSWidth(self.bounds), 1)));
 }
 
@@ -506,14 +510,14 @@ static bool OutputLineEnding(unichar character)
         position = [self scrollPosition];
     if (colorChanged) {
         _dark = dark;
-        _colors = dark ? @[SRGBHex(0xFFFFFF), SRGBHex(0xFFD94D), SRGBHex(0xFF5555)] :
-                         @[SRGBHex(0x000000), SRGBHex(0x866200), SRGBHex(0xB8191F)];
-        NSColor *paper = SRGBHex(dark ? 0x000000 : 0xFFFFFF);
+        _colors = dark ? @[SRGBColor(rgb(255, 255, 255)), SRGBColor(rgb(255, 217, 77)), SRGBColor(rgb(255, 85, 85))] :
+                         @[SRGBColor(rgb(0, 0, 0)), SRGBColor(rgb(134, 98, 0)), SRGBColor(rgb(184, 25, 31))];
+        NSColor *paper = SRGBColor(dark ? rgb(0, 0, 0) : rgb(255, 255, 255));
         _scroll.backgroundColor = paper;
         _text.backgroundColor = paper;
         _text.insertionPointColor = _colors.firstObject;
         _scroll.appearance = [NSAppearance appearanceNamed:dark ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua];
-        _text.selectedTextAttributes = @{NSBackgroundColorAttributeName:SRGBHex(dark ? 0x333F55 : 0xBDD6F7)};
+        _text.selectedTextAttributes = @{NSBackgroundColorAttributeName:SRGBColor(dark ? rgb(51, 63, 85) : rgb(189, 214, 247))};
     }
     NSTextStorage *storage = _text.textStorage;
     NSRange all = NSMakeRange(0, storage.length);
