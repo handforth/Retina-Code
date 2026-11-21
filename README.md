@@ -1,5 +1,5 @@
 # Retina-Code
-A code editor for Mac, with nostalgic font rendering that feels like a 2013 MacBook
+A code editor for Mac, with nostalgic LCD font rendering of the 2013 MacBook era
 
 ## Settings
 You can tweak the look of the LCD text effect
@@ -39,4 +39,4 @@ Run `./build.sh` in the project's root directory.
 
 ## Disclaimers
 All theme credits and licenses are in THEME_CREDITS.txt.
-AI Disclaimer: This project was made with Codex ChatGPT
+AI Disclaimer: This project was made with help from Codex ChatGPT
