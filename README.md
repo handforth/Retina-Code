@@ -37,6 +37,13 @@ Visual Studio 2012 Dark:
 ## Building
 Run `./build.sh` in the project's root directory.
 
+## Usage
+[Download the latest release](https://github.com/sackboy19/Retina-Code/releases/latest), then run Retina Code.app
+
+If macOS blocks the first launch, go to System Settings -> Privacy & Security and choose Open Anyway.
+
+Report any issues you have, bugs, or feature requests please! :D
+
 ## Disclaimers
 All theme credits and licenses are in THEME_CREDITS.txt.
 AI Disclaimer: This project was made with help from Codex ChatGPT
