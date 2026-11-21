@@ -9,11 +9,11 @@ enum class WhitespaceMode { None, Boundary, Selection, Trailing, All };
 
 struct RenderSettings {
     Smoothing smoothing = Smoothing::RetinaLCD;
-    CGFloat saturation = 1;
-    CGFloat strokeWeight = 1;
-    CGFloat fringing = 1;
-    CGFloat softness = 1;
-    CGFloat brightness = 1;
+    CGFloat saturation = 1.10;
+    CGFloat strokeWeight = 1.07;
+    CGFloat fringing = 1.10;
+    CGFloat softness = 1.40;
+    CGFloat brightness = 1.01;
     WhitespaceMode whitespace = WhitespaceMode::None;
 };
 

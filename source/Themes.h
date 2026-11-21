@@ -724,7 +724,7 @@ inline constexpr Theme themes[] = {
       .wordMatch = 0xF7469B, .bracketMatch = 0xF7469B, .vimFlash = 0xF7469B, .commandCaret = 0xFF72B6},
      0xFFFFFF, true, false, {}, 0x929292, 0x000000, true, true},
 
-    // Imported palettes are credited in THEME_LICENSES.txt.
+    // Imported palettes are credited in THEME_CREDITS.txt.
     // GitHub Theme 6.3.5
     {"GitHub Light Default", 0xFFFFFF, 0xF4F6F8, 0xCEE1F8, 0xFFFFFF, 0xE4E4E5, 0x8C959F, 0x1F2328,
      {0x1F2328, 0xCF222E, 0xCF222E, 0x953800, 0x8250DF, 0x1F2328, 0x0A3069,

@@ -537,23 +537,24 @@ BOOL SmoothScrollingPreference()
 static constexpr CGFloat minimumBrightness = 0.5;
 static constexpr CGFloat maximumBrightness = 1.5;
 
-static CGFloat RenderingFactor(NSDictionary *values, NSString *key, CGFloat minimum = 0, CGFloat maximum = 2)
+static CGFloat RenderingFactor(NSDictionary *values, NSString *key, CGFloat fallback, CGFloat minimum = 0, CGFloat maximum = 2)
 {
     NSNumber *number = values[key];
     if (![number isKindOfClass:NSNumber.class] || !std::isfinite(number.doubleValue))
-        return 1;
+        return fallback;
     return std::clamp(number.doubleValue, minimum, maximum);
 }
 
 RenderSettings RenderingPreference()
 {
     NSDictionary *values = [NSUserDefaults.standardUserDefaults dictionaryForKey:renderingKey];
-    RenderSettings settings{.smoothing = SmoothingPreference(),
-                            .saturation = RenderingFactor(values, @"saturation"),
-                            .strokeWeight = RenderingFactor(values, @"stroke"),
-                            .fringing = RenderingFactor(values, @"fringing"),
-                            .softness = RenderingFactor(values, @"softness"),
-                            .brightness = RenderingFactor(values, @"brightness", minimumBrightness, maximumBrightness)};
+    RenderSettings settings;
+    settings.smoothing = SmoothingPreference();
+    settings.saturation = RenderingFactor(values, @"saturation", settings.saturation);
+    settings.strokeWeight = RenderingFactor(values, @"stroke", settings.strokeWeight);
+    settings.fringing = RenderingFactor(values, @"fringing", settings.fringing);
+    settings.softness = RenderingFactor(values, @"softness", settings.softness);
+    settings.brightness = RenderingFactor(values, @"brightness", settings.brightness, minimumBrightness, maximumBrightness);
     NSNumber *whitespace = values[@"whitespace"];
     if ([whitespace isKindOfClass:NSNumber.class] && whitespace.integerValue >= NSInteger(WhitespaceMode::None) &&
         whitespace.integerValue <= NSInteger(WhitespaceMode::All))
@@ -1043,10 +1044,11 @@ static_assert(std::size(colorTitles) == std::tuple_size_v<decltype(ColorFields(s
     _sliders = [NSMutableArray arrayWithCapacity:std::size(renderingSliders)];
     _values = [NSMutableArray arrayWithCapacity:std::size(renderingSliders)];
     y -= 33;
+    constexpr RenderSettings defaults{};
     for (const auto &row : renderingSliders) {
         Label(pane, row.label, NSMakeRect(16, y, 116, 18), NSTextAlignmentRight);
         bool brightness = row.factor == &RenderSettings::brightness;
-        NSSlider *slider = [NSSlider sliderWithValue:1 minValue:brightness ? minimumBrightness : 0
+        NSSlider *slider = [NSSlider sliderWithValue:defaults.*row.factor minValue:brightness ? minimumBrightness : 0
                                            maxValue:brightness ? maximumBrightness : 2
                                                target:self action:@selector(changeRendering:)];
         slider.continuous = YES;

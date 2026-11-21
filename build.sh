@@ -27,6 +27,6 @@ xcrun --sdk macosx clang++ \
     "$source_dir/FolderSearch.mm" \
     -o "$macos/Retina Code"
 cp "$project_dir/resources/Info.plist" "$app/Contents/Info.plist"
-cp "$project_dir/THEME_LICENSES.txt" "$resources/THEME_LICENSES.txt"
+cp "$project_dir/THEME_CREDITS.txt" "$resources/THEME_CREDITS.txt"
 codesign --force --sign - "$app"
 printf '%s\n' "$app"
