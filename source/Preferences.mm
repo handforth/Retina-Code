@@ -1029,7 +1029,8 @@ static_assert(std::size(colorTitles) == std::tuple_size_v<decltype(ColorFields(s
 
     Label(pane, @"Font", NSMakeRect(previewX, 24, 32, 18), NSTextAlignmentLeft);
     _fontDescription = Label(pane, @"", NSMakeRect(previewX + 40, 24, previewWidth - 153, 18), NSTextAlignmentLeft);
-    NSButton *choose = [NSButton buttonWithTitle:@"Choose…" target:self action:@selector(showFonts:)];
+    NSButton *choose = [NSButton buttonWithTitle:@"Choose…" target:NSFontManager.sharedFontManager
+                                         action:@selector(orderFrontFontPanel:)];
     choose.frame = NSMakeRect(width - margin - 105, 18, 105, 28);
     [pane addSubview:choose];
 }
@@ -1754,24 +1755,6 @@ static_assert(std::size(colorTitles) == std::tuple_size_v<decltype(ColorFields(s
     [self showWindow:nil];
     [_preferenceTabs selectTabViewItemWithIdentifier:identifier];
     [self.window makeFirstResponder:_preferenceTabs.selectedTabViewItem.initialFirstResponder];
-}
-
-- (IBAction)showFonts:(id)sender
-{
-    NSFontManager *manager = NSFontManager.sharedFontManager;
-    manager.target = self;
-    manager.action = @selector(changeFont:);
-    [manager setSelectedFont:EditorFontPreference() isMultiple:NO];
-
-    NSFontPanel *panel = [manager fontPanel:YES];
-    [panel makeKeyAndOrderFront:sender];
-    // AppKit can reset this flag while setting up the panel on its first show.
-    panel.becomesKeyOnlyIfNeeded = NO;
-}
-
-- (void)changeFont:(NSFontManager *)sender
-{
-    SetEditorFont([sender convertFont:EditorFontPreference()]);
 }
 
 @end

@@ -23,6 +23,31 @@
 - (IBAction)showCommandPalette:(id)sender;
 @end
 
+@interface EditorFontManager : NSFontManager
+@end
+
+@implementation EditorFontManager
+
+- (void)orderFrontFontPanel:(id)sender
+{
+    self.target = self;
+    self.action = @selector(changeEditorFont:);
+    [self setSelectedFont:EditorFontPreference() isMultiple:NO];
+
+    NSFontPanel *panel = [self fontPanel:YES];
+    [panel makeKeyAndOrderFront:sender];
+    // Keep AppKit's rich-text toolbar out of layout after the Fonts panel closes.
+    panel.toolbar.visible = NO;
+    panel.becomesKeyOnlyIfNeeded = NO;
+}
+
+- (void)changeEditorFont:(NSFontManager *)sender
+{
+    SetEditorFont([sender convertFont:EditorFontPreference()]);
+}
+
+@end
+
 enum class PalettePage { Theme, TabSize, MoreTabSizes, Language, Whitespace, AutoSave, FinalNewline };
 
 static NSMenuItem *AddItem(NSMenu *menu, NSString *title, SEL action, NSString *key, NSInteger tag = 0)
@@ -982,9 +1007,7 @@ static void AddMenuCommands(NSMutableArray<NSMenuItem *> *commands, NSMenu *menu
 
 - (IBAction)showFonts:(id)sender
 {
-    if (!_preferences)
-        _preferences = [[PreferencesController alloc] init];
-    [_preferences showFonts:sender];
+    [NSFontManager.sharedFontManager orderFrontFontPanel:sender];
 }
 
 - (IBAction)newWindowForTab:(id)sender
@@ -1075,6 +1098,7 @@ static void AddMenuCommands(NSMutableArray<NSMenuItem *> *commands, NSMenu *menu
 int main()
 {
     @autoreleasepool {
+        [NSFontManager setFontManagerFactory:EditorFontManager.class];
         NSApplication *application = NSApplication.sharedApplication;
         ApplicationDelegate *delegate = [[ApplicationDelegate alloc] init];
         application.delegate = delegate;

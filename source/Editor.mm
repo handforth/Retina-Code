@@ -99,9 +99,11 @@ using NameCounts = std::map<std::u16string, size_t, std::less<>>;
 
 struct LineStart {
     NSUInteger offset;
+    size_t firstName;
     std::shared_ptr<const LexState> state;
-    std::vector<NameCounts::iterator> names;
 };
+
+enum class HighlightPass { Edit, Document, Appearance };
 
 static const LexState defaultLexState;
 
@@ -128,6 +130,8 @@ static const LexState &IncomingState(const LineStart &line)
 }
 
 @interface EditorTextStorage : NSTextStorage
+- (void)applyAttributes:(NSDictionary<NSAttributedStringKey, id> *)attributes
+               removing:(NSAttributedStringKey)key inRange:(NSRange)range;
 @end
 
 @implementation EditorTextStorage {
@@ -215,6 +219,54 @@ static const LexState &IncomingState(const LineStart &line)
     [self edited:NSTextStorageEditedAttributes range:range changeInLength:0];
 }
 
+- (void)applyAttributes:(NSDictionary<NSAttributedStringKey, id> *)attributes
+               removing:(NSAttributedStringKey)key inRange:(NSRange)range
+{
+    if (!range.length)
+        return;
+    struct AttributeRewrite {
+        NSDictionary *original;
+        NSDictionary *updated;
+    };
+    std::array<AttributeRewrite, 16> recent{};
+    size_t next = 0;
+    NSDictionary *pending = nil;
+    NSRange pendingRange{};
+    // Merge equal runs from the end so collapsing a run never shifts the remaining input.
+    for (NSUInteger end = NSMaxRange(range); end > range.location;) {
+        @autoreleasepool {
+            NSRange run;
+            NSDictionary *original = [_contents attributesAtIndex:end - 1 effectiveRange:&run];
+            auto cached = std::find_if(recent.begin(), recent.end(),
+                [&](const AttributeRewrite &entry) { return entry.original == original; });
+            NSDictionary *current;
+            if (cached != recent.end()) {
+                current = cached->updated;
+            } else {
+                NSMutableDictionary *updated = [original mutableCopy];
+                [updated addEntriesFromDictionary:attributes];
+                if (key)
+                    [updated removeObjectForKey:key];
+                current = [updated isEqualToDictionary:pending] ? pending : updated;
+                recent[next++ % recent.size()] = {original, current};
+            }
+            NSUInteger start = std::max(run.location, range.location);
+            if (current == pending || [current isEqualToDictionary:pending]) {
+                pendingRange.length += end - start;
+                pendingRange.location = start;
+            } else {
+                if (pendingRange.length)
+                    [_contents setAttributes:pending range:pendingRange];
+                pending = current;
+                pendingRange = NSMakeRange(start, end - start);
+            }
+            end = start;
+        }
+    }
+    [_contents setAttributes:pending range:pendingRange];
+    [self edited:NSTextStorageEditedAttributes range:range changeInLength:0];
+}
+
 @end
 
 struct BuildError {
@@ -242,7 +294,7 @@ struct BuildError {
 @end
 
 @interface SyntaxBuffer : NSObject <NSTextStorageDelegate>
-@property(nonatomic, readonly) NSTextStorage *storage;
+@property(nonatomic, readonly) EditorTextStorage *storage;
 @property(nonatomic, readonly) Indentation indentation;
 @property(nonatomic, readonly) BOOL hasFileIndentation;
 @property(nonatomic) Language language;
@@ -284,6 +336,7 @@ struct BuildError {
     std::vector<TypedPair> _typedPairs;
     std::vector<BuildError> _buildErrors;
     std::vector<LineStart> _lines;
+    std::vector<NameCounts::iterator> _lineNames;
     NameCounts _names;
     IndentationSettings _indentationDefaults;
     Indentation _indentation;
@@ -501,13 +554,18 @@ struct BuildError {
     return stack;
 }
 
-- (void)highlightFrom:(NSUInteger)firstLine oldEnd:(NSUInteger)oldEnd delta:(NSInteger)delta full:(BOOL)full
+- (void)highlightFrom:(NSUInteger)firstLine oldEnd:(NSUInteger)oldEnd delta:(NSInteger)delta
+                 pass:(HighlightPass)pass restoreFont:(BOOL)restoreFont
 {
+    bool full = pass != HighlightPass::Edit;
+    bool updateIndex = pass != HighlightPass::Appearance;
     NSString *text = _storage.string;
     NSUInteger length = text.length;
     NSUInteger offset = full ? 0 : _lines[firstLine].offset;
     LexState state = full ? defaultLexState : IncomingState(_lines[firstLine]);
     std::shared_ptr<const LexState> savedState = full ? nullptr : _lines[firstLine].state;
+    std::array<std::shared_ptr<const LexState>, 8> recentStates{};
+    size_t nextState = 0;
     bool plain = _language == Language::Plain;
     NSUInteger resume = full ? _lines.size() : [self lineForOffset:oldEnd] + 1;
     std::vector<LineStart> updated;
@@ -518,9 +576,32 @@ struct BuildError {
     std::u16string line;
     std::vector<Token> tokens;
     std::vector<NameCounts::iterator> names;
+    NSColor *inkColor = _colors[size_t(Ink::Text)];
+    NSDictionary *baseAttributes = (_italicFont || restoreFont) && _font ?
+        @{NSForegroundColorAttributeName:inkColor, NSFontAttributeName:_font} :
+        @{NSForegroundColorAttributeName:inkColor};
     if (full) {
-        updated.swap(_lines);
-        updated.clear();
+        if (updateIndex) {
+            updated.swap(_lines);
+            updated.clear();
+            names.swap(_lineNames);
+            names.clear();
+            if (length < names.capacity() / 2)
+                names.shrink_to_fit();
+            if (length >= largeDocumentLength) {
+                // Size the line index without allocating substrings or growing the vector repeatedly.
+                __block size_t count = 1;
+                [text enumerateSubstringsInRange:NSMakeRange(0, length)
+                    options:NSStringEnumerationByLines | NSStringEnumerationSubstringNotRequired
+                    usingBlock:^(NSString *, NSRange, NSRange, BOOL *) { ++count; }];
+                if (count < updated.capacity() / 2)
+                    updated.shrink_to_fit();
+                updated.reserve(count + count / 16);
+            } else if (length < updated.capacity() / 2) {
+                updated.shrink_to_fit();
+            }
+            _names.clear();
+        }
         if (colorize) {
             updatedBracketStarts.swap(_bracketStarts);
             updatedBracketStarts.clear();
@@ -528,33 +609,12 @@ struct BuildError {
             if (length < _bracketNodes.capacity() / 2)
                 _bracketNodes.shrink_to_fit();
             _bracketNodes.emplace_back();
-        }
-        if (length >= largeDocumentLength) {
-            // Size the line index without allocating substrings or growing the vector repeatedly.
-            __block size_t count = 1;
-            [text enumerateSubstringsInRange:NSMakeRange(0, length)
-                options:NSStringEnumerationByLines | NSStringEnumerationSubstringNotRequired
-                usingBlock:^(NSString *, NSRange, NSRange, BOOL *) { ++count; }];
-            if (count < updated.capacity() / 2)
-                updated.shrink_to_fit();
-            updated.reserve(count + count / 16);
-        } else if (length < updated.capacity() / 2) {
-            updated.shrink_to_fit();
-        }
-        _names.clear();
-        if (colorize) {
-            if (updated.capacity() < updatedBracketStarts.capacity() / 2)
+            size_t lineCapacity = updateIndex ? updated.capacity() : _lines.size();
+            if (lineCapacity < updatedBracketStarts.capacity() / 2)
                 updatedBracketStarts.shrink_to_fit();
-            updatedBracketStarts.reserve(updated.capacity());
+            updatedBracketStarts.reserve(lineCapacity);
         }
-        if (length) {
-            // Clear the old runs in one pass. Replacing them line by line shifts the entire tail.
-            NSRange document = NSMakeRange(0, length);
-            [_storage addAttribute:NSForegroundColorAttributeName value:_colors[size_t(Ink::Text)] range:document];
-            [_storage removeAttribute:EditorNonCodeAttribute range:document];
-            if (_italicFont)
-                [_storage addAttribute:NSFontAttributeName value:_font range:document];
-        }
+        [_storage applyAttributes:baseAttributes removing:EditorNonCodeAttribute inRange:NSMakeRange(0, length)];
     }
 
     // A line beyond the edit can keep its colors once both incoming states match.
@@ -565,11 +625,22 @@ struct BuildError {
             IncomingState(_lines[resume]) == state && (!colorize || _bracketStarts[resume] == bracketStack))
             break;
 
-        if (state == defaultLexState)
-            savedState.reset();
-        else if (!savedState || *savedState != state)
-            savedState = std::make_shared<const LexState>(state);
-        auto &entry = updated.emplace_back(LineStart{offset, savedState, {}});
+        if (updateIndex) {
+            if (state == defaultLexState)
+                savedState.reset();
+            else if (!savedState || *savedState != state) {
+                auto previous = std::find_if(recentStates.begin(), recentStates.end(),
+                    [&](const auto &candidate) { return candidate && *candidate == state; });
+                if (previous != recentStates.end()) {
+                    savedState = *previous;
+                } else {
+                    // Reuse common states such as the same brace depth in consecutive functions.
+                    savedState = std::make_shared<const LexState>(state);
+                    recentStates[nextState++ % recentStates.size()] = savedState;
+                }
+            }
+            updated.push_back({offset, names.size(), savedState});
+        }
         if (colorize)
             updatedBracketStarts.push_back(bracketStack);
         if (offset == length) {
@@ -582,43 +653,40 @@ struct BuildError {
         line.resize(contentsEnd - offset);
         [text getCharacters:reinterpret_cast<unichar *>(line.data()) range:NSMakeRange(offset, line.size())];
         TokenizeLine(line, plain ? Language::C : _language, state, tokens);
-        names.clear();
 
-        if (!full) {
-            NSRange wholeLine = NSMakeRange(offset, end - offset);
-            [_storage addAttribute:NSForegroundColorAttributeName value:_colors[size_t(Ink::Text)] range:wholeLine];
-            [_storage removeAttribute:EditorNonCodeAttribute range:wholeLine];
-            if (_italicFont)
-                [_storage addAttribute:NSFontAttributeName value:_font range:wholeLine];
-        }
-        for (const Token &token : tokens) {
-            size_t ink = size_t(token.ink);
-            NSRange range = NSMakeRange(offset + token.start, token.length);
-            bool nameToken = token.ink == Ink::Text || token.ink == Ink::Name || token.ink == Ink::Type ||
-                             token.ink == Ink::Function || token.ink == Ink::Constant ||
-                             (plain && (token.ink == Ink::Keyword || token.ink == Ink::Control));
-            if (nameToken && !token.nonCode && token.length > 1 && line[token.start] != u'\'') {
-                std::u16string_view word = std::u16string_view(line).substr(token.start, token.length);
-                auto name = _names.lower_bound(word);
-                if (name == _names.end() || name->first != word)
-                    name = _names.emplace_hint(name, word, 0);
-                ++name->second;
-                names.push_back(name);
+        @autoreleasepool {
+            if (!full)
+                [_storage applyAttributes:baseAttributes removing:EditorNonCodeAttribute
+                                  inRange:NSMakeRange(offset, end - offset)];
+            for (const Token &token : tokens) {
+                size_t ink = size_t(token.ink);
+                NSRange range = NSMakeRange(offset + token.start, token.length);
+                bool nameToken = updateIndex &&
+                    (token.ink == Ink::Text || token.ink == Ink::Name || token.ink == Ink::Type ||
+                     token.ink == Ink::Function || token.ink == Ink::Constant ||
+                     (plain && (token.ink == Ink::Keyword || token.ink == Ink::Control)));
+                if (nameToken && !token.nonCode && token.length > 1 && line[token.start] != u'\'') {
+                    std::u16string_view word = std::u16string_view(line).substr(token.start, token.length);
+                    auto name = _names.lower_bound(word);
+                    if (name == _names.end() || name->first != word)
+                        name = _names.emplace_hint(name, word, 0);
+                    ++name->second;
+                    names.push_back(name);
+                }
+                if (!plain && _theme->ink[ink] != _theme->ink[size_t(Ink::Text)])
+                    [_storage addAttribute:NSForegroundColorAttributeName value:_colors[ink] range:range];
+                if (token.nonCode || token.ink == Ink::Comment || token.ink == Ink::String || token.ink == Ink::Escape) {
+                    Ink role = token.ink == Ink::Comment || token.ink == Ink::Escape ? token.ink : Ink::String;
+                    [_storage addAttribute:EditorNonCodeAttribute value:@(NSInteger(role)) range:range];
+                }
+                if (!plain && _italicFont &&
+                    ((token.ink == Ink::Type && _theme->italicTypes) ||
+                     (token.ink == Ink::Comment && _theme->italicComments)))
+                    [_storage addAttribute:NSFontAttributeName value:_italicFont range:range];
             }
-            if (!plain && _theme->ink[ink] != _theme->ink[size_t(Ink::Text)])
-                [_storage addAttribute:NSForegroundColorAttributeName value:_colors[ink] range:range];
-            if (token.nonCode || token.ink == Ink::Comment || token.ink == Ink::String || token.ink == Ink::Escape) {
-                Ink role = token.ink == Ink::Comment || token.ink == Ink::Escape ? token.ink : Ink::String;
-                [_storage addAttribute:EditorNonCodeAttribute value:@(NSInteger(role)) range:range];
-            }
-            if (!plain && _italicFont &&
-                ((token.ink == Ink::Type && _theme->italicTypes) ||
-                 (token.ink == Ink::Comment && _theme->italicComments)))
-                [_storage addAttribute:NSFontAttributeName value:_italicFont range:range];
+            if (colorize)
+                bracketStack = [self colorBracketsInLine:line tokens:tokens offset:offset stack:bracketStack local:localBrackets];
         }
-        if (colorize)
-            bracketStack = [self colorBracketsInLine:line tokens:tokens offset:offset stack:bracketStack local:localBrackets];
-        entry.names.assign(names.begin(), names.end());
 
         offset = end;
         if (offset == length && offset == contentsEnd) {
@@ -628,20 +696,37 @@ struct BuildError {
     }
 
     if (full) {
-        _lines = std::move(updated);
+        if (updateIndex) {
+            _lines = std::move(updated);
+            _lineNames = std::move(names);
+        }
         if (colorize)
             _bracketStarts = std::move(updatedBracketStarts);
     } else {
-        // The names on reused lines stay indexed. Release only the lines we replaced.
-        for (size_t i = firstLine; i < resume; ++i) {
-            for (auto name : _lines[i].names) {
-                if (--name->second == 0)
-                    _names.erase(name);
-            }
+        // Each line points into one array of word uses. Replace the edited span.
+        size_t firstName = _lines[firstLine].firstName;
+        size_t pastName = resume < _lines.size() ? _lines[resume].firstName : _lineNames.size();
+        for (size_t i = firstName; i < pastName; ++i) {
+            auto name = _lineNames[i];
+            if (--name->second == 0)
+                _names.erase(name);
         }
-        if (delta) {
-            for (size_t i = resume; i < _lines.size(); ++i)
+        size_t replaced = pastName - firstName;
+        size_t common = std::min(replaced, names.size());
+        std::copy_n(names.begin(), common, _lineNames.begin() + firstName);
+        if (names.size() < replaced)
+            _lineNames.erase(_lineNames.begin() + firstName + common, _lineNames.begin() + pastName);
+        else if (names.size() > replaced)
+            _lineNames.insert(_lineNames.begin() + pastName, names.begin() + common, names.end());
+        if (_lineNames.size() < _lineNames.capacity() / 4)
+            _lineNames.shrink_to_fit();
+        for (auto &line : updated)
+            line.firstName += firstName;
+        if (delta || names.size() != replaced) {
+            for (size_t i = resume; i < _lines.size(); ++i) {
                 _lines[i].offset = NSUInteger(NSInteger(_lines[i].offset) + delta);
+                _lines[i].firstName = _lines[i].firstName - replaced + names.size();
+            }
         }
         if (updated.size() == resume - firstLine) {
             std::move(updated.begin(), updated.end(), _lines.begin() + firstLine);
@@ -658,11 +743,11 @@ struct BuildError {
     }
 }
 
-- (void)highlightAll
+- (void)highlightAll:(HighlightPass)pass restoreFont:(BOOL)restoreFont
 {
     _pending = NO;
     [_storage beginEditing];
-    [self highlightFrom:0 oldEnd:0 delta:0 full:YES];
+    [self highlightFrom:0 oldEnd:0 delta:0 pass:pass restoreFont:restoreFont];
     [_storage endEditing];
 }
 
@@ -721,7 +806,7 @@ struct BuildError {
     if (!_pending)
         return;
     if (_fullHighlightPending) {
-        [self highlightAll];
+        [self highlightAll:HighlightPass::Document restoreFont:NO];
         return;
     }
 
@@ -731,7 +816,7 @@ struct BuildError {
         --first;
     NSUInteger oldEnd = NSUInteger(NSInteger(NSMaxRange(_pendingRange)) - _pendingDelta);
     [_storage beginEditing];
-    [self highlightFrom:first oldEnd:oldEnd delta:_pendingDelta full:NO];
+    [self highlightFrom:first oldEnd:oldEnd delta:_pendingDelta pass:HighlightPass::Edit restoreFont:NO];
     [_storage endEditing];
 }
 
@@ -757,8 +842,7 @@ struct BuildError {
     NSFont *italic = (theme->italicTypes || theme->italicComments) && font ?
                      [NSFontManager.sharedFontManager convertFont:font toHaveTrait:NSItalicFontMask] : nil;
     _italicFont = [italic isEqual:font] ? nil : italic;
-    if (previousItalicFont && !_italicFont && font && _storage.length)
-        [_storage addAttribute:NSFontAttributeName value:font range:NSMakeRange(0, _storage.length)];
+    BOOL restoreFont = previousItalicFont && !_italicFont;
     if (paletteChanged) {
         NSMutableArray<NSColor *> *colors = [NSMutableArray arrayWithCapacity:size_t(Ink::Count)];
         for (Col32 color : theme->ink)
@@ -779,8 +863,12 @@ struct BuildError {
             _bracketColors = colors;
         }
     }
-    if (paletteChanged || bracketsChanged || _italicFont)
-        [self highlightAll];
+    if (paletteChanged || bracketsChanged || _italicFont) {
+        HighlightPass pass = _pending || _lines.empty() ? HighlightPass::Document : HighlightPass::Appearance;
+        [self highlightAll:pass restoreFont:restoreFont];
+    } else if (restoreFont && font) {
+        [_storage applyAttributes:@{NSFontAttributeName:font} removing:nil inRange:NSMakeRange(0, _storage.length)];
+    }
 }
 
 - (void)setLanguage:(Language)language
@@ -790,7 +878,7 @@ struct BuildError {
         ++_textVersion;
         [self clearBuildErrors];
         [self forgetTypedPairs];
-        [self highlightAll];
+        [self highlightAll:HighlightPass::Document restoreFont:NO];
     }
 }
 
@@ -1981,7 +2069,7 @@ static NSColor *ContrastingSelectionColor(Col32 background)
     Indentation indentation = self.syntax.indentation;
     [self setVimIndentation:indentation];
     NSUInteger tabStop = indentation.tabWidth;
-    NSTextStorage *storage = self.textStorage;
+    EditorTextStorage *storage = self.syntax.storage;
     bool typographyChanged = ![_editorFont isEqual:font] || _fontTabStop != tabStop;
     if (typographyChanged) {
         NSMutableParagraphStyle *paragraph = [[NSMutableParagraphStyle alloc] init];
@@ -1992,8 +2080,8 @@ static NSColor *ContrastingSelectionColor(Col32 background)
         paragraph.tabStops = @[];
         paragraph.defaultTabInterval = tabStop * [@" " sizeWithAttributes:@{NSFontAttributeName:font}].width;
         if (storage.length) {
-            [storage addAttributes:@{NSFontAttributeName:font, NSParagraphStyleAttributeName:paragraph,
-                                     NSLigatureAttributeName:@0} range:NSMakeRange(0, storage.length)];
+            [storage applyAttributes:@{NSFontAttributeName:font, NSParagraphStyleAttributeName:paragraph,
+                                       NSLigatureAttributeName:@0} removing:nil inRange:NSMakeRange(0, storage.length)];
         } else {
             self.font = font;
         }

@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstring>
 #include <list>
 #include <unordered_map>
 #include <utility>
@@ -669,32 +670,44 @@ static uint8_t BrightnessLevel(int channel, int brightness)
     return uint8_t(std::clamp((channel * brightness + 128) >> 8, 0, 255));
 }
 
-NSColor *RenderedEditorColor(Col32 color, const RenderSettings &settings)
+template<bool adjustBrightness>
+static Col32 FilterColor(Col32 color, int saturation, int brightness)
 {
-    int saturation = int(std::lround(settings.saturation * 256));
-    int brightness = int(std::lround(settings.brightness * 256));
     int gray = GrayLevel(ColorRed(color), ColorGreen(color), ColorBlue(color));
     Col32 filtered = Col32(ColorAlpha(color)) << 24;
     for (unsigned shift : {0U, 8U, 16U}) {
         int channel = SaturatedChannel(uint8_t(color >> shift), gray, saturation);
-        filtered |= Col32(BrightnessLevel(channel, brightness)) << shift;
+        if constexpr (adjustBrightness)
+            channel = BrightnessLevel(channel, brightness);
+        filtered |= Col32(channel) << shift;
     }
-    return SRGBColor(filtered);
+    return filtered;
+}
+
+NSColor *RenderedEditorColor(Col32 color, const RenderSettings &settings)
+{
+    int saturation = int(std::lround(settings.saturation * 256));
+    int brightness = int(std::lround(settings.brightness * 256));
+    return SRGBColor(FilterColor<true>(color, saturation, brightness));
 }
 
 template<bool adjustBrightness>
 static void SaturatePixels(uint8_t *data, size_t width, size_t height, size_t stride, int saturation, int brightness)
 {
+    // The bitmap is RGBX, and most of it is long runs of the same paper color.
+    Col32 previous = 0;
+    Col32 filtered = 0;
     for (size_t row = 0; row < height; ++row) {
         uint8_t *pixel = data + row * stride;
         for (size_t column = 0; column < width; ++column, pixel += 4) {
-            int gray = GrayLevel(pixel[0], pixel[1], pixel[2]);
-            for (int channel = 0; channel < 3; ++channel) {
-                uint8_t value = uint8_t(SaturatedChannel(pixel[channel], gray, saturation));
-                if constexpr (adjustBrightness)
-                    value = BrightnessLevel(value, brightness);
-                pixel[channel] = value;
+            Col32 color;
+            std::memcpy(&color, pixel, sizeof(color));
+            if (color != previous) {
+                previous = color;
+                filtered = FilterColor<adjustBrightness>(color, saturation, brightness);
             }
+            if (filtered != color)
+                std::memcpy(pixel, &filtered, sizeof(filtered));
         }
     }
 }

@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <deque>
+#include <optional>
 
 static NSAttributedStringKey const outputToneKey = @"RetinaCodeOutputTone";
 static NSAttributedStringKey const outputForegroundKey = @"RetinaCodeTerminalForeground";
@@ -155,6 +156,7 @@ static bool OutputLineEnding(unichar character)
     NSUInteger _firstLink;
     NSUInteger _scrollbackLines;
     BOOL _scrollRepaintPending;
+    std::optional<OutputScrollPosition> _deferredScrollPosition;
     BOOL _dark;
 }
 
@@ -172,6 +174,7 @@ static bool OutputLineEnding(unichar character)
 
     NSTextStorage *storage = [[NSTextStorage alloc] init];
     CodeLayoutManager *layout = [[CodeLayoutManager alloc] init];
+    layout.backgroundLayoutEnabled = NO;
     [storage addLayoutManager:layout];
     NSTextContainer *container = [[NSTextContainer alloc] initWithContainerSize:NSMakeSize(600, 10000000)];
     container.lineFragmentPadding = 0;
@@ -230,12 +233,26 @@ static bool OutputLineEnding(unichar character)
     }];
 }
 
+- (void)viewDidUnhide
+{
+    [super viewDidUnhide];
+    if (_deferredScrollPosition)
+        self.needsLayout = YES;
+}
+
+- (void)viewDidMoveToWindow
+{
+    [super viewDidMoveToWindow];
+    if (self.window && _deferredScrollPosition)
+        self.needsLayout = YES;
+}
+
 - (void)layout
 {
     [super layout];
     NSRect area = self.bounds;
     area.size.height = std::max<CGFloat>(0, NSHeight(area) - 1);
-    if (NSEqualRects(area, _scroll.frame))
+    if (NSEqualRects(area, _scroll.frame) && !_deferredScrollPosition)
         return;
     OutputScrollPosition position = [self scrollPosition];
     _scroll.frame = area;
@@ -264,6 +281,8 @@ static bool OutputLineEnding(unichar character)
 
 - (OutputScrollPosition)scrollPosition
 {
+    if (_deferredScrollPosition)
+        return *_deferredScrollPosition;
     OutputScrollPosition position{_scroll.documentVisibleRect.origin, bool([self atOutputEnd])};
     if (position.following || !_text.string.length)
         return position;
@@ -281,6 +300,21 @@ static bool OutputLineEnding(unichar character)
 
 - (void)restoreScrollPosition:(OutputScrollPosition)position removed:(NSUInteger)removed reflow:(BOOL)reflow
 {
+    if (!self.window || self.isHiddenOrHasHiddenAncestor) {
+        // Keep the scroll anchor current while trimming hidden output. Lay it out once on reveal.
+        if (removed && !position.following) {
+            if (position.character != NSNotFound && position.character >= removed) {
+                position.character -= removed;
+            } else {
+                position.character = NSNotFound;
+                position.origin.y = 0;
+            }
+        }
+        _deferredScrollPosition = position;
+        return;
+    }
+    reflow = reflow || _deferredScrollPosition.has_value();
+    _deferredScrollPosition.reset();
     if (removed || reflow)
         [_text sizeToFit];
     NSClipView *clip = _scroll.contentView;

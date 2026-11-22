@@ -82,6 +82,5 @@ void SetEditorPreference(NSString *key, id value);
 void SetEditorFont(NSFont *font);
 
 @interface PreferencesController : NSWindowController
-- (IBAction)showFonts:(id)sender;
 - (void)showPane:(NSString *)identifier;
 @end
