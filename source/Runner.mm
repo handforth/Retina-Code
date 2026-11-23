@@ -1138,7 +1138,7 @@ struct CargoSession {
             finished = true;
             built = [data[@"success"] boolValue];
             if (built) {
-                log.status(@"Build successful\n");
+                log.status(@"Build successful\n\n");
                 log.send(true);
                 input.setOpen(true);
                 if (ready)
@@ -1567,7 +1567,7 @@ static void RunNativeProject(NSURL *folder, NSURL *file, NSString *name, const s
         log.status(@"Build failed.\n", OutputTone::Error);
         return;
     }
-    log.status(@"Build successful\n");
+    log.status(@"Build successful\n\n");
     log.send(true);
     RunProgram(program.path, @[], folder, stop, log, input, ready);
 }
@@ -1664,7 +1664,7 @@ static bool BuildProgram(NSString *tool, NSArray<NSString *> *arguments, NSURL *
         log.status(@"Build failed.\n", OutputTone::Error);
         return false;
     }
-    log.status(@"Build successful\n");
+    log.status(@"Build successful\n\n");
     log.send(true);
     return true;
 }
