@@ -17,7 +17,9 @@ BOOL EditorWindowOutputShown(NSWindow *window);
 void RestoreEditorWindowOutput(NSWindow *window, BOOL shown);
 void RequestEditorWindowClose(NSWindow *window);
 BOOL ShowFolderSearch(NSWindow *window, BOOL replace = NO);
+enum class FinalNewlineMode;
 NSString *DecodeSourceText(NSData *data, BOOL *hasBOM = nullptr);
+NSData *SourceDataWithFinalNewline(NSData *data, FinalNewlineMode mode);
 bool IsWholeSourceWord(NSString *text, NSRange range);
 namespace Vim { struct EditBatch; }
 using CloseReviewCompletion = void (^)(NSSet<SourceDocument *> *discarded);
@@ -49,6 +51,7 @@ using SourceOpenCompletion = void (^)(NSDocument *, BOOL, NSError *);
 - (void)applySessionView:(NSDictionary *)state;
 - (void)markSessionDraftEdited;
 - (IBAction)runDocument:(id)sender;
+- (IBAction)debugCommand:(NSMenuItem *)sender;
 - (IBAction)toggleDocumentOutput:(id)sender;
 - (IBAction)toggleExplorer:(id)sender;
 - (IBAction)selectTheme:(NSMenuItem *)sender;

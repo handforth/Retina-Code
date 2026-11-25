@@ -1,6 +1,7 @@
 #import "Editor.h"
 #import "Workspace.h"
 #import "Chrome.h"
+#import "DebugPane.h"
 #import "FolderSearch.h"
 #import "Output.h"
 #import "Preferences.h"
@@ -26,6 +27,7 @@
 static constexpr CGFloat editorPadding = 4;
 static constexpr CGFloat editorLineSpacing = 3;
 static constexpr CGFloat gutterInset = 9;
+static constexpr CGFloat breakpointLane = 18;
 static constexpr CGFloat statusHeight = 23;
 static constexpr CGFloat containerLimit = 10000000;
 static constexpr NSUInteger largeDocumentLength = 256 * 1024;
@@ -75,6 +77,17 @@ NSString *DecodeSourceText(NSData *data, BOOL *hasBOM)
     if (std::memchr(bytes, 0, length))
         return nil;
     return [[NSString alloc] initWithBytes:bytes length:length encoding:NSUTF8StringEncoding];
+}
+
+static NSData *EncodeSourceText(NSString *text, BOOL hasBOM)
+{
+    NSData *data = [text dataUsingEncoding:NSUTF8StringEncoding];
+    if (!hasBOM || !data)
+        return data;
+    const uint8_t bom[] = {0xEF, 0xBB, 0xBF};
+    NSMutableData *withBOM = [NSMutableData dataWithBytes:bom length:sizeof(bom)];
+    [withBOM appendData:data];
+    return withBOM;
 }
 
 static Language LanguageForSource(NSURL *url, NSString *text = nil)
@@ -280,6 +293,10 @@ struct BuildError {
 @property(nonatomic) const Theme *theme;
 @property(nonatomic) RenderSettings rendering;
 @property(nonatomic) NSRect currentLine;
+@property(nonatomic, copy) NSString *debugPath;
+@property(nonatomic) NSUInteger debugLine;
+@property(nonatomic, copy) NSString *debugException;
+- (void)showDebugLine:(NSUInteger)line exception:(NSString *)exception;
 @property(nonatomic, weak) SyntaxBuffer *syntax;
 @property(nonatomic, readonly) NSFont *editorFont;
 - (void)applyAppearance;
@@ -295,6 +312,7 @@ struct BuildError {
 
 @interface SyntaxBuffer : NSObject <NSTextStorageDelegate>
 @property(nonatomic, readonly) EditorTextStorage *storage;
+@property(nonatomic, copy) NSString *breakpointPath;
 @property(nonatomic, readonly) Indentation indentation;
 @property(nonatomic, readonly) BOOL hasFileIndentation;
 @property(nonatomic) Language language;
@@ -891,6 +909,24 @@ struct BuildError {
     [self clearBuildErrors];
     NSUInteger oldLength = NSUInteger(NSInteger(range.length) - delta);
     NSRange previous = NSMakeRange(range.location, oldLength);
+    // The line index still describes the old text at the start of an edit.
+    if (!_pending && !_lines.empty() && DebugBreakpoints(_breakpointPath).count) {
+        NSUInteger first = [self lineForOffset:previous.location];
+        NSUInteger last = [self lineForOffset:NSMaxRange(previous)];
+        NSUInteger oldLines = last - first;
+        NSUInteger newLines = 0;
+        NSString *text = storage.string;
+        for (NSUInteger position = range.location; position < NSMaxRange(range);) {
+            NSUInteger next, contentsEnd;
+            [text getLineStart:nullptr end:&next contentsEnd:&contentsEnd forRange:NSMakeRange(position, 0)];
+            if (next <= NSMaxRange(range) && contentsEnd < next)
+                ++newLines;
+            position = next;
+        }
+        // Inserting text at the start of a line moves its breakpoint with the original text.
+        NSUInteger firstAffected = first + (previous.location == _lines[first].offset ? 1 : 2);
+        ShiftDebugBreakpoints(_breakpointPath, firstAffected, oldLines, newLines);
+    }
     const auto *batch = [VimTextView cursorBatchForStorage:storage];
     if (batch) {
         auto adjust = [&](NSRange &part) {
@@ -2231,6 +2267,72 @@ static NSColor *ContrastingSelectionColor(Col32 background)
     }];
 }
 
+- (void)showDebugLine:(NSUInteger)line exception:(NSString *)exception
+{
+    if (_debugLine == line && (_debugException == exception || [_debugException isEqualToString:exception]))
+        return;
+    _debugLine = line;
+    _debugException = exception;
+    [self setNeedsDisplayInRect:self.visibleRect];
+}
+
+- (NSRect)debugLineInRect:(NSRect)dirty used:(NSRect *)used
+{
+    if (!self.debugLine || self.debugLine > self.syntax.lineCount)
+        return NSZeroRect;
+    NSLayoutManager *layout = self.layoutManager;
+    NSPoint origin = self.textContainerOrigin;
+    NSRect row = NSMakeRect(0, NSMinY(dirty) - origin.y, NSWidth(self.bounds), NSHeight(dirty));
+    NSRange visible = [layout glyphRangeForBoundingRect:row inTextContainer:self.textContainer];
+    NSUInteger offset = [self.syntax offsetForLine:self.debugLine - 1];
+    NSRect fragment = NSZeroRect;
+    if (offset == self.string.length) {
+        if (layout.extraLineFragmentTextContainer == self.textContainer)
+            fragment = layout.extraLineFragmentRect;
+    } else if (visible.length) {
+        NSRange characters = [layout characterRangeForGlyphRange:visible actualGlyphRange:nullptr];
+        if (!NSLocationInRange(offset, characters))
+            return NSZeroRect;
+        NSUInteger glyph = [layout glyphIndexForCharacterAtIndex:offset];
+        fragment = [layout lineFragmentRectForGlyphAtIndex:glyph effectiveRange:nullptr];
+        *used = NSOffsetRect([layout lineFragmentUsedRectForGlyphAtIndex:glyph effectiveRange:nullptr], origin.x, origin.y);
+    }
+    return NSMakeRect(NSMinX(dirty), NSMinY(fragment) + origin.y, NSWidth(dirty), NSHeight(fragment));
+}
+
+- (void)drawDebugExceptionInRect:(NSRect)line used:(NSRect)used
+{
+    NSString *message = self.debugException;
+    if (!message.length || NSIsEmptyRect(line))
+        return;
+    NSRect visible = self.visibleRect;
+    constexpr CGFloat inset = 8;
+    CGFloat end = NSMaxX(visible) - inset;
+    CGFloat maximum = std::min(NSWidth(visible) - 2 * inset, std::clamp(NSWidth(visible) * 0.48, 100.0, 460.0));
+    if (maximum <= 0)
+        return;
+
+    NSRange newline = [message rangeOfCharacterFromSet:NSCharacterSet.newlineCharacterSet];
+    if (newline.location != NSNotFound)
+        message = [message substringToIndex:newline.location];
+    BOOL dark = self.theme->dark;
+    NSColor *ink = SRGBColor(dark ? rgb(255, 187, 183) : rgb(140, 27, 26));
+    NSMutableParagraphStyle *style = [[NSMutableParagraphStyle alloc] init];
+    style.alignment = NSTextAlignmentRight;
+    style.lineBreakMode = NSLineBreakByTruncatingTail;
+    NSFont *font = [NSFont systemFontOfSize:std::min(12.0, self.editorFont.pointSize)];
+    NSDictionary *attributes = @{NSForegroundColorAttributeName:ink, NSFontAttributeName:font, NSParagraphStyleAttributeName:style};
+    CGFloat width = std::min(maximum, std::ceil([message sizeWithAttributes:attributes].width) + 1);
+    CGFloat x = end - width;
+    if (x < NSMaxX(used) + inset) {
+        // Keep the message visible when source text reaches the right edge.
+        [SRGBColor(dark ? rgb(98, 42, 40) : rgb(251, 222, 220)) setFill];
+        NSRectFill(NSMakeRect(x - 5, NSMinY(line), width + inset + 5, NSHeight(line)));
+    }
+    CGFloat y = NSMidY(line) - (font.ascender - font.descender) / 2;
+    [message drawInRect:NSMakeRect(x, y, width, NSHeight(line)) withAttributes:attributes];
+}
+
 - (void)drawVimBlockCarets:(const std::vector<VimBlockCaret> &)carets dirty:(NSRect)dirty
 {
     CodeLayoutManager *layout = (CodeLayoutManager *)self.layoutManager;
@@ -2273,6 +2375,14 @@ static NSColor *ContrastingSelectionColor(Col32 background)
             [SRGBColor(self.theme->line) setFill];
             NSRectFill(NSIntersectionRect(self.currentLine, rect));
         }
+        NSRect debugUsed = NSZeroRect;
+        NSRect debugLine = [self debugLineInRect:rect used:&debugUsed];
+        if (NSIntersectsRect(debugLine, rect)) {
+            NSColor *tone = self.debugException.length ? SRGBColor(rgb(212, 57, 52)) :
+                self.theme->dark ? SRGBColor(rgb(222, 185, 63)) : SRGBColor(rgb(245, 195, 49));
+            [[tone colorWithAlphaComponent:self.debugException.length ? 0.32 : 0.19] setFill];
+            NSRectFillUsingOperation(NSIntersectionRect(debugLine, rect), NSCompositingOperationSourceOver);
+        }
         [self drawWordOccurrences:rect];
         std::vector<NSRange> selections;
         std::vector<NSRange> inactiveSelections;
@@ -2308,6 +2418,7 @@ static NSColor *ContrastingSelectionColor(Col32 background)
         [self drawFoldMarks:rect];
         [self drawBracketMatch:rect flash:NO];
         [self drawBuildErrors:rect];
+        [self drawDebugExceptionInRect:debugLine used:debugUsed];
         if (!blockCarets.empty())
             [self drawVimBlockCarets:blockCarets dirty:rect];
         if (self.vimEnabled || self.cursorCount > 1)
@@ -2409,13 +2520,167 @@ NSView *CreateEditorPreview()
     return [[EditorPreview alloc] init];
 }
 
+struct GutterBreakpointHit {
+    NSUInteger line = 0;
+    NSRect dot = NSZeroRect;
+};
+
+static CGFloat GutterLineCenter(NSRect fragment, CGFloat originY)
+{
+    return originY + NSMidY(fragment) - editorLineSpacing / 2;
+}
+
 @interface Gutter : NSView
 @property(nonatomic, weak) CodeView *editor;
 @property(nonatomic, weak) SyntaxBuffer *buffer;
 @property(nonatomic) NSFont *numberFont;
+@property(nonatomic, weak) DebugSession *debugSession;
+@property(nonatomic, copy) void (^editBreakpoint)(NSString *, NSUInteger);
+- (void)refreshBreakpointHover;
 @end
 
-@implementation Gutter
+@implementation Gutter {
+    GutterBreakpointHit _hoveredBreakpoint;
+    BOOL _mouseInGutter;
+}
+
+- (instancetype)initWithFrame:(NSRect)frame
+{
+    self = [super initWithFrame:frame];
+    if (self) {
+        NSTrackingAreaOptions options = NSTrackingMouseEnteredAndExited | NSTrackingMouseMoved |
+            NSTrackingCursorUpdate | NSTrackingActiveInKeyWindow | NSTrackingInVisibleRect;
+        [self addTrackingArea:[[NSTrackingArea alloc] initWithRect:NSZeroRect options:options owner:self userInfo:nil]];
+    }
+    return self;
+}
+
+- (NSRect)breakpointArea
+{
+    NSRect area = self.bounds;
+    area.size.width = std::min(breakpointLane, NSWidth(area) / 2);
+    return area;
+}
+
+- (NSRect)breakpointDotAtY:(CGFloat)y
+{
+    constexpr CGFloat radius = 4;
+    return NSMakeRect(NSMidX([self breakpointArea]) - radius, y - radius, 2 * radius, 2 * radius);
+}
+
+- (GutterBreakpointHit)breakpointHitAtPoint:(NSPoint)point
+{
+    CodeView *editor = self.editor;
+    if (!editor.debugPath.length ||
+        !NSPointInRect(point, NSIntersectionRect([self breakpointArea], self.visibleRect)))
+        return {};
+
+    SyntaxBuffer *buffer = self.buffer;
+    [buffer finishHighlighting];
+    NSLayoutManager *layout = editor.layoutManager;
+    NSTextContainer *container = editor.textContainer;
+    CGFloat originY = [self convertPoint:editor.textContainerOrigin fromView:editor].y;
+    CGFloat y = point.y - originY;
+    NSRect fragment = layout.extraLineFragmentRect;
+    if (layout.extraLineFragmentTextContainer == container && y >= NSMinY(fragment) && y < NSMaxY(fragment)) {
+        return {buffer.lineCount, [self breakpointDotAtY:GutterLineCenter(fragment, originY)]};
+    }
+    if (!editor.string.length)
+        return {};
+    NSUInteger glyph = [layout glyphIndexForPoint:NSMakePoint(0, y) inTextContainer:container];
+    if (![layout isValidGlyphIndex:glyph])
+        return {};
+    NSRange fragmentGlyphs;
+    fragment = [layout lineFragmentRectForGlyphAtIndex:glyph effectiveRange:&fragmentGlyphs];
+    if (y < NSMinY(fragment) || y >= NSMaxY(fragment))
+        return {};
+    NSUInteger offset = [layout characterIndexForGlyphAtIndex:fragmentGlyphs.location];
+    NSUInteger line = [buffer lineForOffset:offset];
+    if ([buffer offsetForLine:line] != offset)
+        return {};
+    return {line + 1, [self breakpointDotAtY:GutterLineCenter(fragment, originY)]};
+}
+
+- (void)setHoveredBreakpoint:(GutterBreakpointHit)hit
+{
+    if (hit.line == _hoveredBreakpoint.line && NSEqualRects(hit.dot, _hoveredBreakpoint.dot))
+        return;
+    if (_hoveredBreakpoint.line)
+        [self setNeedsDisplayInRect:NSInsetRect(_hoveredBreakpoint.dot, -1, -1)];
+    _hoveredBreakpoint = hit;
+    if (hit.line)
+        [self setNeedsDisplayInRect:NSInsetRect(hit.dot, -1, -1)];
+}
+
+- (void)updateBreakpointHoverAtWindowPoint:(NSPoint)windowPoint
+{
+    NSPoint point = [self convertPoint:windowPoint fromView:nil];
+    _mouseInGutter = NSPointInRect(point, self.visibleRect);
+    GutterBreakpointHit hit = [self breakpointHitAtPoint:point];
+    [self setHoveredBreakpoint:hit];
+    if (_mouseInGutter)
+        [(hit.line ? NSCursor.pointingHandCursor : NSCursor.arrowCursor) set];
+}
+
+- (void)refreshBreakpointHover
+{
+    if (!_mouseInGutter)
+        return;
+    if (self.window.isKeyWindow)
+        [self updateBreakpointHoverAtWindowPoint:self.window.mouseLocationOutsideOfEventStream];
+    else
+        [self setHoveredBreakpoint:GutterBreakpointHit{}];
+}
+
+- (void)viewDidMoveToWindow
+{
+    [super viewDidMoveToWindow];
+    [self refreshBreakpointHover];
+}
+
+- (void)mouseMoved:(NSEvent *)event
+{
+    [self updateBreakpointHoverAtWindowPoint:event.locationInWindow];
+}
+
+- (void)mouseEntered:(NSEvent *)event { [self mouseMoved:event]; }
+- (void)cursorUpdate:(NSEvent *)event { [self mouseMoved:event]; }
+
+- (void)mouseExited:(NSEvent *)event
+{
+    (void)event;
+    _mouseInGutter = NO;
+    [self setHoveredBreakpoint:GutterBreakpointHit{}];
+}
+
+- (void)mouseDown:(NSEvent *)event
+{
+    NSPoint point = [self convertPoint:event.locationInWindow fromView:nil];
+    NSUInteger line = [self breakpointHitAtPoint:point].line;
+    NSString *path = self.editor.debugPath;
+    if (line)
+        SetDebugBreakpoint(path, line, DebugBreakpoints(path)[@(line)] ? nil : @{});
+}
+
+- (NSMenu *)menuForEvent:(NSEvent *)event
+{
+    NSPoint point = [self convertPoint:event.locationInWindow fromView:nil];
+    NSUInteger line = [self breakpointHitAtPoint:point].line;
+    if (!line)
+        return nil;
+    NSMenu *menu = [[NSMenu alloc] initWithTitle:@""];
+    NSMenuItem *item = [menu addItemWithTitle:@"Edit Breakpoint…" action:@selector(editBreakpointFromMenu:) keyEquivalent:@""];
+    item.target = self;
+    item.representedObject = @[self.editor.debugPath, @(line)];
+    return menu;
+}
+
+- (void)editBreakpointFromMenu:(NSMenuItem *)sender
+{
+    NSArray *location = sender.representedObject;
+    if (self.editBreakpoint)
+        self.editBreakpoint(location[0], [location[1] unsignedIntegerValue]);
+}
 
 - (BOOL)isFlipped
 {
@@ -2453,6 +2718,7 @@ NSView *CreateEditorPreview()
     NSLayoutManager *layout = editor.layoutManager;
     NSTextContainer *container = editor.textContainer;
     NSPoint origin = editor.textContainerOrigin;
+    CGFloat originY = [self convertPoint:origin fromView:editor].y;
     NSRect visible = editor.visibleRect;
     NSRect area = NSMakeRect(0, NSMinY(visible) - origin.y, NSWidth(editor.bounds), NSHeight(visible));
     NSRange glyphs = [layout glyphRangeForBoundingRect:area inTextContainer:container];
@@ -2462,13 +2728,28 @@ NSView *CreateEditorPreview()
     NSDictionary *activeInk = @{NSFontAttributeName:font, NSForegroundColorAttributeName:SRGBColor(theme.activeNumber)};
     CGContextRef context = NSGraphicsContext.currentContext.CGContext;
     CGFloat scale = std::abs(CGContextGetCTM(context).d);
+    NSString *path = editor.debugPath;
+    NSDictionary *breakpoints = DebugBreakpoints(path);
 
     void (^drawNumber)(NSUInteger, NSRect) = ^(NSUInteger line, NSRect fragment) {
-        CGFloat textCenter = NSMidY(fragment) - editorLineSpacing / 2;
-        CGFloat center = [self convertPoint:NSMakePoint(0, origin.y + textCenter) fromView:editor].y;
+        CGFloat center = GutterLineCenter(fragment, originY);
         CGFloat halfHeight = NSHeight(fragment) / 2;
         if (center + halfHeight < NSMinY(dirty) || center - halfHeight > NSMaxY(dirty))
             return;
+        NSDictionary *options = breakpoints.count ? breakpoints[@(line + 1)] : nil;
+        if (options || _hoveredBreakpoint.line == line + 1) {
+            BOOL disabled = [options[@"disabled"] boolValue];
+            NSColor *ink = disabled ? NSColor.tertiaryLabelColor : SRGBColor(rgb(224, 63, 58));
+            NSBezierPath *dot = [NSBezierPath bezierPathWithOvalInRect:[self breakpointDotAtY:center]];
+            if (options && (disabled || (self.debugSession && ![self.debugSession breakpointResolved:path line:line + 1]))) {
+                [ink setStroke];
+                dot.lineWidth = 1.5;
+                [dot stroke];
+            } else {
+                [(options ? ink : [ink colorWithAlphaComponent:0.36]) setFill];
+                [dot fill];
+            }
+        }
         NSString *number = [editor vimLineNumber:line current:current];
         if (!number.length)
             return;
@@ -2546,17 +2827,87 @@ static NSTextField *StatusLabel(NSString *title)
     return label;
 }
 
-static void SetRunButton(NSButton *button, BOOL running)
+static bool HasEnabledBreakpoint(NSDictionary<NSNumber *, NSDictionary *> *lines)
 {
-    NSString *title = running ? @"Stop" : @"Run";
-    if (!button || [button.toolTip isEqualToString:title])
+    for (NSDictionary *options in lines.objectEnumerator) {
+        if (![options[@"disabled"] boolValue])
+            return true;
+    }
+    return false;
+}
+
+static bool RunHasBreakpoint(RunProject project, Language language, NSURL *file)
+{
+    if (!file || !DebuggableLanguage(language, file))
+        return false;
+    if (HasEnabledBreakpoint(DebugBreakpoints(file.path)))
+        return true;
+
+    NSURL *root = project.manifest ? project.manifest.URLByDeletingLastPathComponent : project.folder;
+    NSString *folder = root.path;
+    if (!folder.length)
+        return false;
+    auto *breakpoints = DebugAllBreakpoints();
+    for (NSString *path in breakpoints) {
+        if (!PathIsInFolder(path, folder) || !HasEnabledBreakpoint(breakpoints[path]))
+            continue;
+        NSURL *source = [NSURL fileURLWithPath:path];
+        Language sourceLanguage = LanguageForSource(source);
+        if ((sourceLanguage == language || (CFamily(language) && CFamily(sourceLanguage))) &&
+            [NSFileManager.defaultManager fileExistsAtPath:path])
+            return true;
+    }
+    return false;
+}
+
+enum class RunCommand { Run, Continue, Stop };
+
+static NSString *RunCommandTitle(RunCommand command)
+{
+    if (command == RunCommand::Continue)
+        return @"Continue";
+    return command == RunCommand::Stop ? @"Stop" : @"Run";
+}
+
+static NSImage *ContinueButtonImage()
+{
+    static NSImage *image = [] {
+        NSImage *symbol = [NSImage imageWithSize:NSMakeSize(18, 18) flipped:YES drawingHandler:^BOOL(NSRect) {
+            [NSColor.blackColor setFill];
+            [[NSBezierPath bezierPathWithRoundedRect:NSMakeRect(1.5, 2, 3.5, 14) xRadius:0.65 yRadius:0.65] fill];
+
+            NSBezierPath *triangle = [NSBezierPath bezierPath];
+            [triangle moveToPoint:NSMakePoint(7.5, 2)];
+            [triangle lineToPoint:NSMakePoint(17, 9)];
+            [triangle lineToPoint:NSMakePoint(7.5, 16)];
+            [triangle closePath];
+            [triangle fill];
+            return YES;
+        }];
+        [symbol setTemplate:YES];
+        symbol.accessibilityDescription = @"Continue";
+        return symbol;
+    }();
+    return image;
+}
+
+static void SetRunButton(NSButton *button, RunCommand command)
+{
+    NSString *title = RunCommandTitle(command);
+    if (!button || [button.accessibilityLabel isEqualToString:title])
         return;
-    NSImage *symbol = [NSImage imageWithSystemSymbolName:running ? @"stop.fill" : @"play.fill" accessibilityDescription:title];
-    NSImageSymbolConfiguration *size = [NSImageSymbolConfiguration configurationWithPointSize:18 weight:NSFontWeightRegular];
-    button.image = [symbol imageWithSymbolConfiguration:size];
-    button.contentTintColor = running ? nil : SRGBColor(rgb(46, 148, 69));
+    bool stop = command == RunCommand::Stop;
+    if (command == RunCommand::Continue) {
+        button.image = ContinueButtonImage();
+    } else {
+        NSImage *symbol = [NSImage imageWithSystemSymbolName:stop ? @"stop.fill" : @"play.fill" accessibilityDescription:title];
+        NSImageSymbolConfiguration *size = [NSImageSymbolConfiguration configurationWithPointSize:18 weight:NSFontWeightRegular];
+        button.image = [symbol imageWithSymbolConfiguration:size];
+    }
+    button.contentTintColor = stop ? nil : SRGBColor(rgb(46, 148, 69));
     button.accessibilityLabel = title;
-    button.toolTip = title;
+    button.toolTip = command == RunCommand::Continue ? DebugCommandToolTip(DebugCommand::Continue, title) :
+        [title stringByAppendingString:@" (⌘R)"];
 }
 
 @interface SourceDocument (VimActions)
@@ -2568,6 +2919,7 @@ static void SetRunButton(NSButton *button, BOOL running)
 - (void)revealRunLocation:(const RunLocation &)location;
 - (void)cancelRun;
 - (NSUInteger)beginBuildDiagnostics;
+- (NSUInteger)diagnosticVersion;
 - (void)applyBuildMessages:(const std::vector<RunMessage> &)messages version:(NSUInteger)version owner:(BOOL)owner;
 @end
 
@@ -2586,6 +2938,7 @@ struct BuildTarget {
     __weak SourceDocument *document;
     NSUInteger version;
     bool owner;
+    NSURL *file = nil;
 };
 
 static void SaveBuildDocuments(NSArray<SourceDocument *> *documents, NSUInteger next, SourceRunner *runner,
@@ -2667,16 +3020,42 @@ static Vim::EditBatch IndentationConversion(NSString *text, Indentation style)
 static void SyncNativeTabOutput(NSWindow *window);
 static char selectedOutputTabContext;
 
+enum class DockPage { Hidden, Output, Errors, Debug };
+
 @interface WindowOutput : NSObject
 @property(nonatomic) OutputPane *pane;
+@property(nonatomic) OutputPane *errorsPane;
+@property(nonatomic) DebugPane *debugPane;
+@property(nonatomic) DebugSession *debugSession;
+@property(nonatomic) SourceRunner *debugBuilder;
+@property(nonatomic) DebugExecutable *externalExecutable;
+@property(nonatomic, copy) NSArray<NSString *> *debugArguments;
+@property(nonatomic, weak) SourceDocument *debugDocument;
+@property(nonatomic) NSURL *debugFile;
+@property(nonatomic) NSURL *debugFolder;
+@property(nonatomic) Language debugLanguage;
+@property(nonatomic) BOOL restartDebug;
+@property(nonatomic, copy) NSString *debugStatus;
+@property(nonatomic, weak) NSDictionary *navigatedFrame;
+@property(nonatomic, readonly) BOOL debugging;
+- (void)stopDebug;
 @property(nonatomic, weak) EditorWindow *host;
 @property(nonatomic, weak) SourceDocument *source;
 @property(nonatomic) SourceRunner *runner;
 @property(nonatomic) FolderWorkspace *runWorkspace;
 @property(nonatomic) BOOL shown;
+@property(nonatomic) DockPage page;
 @property(nonatomic) BOOL returnFocus;
+@property(nonatomic, readonly) NSUInteger errorCount;
+@property(nonatomic, readonly) NSTimer *checkTimer;
+@property(nonatomic) SourceRunner *checkRunner;
+@property(nonatomic) RustCheckCache *checkCache;
 - (void)observeTabGroup:(NSWindowTabGroup *)group;
 - (void)finishRun;
+- (void)armCheckTimer:(NSTimeInterval)delay;
+- (void)cancelCheck;
+- (void)setCheckResult:(CheckResult)result source:(SourceDocument *)source;
+- (void)presentDiagnostics;
 @end
 
 @interface EditorWindow : NSView <NSTextViewDelegate>
@@ -2699,6 +3078,11 @@ static char selectedOutputTabContext;
 - (void)setWindowOutput:(WindowOutput *)output attach:(BOOL)attach;
 - (void)detachWindowOutput;
 - (void)showOutput:(BOOL)show;
+- (void)scheduleRustCheck;
+- (void)resumeRustCheck;
+- (void)cancelRustCheck;
+- (void)startPendingRustCheck;
+- (void)updateErrorsTab;
 - (CodeView *)editorForOutput;
 - (NSDictionary *)sessionView;
 - (void)restoreSessionView:(NSDictionary *)state;
@@ -2713,6 +3097,13 @@ static char selectedOutputTabContext;
 - (void)useAutomaticLanguage;
 - (void)refreshDetectedLanguage;
 - (IBAction)runSource:(id)sender;
+- (void)performDebugCommand:(DebugCommand)command;
+- (BOOL)canDebugCommand:(DebugCommand)command;
+- (void)debugUpdated;
+- (void)refreshDebugLocation;
+- (RunCommand)runCommand;
+- (BOOL)canRunCommand;
+- (void)refreshRunButton;
 - (IBAction)toggleOutput:(id)sender;
 - (BOOL)isRunSource;
 - (void)stopRun;
@@ -2722,6 +3113,24 @@ static char selectedOutputTabContext;
 
 @implementation WindowOutput {
     __weak NSWindowTabGroup *_tabGroup;
+    __weak SourceDocument *_diagnosticsSource;
+    std::optional<std::vector<RunMessage>> _pendingDiagnostics;
+}
+
+- (BOOL)shown { return _page == DockPage::Output; }
+- (BOOL)debugging { return _debugBuilder || (_debugSession && _debugSession.phase != DebugPhase::Finished); }
+
+- (void)stopDebug
+{
+    _restartDebug = NO;
+    [_debugBuilder stop];
+    [_debugSession stop];
+}
+
+- (void)setShown:(BOOL)shown
+{
+    if (shown || self.shown)
+        _page = shown ? DockPage::Output : DockPage::Hidden;
 }
 
 - (void)observeTabGroup:(NSWindowTabGroup *)group
@@ -2747,16 +3156,59 @@ static char selectedOutputTabContext;
     _runner = nil;
     if (_runWorkspace.runningDocument == _source)
         _runWorkspace.runningDocument = nil;
-    BOOL running = _runWorkspace.runningDocument != nil;
-    SetRunButton(host.runButton, running);
-    host.runButton.enabled = running || host.canRun;
     _runWorkspace = nil;
+    [host refreshRunButton];
+    [host resumeRustCheck];
+}
+
+- (void)armCheckTimer:(NSTimeInterval)delay
+{
+    if (_checkTimer) {
+        _checkTimer.fireDate = [NSDate dateWithTimeIntervalSinceNow:delay];
+        return;
+    }
+    __weak WindowOutput *output = self;
+    _checkTimer = [NSTimer timerWithTimeInterval:delay repeats:NO block:^(NSTimer *timer) {
+        WindowOutput *dock = output;
+        if (dock && dock->_checkTimer == timer) {
+            dock->_checkTimer = nil;
+            [dock.host startPendingRustCheck];
+        }
+    }];
+    [NSRunLoop.mainRunLoop addTimer:_checkTimer forMode:NSRunLoopCommonModes];
+}
+
+- (void)cancelCheck
+{
+    [_checkTimer invalidate];
+    _checkTimer = nil;
+    [_checkRunner stop];
+}
+
+- (void)setCheckResult:(CheckResult)result source:(SourceDocument *)source
+{
+    _errorCount = result.errors;
+    _diagnosticsSource = source;
+    _pendingDiagnostics = std::move(result.diagnostics);
+    if (_page == DockPage::Errors)
+        [self presentDiagnostics];
+    [_host updateErrorsTab];
+}
+
+- (void)presentDiagnostics
+{
+    if (_errorsPane && _pendingDiagnostics) {
+        [_errorsPane showDiagnostics:*_pendingDiagnostics source:_diagnosticsSource];
+        _pendingDiagnostics.reset();
+    }
 }
 
 - (void)dealloc
 {
     [_tabGroup removeObserver:self forKeyPath:@"selectedWindow" context:&selectedOutputTabContext];
     [_runner stop];
+    [self stopDebug];
+    [self cancelCheck];
 }
 
 @end
@@ -2776,6 +3228,8 @@ static char selectedOutputTabContext;
     NSPopUpButton *_language;
     NSButton *_indentationButton;
     DockTab *_outputTab;
+    DockTab *_errorsTab;
+    DockTab *_debugTab;
     DockRail *_outputRail;
     DockDivider *_outputDivider;
     DockDropTarget *_dropTarget;
@@ -2790,6 +3244,7 @@ static char selectedOutputTabContext;
     BOOL _scrollRepaintPending;
     BOOL _automaticLanguageMode;
     BOOL _detectLanguageFromContent;
+    BOOL _needsRustCheck;
 }
 
 - (instancetype)initWithDocument:(SourceDocument *)document text:(NSString *)text language:(Language)language
@@ -2830,12 +3285,19 @@ static char selectedOutputTabContext;
     _scroll.contentView.postsBoundsChangedNotifications = YES;
     [self addSubview:_scroll];
 
-    _gutter = [[Gutter alloc] init];
+    _gutter = [[Gutter alloc] initWithFrame:NSZeroRect];
     _gutter.editor = _editor;
     _gutter.buffer = _buffer;
+    _editor.debugPath = DebugSourcePath(document.fileURL);
+    _buffer.breakpointPath = _editor.debugPath;
+    __weak EditorWindow *debugEditor = parent ? parent : self;
+    _gutter.editBreakpoint = ^(NSString *path, NSUInteger line) { [debugEditor editBreakpoint:path line:line]; };
+    [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(breakpointChanged:)
+                                               name:DebugBreakpointsChanged object:nil];
     [self addSubview:_gutter];
 
     if (!parent) {
+        _needsRustCheck = language == Language::Rust;
         _windowOutput = [[WindowOutput alloc] init];
         _windowOutput.host = self;
         _statusBar = [[WindowStatusBar alloc] init];
@@ -2854,16 +3316,7 @@ static char selectedOutputTabContext;
         _outputRail = [[DockRail alloc] init];
         _outputRail.clipsToBounds = YES;
         [self addSubview:_outputRail];
-        _outputTab = [[DockTab alloc] initWithFrame:NSZeroRect];
-        _outputTab.title = @"Output";
-        _outputTab.target = self;
-        _outputTab.action = @selector(toggleOutput:);
-        [_outputTab setButtonType:NSButtonTypePushOnPushOff];
-        _outputTab.bezelStyle = NSBezelStyleAccessoryBar;
-        _outputTab.controlSize = NSControlSizeSmall;
-        _outputTab.clipsToBounds = YES;
         __weak EditorWindow *view = self;
-        _outputTab.track = ^(NSPoint point, BOOL finished) { [view dragOutputTab:point finished:finished]; };
         NSMenu *dockMenu = [[NSMenu alloc] initWithTitle:@"Output"];
         for (NSString *title in @[@"Dock Bottom", @"Dock Left", @"Dock Right", @"Dock Top"]) {
             NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:title action:@selector(chooseOutputDock:) keyEquivalent:@""];
@@ -2871,8 +3324,9 @@ static char selectedOutputTabContext;
             item.tag = dockMenu.numberOfItems;
             [dockMenu addItem:item];
         }
-        _outputTab.menu = dockMenu;
-        [_outputRail addSubview:_outputTab];
+        _outputTab = [self addDockTab:@"Output" action:@selector(toggleOutput:) menu:dockMenu];
+        _errorsTab = [self addDockTab:@"0 Errors" action:@selector(toggleErrors:) menu:dockMenu];
+        _debugTab = [self addDockTab:@"Debug" action:@selector(toggleDebug:) menu:dockMenu];
         _outputDivider = [[DockDivider alloc] init];
         _outputDivider.resize = ^(CGFloat delta, BOOL finished) { [view resizeOutputBy:delta finished:finished]; };
         _outputDivider.hidden = YES;
@@ -3020,6 +3474,23 @@ static char selectedOutputTabContext;
     _dockHeight = std::isfinite(height) && height >= 74 ? height : 172;
 }
 
+- (DockTab *)addDockTab:(NSString *)title action:(SEL)action menu:(NSMenu *)menu
+{
+    DockTab *tab = [[DockTab alloc] initWithFrame:NSZeroRect];
+    tab.title = title;
+    tab.target = self;
+    tab.action = action;
+    [tab setButtonType:NSButtonTypePushOnPushOff];
+    tab.bezelStyle = NSBezelStyleAccessoryBar;
+    tab.controlSize = NSControlSizeSmall;
+    tab.clipsToBounds = YES;
+    tab.menu = menu;
+    __weak EditorWindow *view = self;
+    tab.track = ^(NSPoint point, BOOL finished) { [view dragOutputTab:point finished:finished]; };
+    [_outputRail addSubview:tab];
+    return tab;
+}
+
 - (void)moveOutputDock:(DockSide)side
 {
     if (_dockSide != side) {
@@ -3084,27 +3555,69 @@ static char selectedOutputTabContext;
     return editor && editor.window == self.window ? editor : self.activeEditor;
 }
 
-- (void)attachOutputPane
+- (void)updateErrorsTab
 {
-    OutputPane *pane = _windowOutput.pane;
-    if (!pane && _windowOutput.shown) {
-        pane = [[OutputPane alloc] initWithFrame:NSMakeRect(0, 0, NSWidth(self.bounds), 160)];
+    NSUInteger count = _windowOutput.errorCount;
+    NSString *title = count == 1 ? @"1 Error" : [NSString stringWithFormat:@"%lu Errors", (unsigned long)count];
+    if (![_errorsTab.title isEqualToString:title]) {
+        _errorsTab.title = title;
+        self.needsLayout = YES;
+    }
+}
+
+- (void)attachDockPanes
+{
+    for (DockPage page : {DockPage::Output, DockPage::Errors}) {
+        bool diagnostics = page == DockPage::Errors;
+        BOOL shown = _windowOutput.page == page;
+        OutputPane *pane = diagnostics ? _windowOutput.errorsPane : _windowOutput.pane;
+        if (!pane && shown) {
+            pane = [[OutputPane alloc] initWithFrame:NSMakeRect(0, 0, NSWidth(self.bounds), 160) diagnostics:diagnostics];
+            __weak WindowOutput *output = _windowOutput;
+            pane.openLocation = ^(const RunLocation &location, SourceDocument *source) {
+                [output.host openRunLocation:location source:source];
+            };
+            if (diagnostics) {
+                _windowOutput.errorsPane = pane;
+            } else {
+                pane.sendInput = ^BOOL(NSString *line) { return [output.runner sendInput:line]; };
+                _windowOutput.pane = pane;
+            }
+        }
+        pane.hidden = !shown;
+        if (pane && pane.superview != self) {
+            [pane removeFromSuperview];
+            [self addSubview:pane positioned:NSWindowBelow relativeTo:_outputRail];
+            [pane applyFont:_editor.editorFont rendering:_editor.rendering dark:_editor.theme->dark];
+        }
+    }
+    BOOL showDebugger = _windowOutput.page == DockPage::Debug;
+    DebugPane *debugger = _windowOutput.debugPane;
+    if (showDebugger && !debugger) {
+        debugger = [[DebugPane alloc] initWithFrame:NSZeroRect];
         __weak WindowOutput *output = _windowOutput;
-        pane.openLocation = ^(const RunLocation &location, SourceDocument *source) {
+        debugger.command = ^(DebugCommand command) { [output.host performDebugCommand:command]; };
+        debugger.openLocation = ^(NSString *path, NSUInteger line) {
+            [output.host openDebugLocation:path line:line column:1];
+        };
+        debugger.editBreakpoint = ^(NSString *path, NSUInteger line) { [output.host editBreakpoint:path line:line]; };
+        debugger.console.openLocation = ^(const RunLocation &location, SourceDocument *source) {
             [output.host openRunLocation:location source:source];
         };
-        pane.sendInput = ^BOOL(NSString *line) {
-            return [output.runner sendInput:line];
-        };
-        _windowOutput.pane = pane;
+        _windowOutput.debugPane = debugger;
     }
-    if (pane && pane.superview != self) {
-        [pane removeFromSuperview];
-        [self addSubview:pane positioned:NSWindowBelow relativeTo:_outputRail];
-        [pane applyFont:_editor.editorFont rendering:_editor.rendering dark:_editor.theme->dark];
+    debugger.hidden = !showDebugger;
+    if (debugger && debugger.superview != self) {
+        [debugger removeFromSuperview];
+        [self addSubview:debugger positioned:NSWindowBelow relativeTo:_outputRail];
+        [debugger.console applyFont:_editor.editorFont rendering:_editor.rendering dark:_editor.theme->dark];
     }
-    pane.hidden = !_windowOutput.shown;
+    _debugTab.state = showDebugger ? NSControlStateValueOn : NSControlStateValueOff;
+    if (_windowOutput.page == DockPage::Errors)
+        [_windowOutput presentDiagnostics];
     _outputTab.state = _windowOutput.shown ? NSControlStateValueOn : NSControlStateValueOff;
+    _errorsTab.state = _windowOutput.page == DockPage::Errors ? NSControlStateValueOn : NSControlStateValueOff;
+    [self updateErrorsTab];
 }
 
 - (void)setWindowOutput:(WindowOutput *)output attach:(BOOL)attach
@@ -3115,37 +3628,71 @@ static char selectedOutputTabContext;
         self.needsLayout = YES;
     }
     if (attach && output.host != self) {
+        [output cancelCheck];
         output.host = self;
         [self readDockPlacement];
-        [self attachOutputPane];
+        [self attachDockPanes];
         self.needsLayout = YES;
+    }
+    if (attach) {
+        [self refreshDebugLocation];
+        [self resumeRustCheck];
     }
 }
 
 - (void)detachWindowOutput
 {
     if (_windowOutput.host == self) {
+        [_windowOutput cancelCheck];
         _windowOutput.host = nil;
         [_windowOutput.pane removeFromSuperview];
+        [_windowOutput.errorsPane removeFromSuperview];
+        [_windowOutput.debugPane removeFromSuperview];
     }
+    [_editor showDebugLine:0 exception:nil];
+    [_secondPane.editor showDebugLine:0 exception:nil];
+    _gutter.debugSession = nil;
+    if (_secondPane)
+        _secondPane->_gutter.debugSession = nil;
 }
 
 - (void)showOutput:(BOOL)show
 {
-    if (show == self.outputShown)
+    if (show != self.outputShown)
+        [self showDockPage:show ? DockPage::Output : DockPage::Hidden];
+}
+
+- (void)showDockPage:(DockPage)page
+{
+    if (_windowOutput.page == page)
         return;
+    BOOL show = page != DockPage::Hidden;
     CodeView *source = [self editorForOutput];
     NSUInteger offset = std::min(source.vimDisplayedCursor, source.string.length);
     NSRect caret = show ? [source vimCaretAt:offset] : NSZeroRect;
     BOOL keepCaretVisible = show && NSIntersectsRect(caret, source.visibleRect);
-    if (!show && _windowOutput.pane.hasKeyboardFocus)
-        [self.window makeFirstResponder:[self editorForOutput]];
-    _windowOutput.shown = show;
-    [self attachOutputPane];
+    if (_windowOutput.pane.hasKeyboardFocus || _windowOutput.errorsPane.hasKeyboardFocus ||
+        _windowOutput.debugPane.hasKeyboardFocus)
+        [self.window makeFirstResponder:source];
+    _windowOutput.page = page;
+    [self attachDockPanes];
     [self setNeedsLayout:YES];
     [self layoutSubtreeIfNeeded];
     if (keepCaretVisible && !NSContainsRect(source.visibleRect, caret))
         [source scrollRangeToVisible:NSMakeRange(offset, 0)];
+}
+
+- (IBAction)toggleDebug:(id)sender
+{
+    (void)sender;
+    [self showDockPage:_windowOutput.page == DockPage::Debug ? DockPage::Hidden : DockPage::Debug];
+    [self refreshDebugControls];
+}
+
+- (IBAction)toggleErrors:(id)sender
+{
+    (void)sender;
+    [self showDockPage:_windowOutput.page == DockPage::Errors ? DockPage::Hidden : DockPage::Errors];
 }
 
 - (IBAction)toggleOutput:(id)sender
@@ -3258,6 +3805,101 @@ static char selectedOutputTabContext;
     return documents;
 }
 
+- (void)scheduleRustCheck
+{
+    _needsRustCheck = _buffer.language == Language::Rust;
+    WindowOutput *dock = _windowOutput;
+    if (dock.host != self)
+        return;
+    if (![self canQueueRustCheck]) {
+        [dock cancelCheck];
+        return;
+    }
+    [dock.checkRunner stop];
+    [dock armCheckTimer:1];
+}
+
+- (BOOL)canQueueRustCheck
+{
+    WindowOutput *dock = _windowOutput;
+    return _needsRustCheck && dock.host == self && self.window.isKeyWindow &&
+           !dock.runner && !dock.debugging && !_document.workspace.runningDocument;
+}
+
+- (void)resumeRustCheck
+{
+    WindowOutput *dock = _windowOutput;
+    if ([self canQueueRustCheck] && !dock.checkTimer && (!dock.checkRunner || dock.checkRunner.isStopped))
+        [dock armCheckTimer:1];
+}
+
+- (void)cancelRustCheck
+{
+    _needsRustCheck = NO;
+    if (_windowOutput.host == self)
+        [_windowOutput cancelCheck];
+}
+
+- (void)startPendingRustCheck
+{
+    WindowOutput *dock = _windowOutput;
+    SourceDocument *owner = _document;
+    if (!owner || !_needsRustCheck || dock.host != self || !self.window || dock.checkRunner || dock.runner ||
+        dock.debugging || owner.workspace.runningDocument || self.hasMarkedEditorText)
+        return;
+
+    NSURL *file = CanonicalFileURL(owner.fileURL);
+    RunProject project = LocateRunProject(Language::Rust, file, file ? owner.workspace.folder : nil);
+    NSArray<SourceDocument *> *documents = [self documentsForBuild:project];
+    std::vector<CheckSource> sources;
+    std::vector<BuildTarget> targets;
+    sources.reserve(documents.count);
+    targets.reserve(documents.count);
+    for (SourceDocument *document in documents) {
+        NSURL *path = CanonicalFileURL(document.fileURL);
+        bool active = document == owner;
+        targets.push_back({document, document.diagnosticVersion, active, path});
+        if (active || (path && document.isDocumentEdited)) {
+            NSString *text = document.sourceText;
+            sources.push_back({path, document.hasUTF8BOM ? [@"\uFEFF" stringByAppendingString:text] : [text copy]});
+        }
+    }
+
+    SourceRunner *checker = [[SourceRunner alloc] init];
+    dock.checkRunner = checker;
+    if (project.kind == RunKind::Cargo && !dock.checkCache)
+        dock.checkCache = [[RustCheckCache alloc] init];
+    __weak WindowOutput *output = dock;
+    __weak EditorWindow *view = self;
+    __weak SourceDocument *document = owner;
+    [checker checkRustProject:project file:file name:file ? file.lastPathComponent : owner.displayName
+                       sources:std::move(sources) cache:dock.checkCache finished:^(CheckResult result) {
+        WindowOutput *console = output;
+        if (console.checkRunner != checker)
+            return;
+        console.checkRunner = nil;
+        EditorWindow *root = view;
+        if (!checker.isStopped && root && console.host == root) {
+            bool current = std::ranges::all_of(targets, [](const BuildTarget &target) {
+                SourceDocument *source = target.document;
+                NSURL *path = CanonicalFileURL(source.fileURL);
+                return source && source.diagnosticVersion == target.version && (path == target.file || [path isEqual:target.file]);
+            });
+            if (current) {
+                root->_needsRustCheck = NO;
+                for (const auto &target : targets) {
+                    if (target.owner || [target.file.pathExtension.lowercaseString isEqualToString:@"rs"]) {
+                        [target.document beginBuildDiagnostics];
+                        [target.document applyBuildMessages:result.diagnostics version:target.version owner:target.owner];
+                    }
+                }
+                [console setCheckResult:std::move(result) source:document];
+            }
+        }
+        [console.host resumeRustCheck];
+    }];
+}
+
 - (void)launchRun:(RunProject)project language:(Language)language file:(NSURL *)file output:(WindowOutput *)output
         documents:(NSArray<SourceDocument *> *)documents startingFocus:(NSResponder *)focus
 {
@@ -3301,35 +3943,515 @@ static char selectedOutputTabContext;
     }];
 }
 
+- (RunCommand)runCommand
+{
+    if (_windowOutput.debugSession.phase == DebugPhase::Paused)
+        return RunCommand::Continue;
+    if (self.running || self.isRunSource || _document.workspace.runningDocument || _windowOutput.debugging)
+        return RunCommand::Stop;
+    return RunCommand::Run;
+}
+
+- (BOOL)canRunCommand
+{
+    DebugSession *session = _windowOutput.debugSession;
+    switch (self.runCommand) {
+    case RunCommand::Continue:
+        return session.threadID != nil;
+    case RunCommand::Stop:
+        return session.phase != DebugPhase::Stopping;
+    case RunCommand::Run:
+        return self.canRun || (DebuggableLanguage(_buffer.language, _document.fileURL) &&
+                              HasEnabledBreakpoint(DebugBreakpoints(_editor.debugPath)));
+    }
+}
+
+- (void)refreshRunButton
+{
+    NSButton *button = self.runButton;
+    if (button) {
+        SetRunButton(button, self.runCommand);
+        button.enabled = self.canRunCommand;
+    }
+}
+
+- (NSUInteger)debugCursorLine
+{
+    [_buffer finishHighlighting];
+    CodeView *editor = self.activeEditor;
+    return [_buffer lineForOffset:std::min(editor.vimDisplayedCursor, editor.string.length)] + 1;
+}
+
+- (BOOL)canDebugCommand:(DebugCommand)command
+{
+    WindowOutput *dock = _windowOutput;
+    if (!dock || self.window.attachedSheet)
+        return NO;
+    DebugSession *session = dock.debugSession;
+    BOOL available = !dock.runner && !_document.workspace.runningDocument;
+    BOOL paused = session && session.phase == DebugPhase::Paused;
+    BOOL stopping = session && session.phase == DebugPhase::Stopping;
+    BOOL hasTarget = dock.debugFile || dock.externalExecutable;
+    switch (command) {
+    case DebugCommand::Continue:
+        return paused || (!dock.debugging && available && (DebuggableLanguage(_buffer.language, _document.fileURL) || hasTarget));
+    case DebugCommand::StepOver:
+    case DebugCommand::StepInto:
+    case DebugCommand::StepOut:
+        return paused && session.threadID;
+    case DebugCommand::Pause:
+        return session && session.phase == DebugPhase::Running;
+    case DebugCommand::Restart:
+        return available && hasTarget && !stopping && !session.attached;
+    case DebugCommand::Stop:
+        return dock.debugging && !stopping;
+    case DebugCommand::ToggleBreakpoint:
+    case DebugCommand::EditBreakpoint:
+        return _editor.debugPath.length > 0;
+    case DebugCommand::RunToCursor:
+        return paused && session.threadID && _editor.debugPath.length > 0;
+    case DebugCommand::ChooseExecutable:
+    case DebugCommand::Attach:
+    case DebugCommand::Arguments:
+        return available && !dock.debugging;
+    case DebugCommand::ShowPane:
+        return YES;
+    }
+}
+
+- (void)breakpointChanged:(NSNotification *)notification
+{
+    NSString *path = notification.object;
+    if ([_editor.debugPath isEqualToString:path]) {
+        [_gutter setNeedsDisplay:YES];
+        [self refreshRunButton];
+    }
+    if (_windowOutput.host == self) {
+        [_windowOutput.debugSession sendBreakpoints:path];
+        [_windowOutput.debugPane breakpointsChanged];
+    }
+}
+
+- (void)refreshDebugLocation
+{
+    DebugSession *session = _windowOutput.debugSession;
+    NSString *file = DebugSourcePath(_document.fileURL);
+    _editor.debugPath = file;
+    _buffer.breakpointPath = file;
+    _secondPane.editor.debugPath = file;
+    NSDictionary *frame = session.frame;
+    NSString *path = frame[@"source"][@"path"];
+    NSUInteger line = 0;
+    if (session.phase == DebugPhase::Paused && path.isAbsolutePath &&
+        [file isEqualToString:DebugSourcePath([NSURL fileURLWithPath:path])]) {
+        line = [frame[@"line"] unsignedIntegerValue];
+    }
+    [_editor showDebugLine:line exception:line ? session.exception : nil];
+    [_secondPane.editor showDebugLine:line exception:line ? session.exception : nil];
+    _gutter.debugSession = _windowOutput.debugging ? session : nil;
+    [_gutter refreshBreakpointHover];
+    [_gutter setNeedsDisplay:YES];
+    if (_secondPane) {
+        _secondPane->_gutter.debugSession = _gutter.debugSession;
+        [_secondPane->_gutter refreshBreakpointHover];
+        [_secondPane->_gutter setNeedsDisplay:YES];
+    }
+}
+
+- (void)openDebugLocation:(NSString *)path line:(NSUInteger)line column:(NSUInteger)column
+{
+    if (!path.isAbsolutePath || !line || ![NSFileManager.defaultManager fileExistsAtPath:path])
+        return;
+    NSURL *file = CanonicalFileURL([NSURL fileURLWithPath:path]);
+    RunLocation location{file, line, column, 0, 0, false, false};
+    SourceDocument *document = [_editor.debugPath isEqualToString:file.path] ? _document : nil;
+    [self openRunLocation:location source:document];
+}
+
+- (void)refreshDebugControls
+{
+    WindowOutput *dock = _windowOutput;
+    [self refreshRunButton];
+    dock.debugPane.session = dock.debugSession;
+    [dock.debugPane updateStatus:dock.debugStatus building:dock.debugBuilder != nil
+                    restartable:(dock.debugFile || dock.externalExecutable) && !_document.workspace.runningDocument];
+}
+
+- (void)debugUpdated
+{
+    WindowOutput *dock = _windowOutput;
+    [self refreshDebugControls];
+    [self refreshDebugLocation];
+    DebugSession *session = dock.debugSession;
+    NSDictionary *frame = session.frame;
+    if (frame && frame != dock.navigatedFrame) {
+        dock.navigatedFrame = frame;
+        [self openDebugLocation:frame[@"source"][@"path"] line:[frame[@"line"] unsignedIntegerValue]
+                         column:[frame[@"column"] unsignedIntegerValue]];
+    } else if (session && session.phase == DebugPhase::Finished) {
+        dock.navigatedFrame = nil;
+        if (dock.restartDebug) {
+            dock.restartDebug = NO;
+            [self startDebugTarget];
+        } else {
+            [self resumeRustCheck];
+        }
+    }
+}
+
+- (void)startDebugSession:(DebugExecutable *)executable pid:(pid_t)pid
+{
+    WindowOutput *dock = _windowOutput;
+    DebugSession *session = [[DebugSession alloc] initWithExecutable:executable arguments:dock.debugArguments
+                                                           language:dock.debugLanguage pid:pid];
+    dock.debugSession = session;
+    dock.debugStatus = nil;
+    dock.navigatedFrame = nil;
+    __weak WindowOutput *weak = dock;
+    __weak DebugSession *weakSession = session;
+    session.output = ^(NSString *text, OutputTone tone) {
+        [weak.debugPane.console appendMessages:{{text, tone, {}}} source:nil];
+    };
+    session.changed = ^{
+        WindowOutput *output = weak;
+        DebugSession *current = weakSession;
+        if (output.debugSession != current)
+            return;
+        if (current.phase == DebugPhase::Finished && ([current.status isEqualToString:@"Debugging failed"] ||
+            [current.status isEqualToString:@"Could not start LLDB"] || [current.status isEqualToString:@"Disconnected"]))
+            [output.debugPane showConsole];
+        [output.host debugUpdated];
+    };
+
+    [self debugUpdated];
+    [session start];
+}
+
+- (void)startDebugTarget
+{
+    WindowOutput *dock = _windowOutput;
+    [dock cancelCheck];
+    [self showDockPage:DockPage::Debug];
+    [dock.debugPane prepare];
+    dock.debugSession = nil;
+    dock.debugStatus = nil;
+    if (dock.externalExecutable) {
+        [self startDebugSession:dock.externalExecutable pid:0];
+        return;
+    }
+    SourceDocument *source = dock.debugDocument;
+    NSURL *file = source.fileURL ? CanonicalFileURL(source.fileURL) : dock.debugFile;
+    Language language = dock.debugLanguage;
+    RunProject project = LocateRunProject(language, file, dock.debugFolder);
+    NSMutableArray<SourceDocument *> *documents = [[self documentsForBuild:project] mutableCopy];
+    if (project.kind == RunKind::Source)
+        [documents removeAllObjects];
+    if (source && ![documents containsObject:source])
+        [documents addObject:source];
+    SourceRunner *runner = [[SourceRunner alloc] init];
+    dock.debugBuilder = runner;
+    dock.debugStatus = @"Building…";
+    [self refreshDebugControls];
+    __weak WindowOutput *weak = dock;
+    __weak SourceDocument *weakSource = source;
+    SaveBuildDocuments(documents, 0, runner, ^(NSError *error) {
+        WindowOutput *output = weak;
+        if (!output || output.debugBuilder != runner)
+            return;
+        if (error || runner.isStopped) {
+            output.debugBuilder = nil;
+            if (output.restartDebug) {
+                output.restartDebug = NO;
+                [output.host startDebugTarget];
+                return;
+            }
+            output.debugStatus = error ? @"Build failed" : @"Stopped";
+            if (error) {
+                [output.debugPane.console appendMessages:{{[error.localizedDescription stringByAppendingString:@"\n"],
+                                                          OutputTone::Error, {}}} source:nil];
+                [output.debugPane showConsole];
+            }
+            [output.host debugUpdated];
+            [output.host resumeRustCheck];
+            return;
+        }
+        [runner buildDebugProject:project language:language file:file output:^(const std::vector<RunMessage> &messages) {
+            [weak.debugPane.console appendMessages:messages source:weakSource];
+        } finished:^(DebugExecutable *executable) {
+            WindowOutput *current = weak;
+            if (!current || current.debugBuilder != runner)
+                return;
+            current.debugBuilder = nil;
+            if (current.restartDebug) {
+                current.restartDebug = NO;
+                [current.host startDebugTarget];
+            } else if (executable && !runner.isStopped && current.host) {
+                [current.host startDebugSession:executable pid:0];
+            } else {
+                current.debugStatus = runner.isStopped ? @"Stopped" : @"Build failed";
+                if (!runner.isStopped)
+                    [current.debugPane showConsole];
+                [current.host debugUpdated];
+                [current.host resumeRustCheck];
+            }
+        }];
+    });
+}
+
+- (void)debugAfterSave:(NSDocument *)document didSave:(BOOL)saved contextInfo:(void *)context
+{
+    (void)context;
+    if (saved && document == _document && self.window)
+        [self performDebugCommand:DebugCommand::Continue];
+}
+
+- (void)chooseDebugExecutable
+{
+    NSOpenPanel *panel = NSOpenPanel.openPanel;
+    panel.title = @"Debug Executable";
+    panel.prompt = @"Debug";
+    panel.directoryURL = _document.workspace ? _document.workspace.folder : _document.fileURL.URLByDeletingLastPathComponent;
+    __weak EditorWindow *weak = self;
+    [panel beginSheetModalForWindow:self.window completionHandler:^(NSModalResponse response) {
+        EditorWindow *editor = weak;
+        if (response != NSModalResponseOK || !editor)
+            return;
+        NSURL *file = panel.URL;
+        if ([file.pathExtension caseInsensitiveCompare:@"app"] == NSOrderedSame)
+            file = [NSBundle bundleWithURL:file].executableURL;
+        if (!file || ![NSFileManager.defaultManager isExecutableFileAtPath:file.path]) {
+            NSAlert *alert = [[NSAlert alloc] init];
+            alert.messageText = @"Choose an executable file.";
+            [alert beginSheetModalForWindow:editor.window completionHandler:nil];
+            return;
+        }
+        WindowOutput *dock = editor->_windowOutput;
+        dock.debugDocument = nil;
+        dock.debugFile = nil;
+        dock.debugLanguage = Language::Plain;
+        dock.externalExecutable = [[DebugExecutable alloc] initWithFile:file directory:file.URLByDeletingLastPathComponent];
+        [editor startDebugTarget];
+    }];
+}
+
+- (void)attachDebugger
+{
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.messageText = @"Attach to Process";
+    alert.informativeText = @"Enter the process ID.";
+    [alert addButtonWithTitle:@"Attach"];
+    [alert addButtonWithTitle:@"Cancel"];
+    NSTextField *field = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 0, 230, 24)];
+    field.cell.scrollable = YES;
+    field.placeholderString = @"PID";
+    alert.accessoryView = field;
+    alert.window.initialFirstResponder = field;
+    __weak EditorWindow *weak = self;
+    [alert beginSheetModalForWindow:self.window completionHandler:^(NSModalResponse response) {
+        EditorWindow *editor = weak;
+        if (response != NSAlertFirstButtonReturn || !editor)
+            return;
+        NSScanner *scanner = [NSScanner scannerWithString:field.stringValue];
+        int pid = 0;
+        if (![scanner scanInt:&pid] || !scanner.isAtEnd || pid <= 1 || pid == NSProcessInfo.processInfo.processIdentifier) {
+            NSAlert *invalid = [[NSAlert alloc] init];
+            invalid.messageText = @"Enter a valid process ID.";
+            [invalid beginSheetModalForWindow:editor.window completionHandler:nil];
+            return;
+        }
+        WindowOutput *dock = editor->_windowOutput;
+        dock.debugFile = nil;
+        dock.debugDocument = nil;
+        dock.debugLanguage = Language::Plain;
+        dock.externalExecutable = nil;
+        [dock cancelCheck];
+        [editor showDockPage:DockPage::Debug];
+        [dock.debugPane prepare];
+        [editor startDebugSession:nil pid:pid];
+    }];
+}
+
+- (void)editDebugArguments
+{
+    WindowOutput *dock = _windowOutput;
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.messageText = @"Program Arguments";
+    alert.informativeText = @"Enter one argument per line.";
+    [alert addButtonWithTitle:@"OK"];
+    [alert addButtonWithTitle:@"Cancel"];
+    NSScrollView *scroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(0, 0, 280, 90)];
+    scroll.borderType = NSBezelBorder;
+    scroll.hasVerticalScroller = YES;
+    NSTextView *field = [[NSTextView alloc] initWithFrame:scroll.bounds];
+    field.autoresizingMask = NSViewWidthSizable;
+    field.richText = NO;
+    field.automaticQuoteSubstitutionEnabled = NO;
+    field.automaticDashSubstitutionEnabled = NO;
+    field.string = dock.debugArguments.count ? [dock.debugArguments componentsJoinedByString:@"\n"] : @"";
+    scroll.documentView = field;
+    alert.accessoryView = scroll;
+    alert.window.initialFirstResponder = field;
+    [alert beginSheetModalForWindow:self.window completionHandler:^(NSModalResponse response) {
+        if (response != NSAlertFirstButtonReturn)
+            return;
+        NSMutableArray *arguments = [[field.string componentsSeparatedByString:@"\n"] mutableCopy];
+        if (arguments.count && ![arguments.lastObject length])
+            [arguments removeLastObject];
+        dock.debugArguments = arguments;
+    }];
+}
+
+- (void)editBreakpoint:(NSString *)path line:(NSUInteger)line
+{
+    if (!path.length || !line || self.window.attachedSheet)
+        return;
+    NSDictionary *options = DebugBreakpoints(path)[@(line)];
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.messageText = [NSString stringWithFormat:@"%@:%lu", path.lastPathComponent, line];
+    [alert addButtonWithTitle:@"OK"];
+    [alert addButtonWithTitle:@"Cancel"];
+    NSView *fields = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 290, 82)];
+    NSTextField *condition = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 59, 289, 22)];
+    condition.cell.scrollable = YES;
+    condition.placeholderString = @"Condition";
+    condition.stringValue = options[@"condition"] ? options[@"condition"] : @"";
+    condition.accessibilityLabel = @"Condition";
+    NSTextField *hits = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 31, 289, 22)];
+    hits.cell.scrollable = YES;
+    hits.placeholderString = @"Hit Count";
+    hits.stringValue = options[@"hitCondition"] ? options[@"hitCondition"] : @"";
+    hits.accessibilityLabel = @"Hit Count";
+    NSButton *enabled = [NSButton checkboxWithTitle:@"Enabled" target:nil action:nil];
+    enabled.frame = NSMakeRect(0, 3, 120, 20);
+    enabled.state = [options[@"disabled"] boolValue] ? NSControlStateValueOff : NSControlStateValueOn;
+    [fields addSubview:condition];
+    [fields addSubview:hits];
+    [fields addSubview:enabled];
+    alert.accessoryView = fields;
+    alert.window.initialFirstResponder = condition;
+    [alert beginSheetModalForWindow:self.window completionHandler:^(NSModalResponse response) {
+        if (response != NSAlertFirstButtonReturn)
+            return;
+        NSMutableDictionary *updated = [NSMutableDictionary dictionary];
+        if (condition.stringValue.length)
+            updated[@"condition"] = condition.stringValue;
+        if (hits.stringValue.length)
+            updated[@"hitCondition"] = hits.stringValue;
+        if (enabled.state == NSControlStateValueOff)
+            updated[@"disabled"] = @YES;
+        SetDebugBreakpoint(path, line, updated);
+    }];
+}
+
+- (void)performDebugCommand:(DebugCommand)command
+{
+    if (![self canDebugCommand:command])
+        return;
+    WindowOutput *dock = _windowOutput;
+    switch (command) {
+    case DebugCommand::Continue:
+        if (dock.debugging) {
+            [dock.debugSession performCommand:command];
+        } else if (DebuggableLanguage(_buffer.language, _document.fileURL)) {
+            if (!_document.fileURL) {
+                [_document saveDocumentWithDelegate:self didSaveSelector:@selector(debugAfterSave:didSave:contextInfo:) contextInfo:nullptr];
+                return;
+            }
+            dock.externalExecutable = nil;
+            dock.debugDocument = _document;
+            dock.debugFile = CanonicalFileURL(_document.fileURL);
+            dock.debugFolder = _document.workspace.folder;
+            dock.debugLanguage = _buffer.language;
+            [self startDebugTarget];
+        } else {
+            [self startDebugTarget];
+        }
+        break;
+    case DebugCommand::Pause:
+    case DebugCommand::StepOver:
+    case DebugCommand::StepInto:
+    case DebugCommand::StepOut:
+        [dock.debugSession performCommand:command];
+        break;
+    case DebugCommand::Restart:
+        if (dock.debugging) {
+            dock.restartDebug = YES;
+            [dock.debugBuilder stop];
+            [dock.debugSession stop];
+        } else {
+            [self startDebugTarget];
+        }
+        break;
+    case DebugCommand::Stop:
+        [dock stopDebug];
+        break;
+    case DebugCommand::ToggleBreakpoint: {
+        NSString *path = _editor.debugPath;
+        NSUInteger line = [self debugCursorLine];
+        SetDebugBreakpoint(path, line, DebugBreakpoints(path)[@(line)] ? nil : @{});
+        break;
+    }
+    case DebugCommand::EditBreakpoint:
+        [self editBreakpoint:_editor.debugPath line:[self debugCursorLine]];
+        break;
+    case DebugCommand::RunToCursor:
+        [dock.debugSession runToLine:[self debugCursorLine] path:_editor.debugPath];
+        break;
+    case DebugCommand::ChooseExecutable:
+        [self chooseDebugExecutable];
+        break;
+    case DebugCommand::Attach:
+        [self attachDebugger];
+        break;
+    case DebugCommand::Arguments:
+        [self editDebugArguments];
+        break;
+    case DebugCommand::ShowPane:
+        [self toggleDebug:nil];
+        break;
+    }
+}
+
 - (IBAction)runSource:(id)sender
 {
     (void)sender;
+    if (!self.canRunCommand)
+        return;
     WindowOutput *output = _windowOutput;
-    if (output.runner) {
-        [output.runner stop];
-        return;
-    }
     FolderWorkspace *workspace = _document.workspace;
-    SourceDocument *running = workspace.runningDocument;
-    if (running) {
-        [running cancelRun];
+    switch (self.runCommand) {
+    case RunCommand::Continue:
+        [output.debugSession performCommand:DebugCommand::Continue];
         return;
+    case RunCommand::Stop:
+        if (output.runner)
+            [output.runner stop];
+        else if (output.debugging)
+            [output stopDebug];
+        else if (SourceDocument *running = workspace.runningDocument)
+            [running cancelRun];
+        else
+            [self stopRun];
+        return;
+    case RunCommand::Run:
+        break;
     }
-    if (self.isRunSource) {
-        [self stopRun];
-        return;
-    }
-    if (!self.canRun)
-        return;
-    if (!output.pane.hasKeyboardFocus)
-        _outputSource = self.activeEditor;
-    [self showOutput:YES];
-    [output.pane prepareForRun];
 
     NSURL *file = CanonicalFileURL(_document.fileURL);
     Language language = _buffer.language;
     NSURL *folder = file || !_buffer.storage.length ? workspace.folder : nil;
     RunProject project = LocateRunProject(language, file, folder);
+    if (RunHasBreakpoint(project, language, file)) {
+        [self performDebugCommand:DebugCommand::Continue];
+        return;
+    }
+    if (!self.canRun)
+        return;
+    [output cancelCheck];
+    if (!output.pane.hasKeyboardFocus)
+        _outputSource = self.activeEditor;
+    [self showOutput:YES];
+    [output.pane prepareForRun];
     NSArray<SourceDocument *> *documents = [self documentsForBuild:project];
     SourceRunner *runner = [[SourceRunner alloc] init];
     output.source = _document;
@@ -3338,7 +4460,7 @@ static char selectedOutputTabContext;
     output.returnFocus = NO;
     _runningOutput = output;
     workspace.runningDocument = _document;
-    SetRunButton(self.runButton, YES);
+    [self refreshRunButton];
 
     NSResponder *focus = self.window.firstResponder;
     if (project.kind == RunKind::Source) {
@@ -3368,6 +4490,7 @@ static char selectedOutputTabContext;
 - (void)dealloc
 {
     [self stopRun];
+    [self cancelRustCheck];
 }
 
 - (void)splitResized:(NSNotification *)notification
@@ -3499,14 +4622,27 @@ static char selectedOutputTabContext;
     (void)notification;
     [_editor invalidateVimCaret];
     [_editor updateInsertionPointStateAndRestartTimer:YES];
+    [_gutter refreshBreakpointHover];
     if (!self.window.isKeyWindow)
         [_editor dismissCompletion];
     else if (_outputRail) {
         [self readDockPlacement];
+        [self resumeRustCheck];
         [self setNeedsLayout:YES];
     }
     [_statusBar setNeedsDisplay:YES];
     [_outputRail setNeedsDisplay:YES];
+}
+
+static void PlaceDockTab(DockTab *button, NSRect frame, bool vertical)
+{
+    button.frameRotation = 0;
+    if (vertical) {
+        button.frame = NSMakeRect(NSMaxX(frame), NSMinY(frame), NSHeight(frame), NSWidth(frame));
+        button.frameRotation = 90;
+    } else {
+        button.frame = frame;
+    }
 }
 
 - (void)layout
@@ -3524,18 +4660,40 @@ static char selectedOutputTabContext;
         }
         _outputRail.frame = dock.rail;
         NSRect tab = NSOffsetRect(dock.tab, -NSMinX(dock.rail), -NSMinY(dock.rail));
-        _outputTab.frameRotation = 0;
-        if (DockIsSide(_dockSide)) {
-            _outputTab.frame = NSMakeRect(NSMaxX(tab), NSMinY(tab), NSHeight(tab), NSWidth(tab));
-            _outputTab.frameRotation = 90;
+        bool vertical = DockIsSide(_dockSide);
+        CGFloat length = std::max(74.0, std::ceil(_errorsTab.fittingSize.width));
+        NSRect errors = tab;
+        if (vertical) {
+            CGFloat end = std::max(0.0, NSMinY(tab) - 3);
+            errors.size.height = std::min(length, end);
+            errors.origin.y = end - errors.size.height;
         } else {
-            _outputTab.frame = tab;
+            errors.origin.x = NSMaxX(tab) + 3;
+            errors.size.width = std::clamp(NSWidth(dock.rail) - errors.origin.x, 0.0, length);
         }
+        NSRect debug = errors;
+        if (vertical) {
+            CGFloat end = std::max(0.0, NSMinY(errors) - 3);
+            debug.size.height = std::min(68.0, end);
+            debug.origin.y = end - debug.size.height;
+        } else {
+            debug.origin.x = NSMaxX(errors) + 3;
+            debug.size.width = std::clamp(NSWidth(dock.rail) - debug.origin.x, 0.0, 68.0);
+        }
+        PlaceDockTab(_outputTab, tab, vertical);
+        PlaceDockTab(_errorsTab, errors, vertical);
+        PlaceDockTab(_debugTab, debug, vertical);
         _outputDivider.hidden = NSIsEmptyRect(dock.divider);
         _outputDivider.vertical = DockIsSide(_dockSide);
         _outputDivider.frame = dock.divider;
-        if (_windowOutput.host == self && self.outputShown)
-            _windowOutput.pane.frame = dock.output;
+        if (_windowOutput.host == self) {
+            if (self.outputShown)
+                _windowOutput.pane.frame = dock.output;
+            if (_windowOutput.page == DockPage::Errors)
+                _windowOutput.errorsPane.frame = dock.output;
+            if (_windowOutput.page == DockPage::Debug)
+                _windowOutput.debugPane.frame = dock.output;
+        }
     }
     if (_splitView) {
         if (!NSEqualRects(_splitView.frame, content)) {
@@ -3562,7 +4720,8 @@ static char selectedOutputTabContext;
 
 - (DockFrames)dockFrames
 {
-    return LayoutDock([self editorBody], _dockSide, self.outputShown, DockIsSide(_dockSide) ? _dockWidth : _dockHeight);
+    return LayoutDock([self editorBody], _dockSide, _windowOutput.page != DockPage::Hidden,
+                      DockIsSide(_dockSide) ? _dockWidth : _dockHeight);
 }
 
 - (NSRect)editorArea
@@ -3579,7 +4738,7 @@ static char selectedOutputTabContext;
     NSUInteger lineCount = std::max(NSUInteger(1), _buffer.lineCount);
     CGFloat digits = std::floor(std::log10(double(lineCount))) + 1;
     CGFloat digitWidth = [@"0" sizeWithAttributes:@{NSFontAttributeName:_gutter.numberFont}].width;
-    CGFloat gutterWidth = std::min(std::max(42.0, std::ceil(digits * digitWidth + 2 * gutterInset)),
+    CGFloat gutterWidth = std::min(std::max(42.0, std::ceil(digits * digitWidth + gutterInset + breakpointLane)),
                                   std::floor(width / 3));
     _scroll.frame = NSMakeRect(x + gutterWidth, NSMinY(area), width - gutterWidth, height);
     _gutter.frame = NSMakeRect(x, NSMinY(area), gutterWidth, height);
@@ -3605,6 +4764,7 @@ static char selectedOutputTabContext;
     [self applyPreferences];
     [self layoutSubtreeIfNeeded];
     [_editor scrollRangeToVisible:NSMakeRange(0, 0)];
+    [self scheduleRustCheck];
 }
 
 - (NSDictionary *)sessionPane
@@ -3706,6 +4866,7 @@ static char selectedOutputTabContext;
             root->_scrollRepaintPending = NO;
             [root->_editor refreshBuildErrorToolTips];
             [root->_editor setNeedsDisplayInRect:root->_scroll.documentVisibleRect];
+            [root->_gutter refreshBreakpointHover];
             [root->_gutter setNeedsDisplay:YES];
         }
     }];
@@ -3753,9 +4914,10 @@ static char selectedOutputTabContext;
     BOOL changed = _buffer.language != language;
     if (changed)
         _buffer.language = language;
-    self.runButton.enabled = self.canRun || self.running || _document.workspace.runningDocument != nil;
+    [self refreshDebugControls];
     if (!changed)
         return;
+    [self scheduleRustCheck];
     [_document resumePendingAutoSave];
     [_editor dismissCompletion];
     [_editor refreshWordSelection];
@@ -3791,8 +4953,11 @@ static char selectedOutputTabContext;
     }
     _scroll.appearance = [NSAppearance appearanceNamed:_editor.theme->dark ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua];
     _scroll.backgroundColor = RenderedEditorColor(_editor.theme->paper, _editor.rendering);
-    if (_windowOutput.host == self)
+    if (_windowOutput.host == self) {
         [_windowOutput.pane applyFont:_editor.editorFont rendering:_editor.rendering dark:_editor.theme->dark];
+        [_windowOutput.errorsPane applyFont:_editor.editorFont rendering:_editor.rendering dark:_editor.theme->dark];
+        [_windowOutput.debugPane.console applyFont:_editor.editorFont rendering:_editor.rendering dark:_editor.theme->dark];
+    }
 
     NSFont *font = _editor.editorFont;
     CGFloat numberSize = std::max(1.0, std::round(font.pointSize * (5.0 / 6.0)));
@@ -3877,6 +5042,7 @@ static char selectedOutputTabContext;
     [_editor refreshBracketMatch];
     [_editor refreshWordSelection];
     [_editor validateCompletion];
+    [_gutter refreshBreakpointHover];
     [_gutter setNeedsDisplay:YES];
 }
 
@@ -3896,6 +5062,7 @@ static char selectedOutputTabContext;
     [other updateCursor];
     [other setNeedsLayout:YES];
     [_document scheduleAutoSaveAfterEdit];
+    [root scheduleRustCheck];
 }
 
 - (void)textViewDidChangeSelection:(NSNotification *)notification
@@ -4576,14 +5743,14 @@ static char windowOutputKey;
     close.action = @selector(closeEditorWindow:);
 
     NSRect runFrame = NSMakeRect(0, 0, 28, 24);
-    NSView *runContainer = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, NSWidth(runFrame) + 4, NSHeight(runFrame))];
+    NSView *runContainer = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, NSMaxX(runFrame) + 4, NSHeight(runFrame))];
     _runButton = [[NSButton alloc] initWithFrame:runFrame];
     _runButton.autoresizingMask = NSViewMinXMargin | NSViewHeightSizable;
     [_runButton setButtonType:NSButtonTypeMomentaryPushIn];
     _runButton.bordered = NO;
     _runButton.imagePosition = NSImageOnly;
     _runButton.action = @selector(runDocument:);
-    SetRunButton(_runButton, NO);
+    SetRunButton(_runButton, RunCommand::Run);
     [runContainer addSubview:_runButton];
 
     NSTitlebarAccessoryViewController *runAccessory = [[NSTitlebarAccessoryViewController alloc] init];
@@ -4653,6 +5820,8 @@ static char windowOutputKey;
 {
     (void)notification;
     _windowClosed = YES;
+    if (_workspace || self.window.tabGroup.windows.count <= 1)
+        [[self windowOutput] stopDebug];
     [EmptyProjectWindows() removeObject:self];
 }
 
@@ -5064,15 +6233,19 @@ static char windowOutputKey;
 - (void)workspaceRunChanged:(NSNotification *)notification
 {
     (void)notification;
-    BOOL running = _workspace.runningDocument != nil || _installedEditor.running;
-    _runButton.enabled = _installedEditor && (running || _installedEditor.canRun);
-    SetRunButton(_runButton, running);
+    if (_installedEditor) {
+        [_installedEditor refreshRunButton];
+    } else {
+        _runButton.enabled = NO;
+        SetRunButton(_runButton, RunCommand::Run);
+    }
 }
 
 - (void)updateExplorerLayout
 {
     _layingOutExplorer = YES;
-    if (_workspace.sidebarShown) {
+    BOOL shown = _workspace.sidebarShown;
+    if (shown) {
         if (!_sidebar) {
             _sidebar = [[FolderSidebar alloc] initWithWorkspace:_workspace];
             __weak SourceWindowController *controller = self;
@@ -5090,15 +6263,14 @@ static char windowOutputKey;
         }
         if (!_sidebar.superview)
             [_editorSplit insertArrangedSubview:_sidebar atIndex:0];
-        _sidebarButton.toolTip = @"Hide Sidebar";
     } else {
         NSResponder *focus = self.window.firstResponder;
         if (_sidebar && [focus isKindOfClass:NSView.class] && [(NSView *)focus isDescendantOf:_sidebar])
             [self.window makeFirstResponder:_installedEditor.activeEditor];
         [_sidebar removeFromSuperview];
-        _sidebarButton.toolTip = @"Show Sidebar";
     }
-    _sidebarButton.accessibilityLabel = _sidebarButton.toolTip;
+    _sidebarButton.accessibilityLabel = shown ? @"Hide Sidebar" : @"Show Sidebar";
+    _sidebarButton.toolTip = shown ? @"Hide Sidebar (⌘B)" : @"Show Sidebar (⌘B)";
     [_editorSplit adjustSubviews];
     if (_sidebar.superview && NSWidth(_editorSplit.bounds) >= 140) {
         CGFloat width = std::clamp(_workspace.sidebarWidth, 140.0, [self maximumExplorerWidth]);
@@ -5375,6 +6547,18 @@ static Vim::EditBatch PlanSaveCleanup(NSString *text, SaveCleanupSettings settin
         edits.push_back({{length, length}, std::move(ending)});
     }
     return Vim::EditBatch(std::move(edits));
+}
+
+NSData *SourceDataWithFinalNewline(NSData *data, FinalNewlineMode mode)
+{
+    if (!data.length || mode == FinalNewlineMode::Preserve)
+        return data;
+    BOOL hasBOM = NO;
+    NSString *text = DecodeSourceText(data, &hasBOM);
+    auto edits = PlanSaveCleanup(text, {.finalNewline = mode}, {});
+    if (edits.edits.empty())
+        return data;
+    return EncodeSourceText(TextByApplyingEdits(text, edits), hasBOM);
 }
 
 static SourceWindowController *MakeSourceWindowController(FolderWorkspace *workspace)
@@ -5785,15 +6969,9 @@ NSWindow *RestoreWorkspaceWindow(FolderWorkspace *workspace, NSArray<SourceDocum
 
 - (NSData *)dataForSourceText:(NSString *)text error:(NSError **)error
 {
-    NSData *data = [text dataUsingEncoding:NSUTF8StringEncoding];
+    NSData *data = EncodeSourceText(text, _hasBOM);
     if (!data && error)
         *error = [NSError errorWithDomain:NSCocoaErrorDomain code:NSFileWriteInapplicableStringEncodingError userInfo:nil];
-    if (_hasBOM && data) {
-        uint8_t bom[] = {0xEF, 0xBB, 0xBF};
-        NSMutableData *withBOM = [NSMutableData dataWithBytes:bom length:sizeof(bom)];
-        [withBOM appendData:data];
-        return withBOM;
-    }
     return data;
 }
 
@@ -6051,7 +7229,9 @@ NSWindow *RestoreWorkspaceWindow(FolderWorkspace *workspace, NSArray<SourceDocum
     NSURL *before = self.fileURL;
     [super setFileURL:url];
     if (_editorWindow && ![url isEqual:before]) {
+        [_editorWindow refreshDebugLocation];
         [_editorWindow refreshDetectedLanguage];
+        [_editorWindow scheduleRustCheck];
         [_workspace refresh];
         [_workspace documentChanged];
         if (self.editorHostWindow.windowController.document == self)
@@ -6062,8 +7242,11 @@ NSWindow *RestoreWorkspaceWindow(FolderWorkspace *workspace, NSArray<SourceDocum
 - (void)setFileURLFromExplorer:(NSURL *)url
 {
     NSURL *old = self.fileURL;
+    NSString *oldPath = DebugSourcePath(old);
     NSDate *date = self.fileModificationDate;
     [super setFileURL:url];
+    MoveDebugBreakpoints(oldPath, DebugSourcePath(url));
+    [_editorWindow refreshDebugLocation];
     if ([_savedFileURL isEqual:old.URLByStandardizingPath])
         _savedFileURL = url.URLByStandardizingPath;
     id identifier = nil;
@@ -6081,6 +7264,7 @@ NSWindow *RestoreWorkspaceWindow(FolderWorkspace *workspace, NSArray<SourceDocum
         if (!self.isDocumentEdited)
             [self updateChangeCount:NSChangeDone];
     }
+    [_editorWindow scheduleRustCheck];
     NSWindowController *controller = self.windowControllers.firstObject;
     [controller synchronizeWindowTitleWithDocumentName];
 }
@@ -6124,6 +7308,11 @@ NSWindow *RestoreWorkspaceWindow(FolderWorkspace *workspace, NSArray<SourceDocum
     [_editorWindow runSource:sender];
 }
 
+- (IBAction)debugCommand:(NSMenuItem *)sender
+{
+    [_editorWindow performDebugCommand:static_cast<DebugCommand>(sender.tag)];
+}
+
 - (IBAction)toggleDocumentOutput:(id)sender
 {
     [_editorWindow toggleOutput:sender];
@@ -6142,6 +7331,7 @@ NSWindow *RestoreWorkspaceWindow(FolderWorkspace *workspace, NSArray<SourceDocum
 
 - (void)cancelRun { [_editorWindow stopRun]; }
 - (NSUInteger)beginBuildDiagnostics { return [_editorWindow beginBuildDiagnostics]; }
+- (NSUInteger)diagnosticVersion { return _editorWindow.editor.syntax.textVersion; }
 
 - (void)applyBuildMessages:(const std::vector<RunMessage> &)messages version:(NSUInteger)version owner:(BOOL)owner
 {
@@ -6155,6 +7345,7 @@ NSWindow *RestoreWorkspaceWindow(FolderWorkspace *workspace, NSArray<SourceDocum
     _closing = YES;
     [self cancelAutoSave];
     [_editorWindow stopRun];
+    [_editorWindow cancelRustCheck];
     [_projectWindowController closeProjectDocument:self];
     [_workspace removeDocument:self];
     [super close];
@@ -6197,10 +7388,11 @@ NSWindow *RestoreWorkspaceWindow(FolderWorkspace *workspace, NSArray<SourceDocum
         return _editorWindow != nil;
     if (action == @selector(convertIndentation:))
         return _editorWindow.activeEditor.editable && !_editorWindow.hasMarkedEditorText;
+    if (action == @selector(debugCommand:))
+        return [_editorWindow canDebugCommand:static_cast<DebugCommand>(item.tag)];
     if (action == @selector(runDocument:)) {
-        BOOL running = _editorWindow.running || _workspace.runningDocument != nil;
-        item.title = running ? @"Stop" : @"Run";
-        return _editorWindow && (running || _editorWindow.canRun);
+        item.title = RunCommandTitle(_editorWindow.runCommand);
+        return _editorWindow.canRunCommand;
     }
     if (action == @selector(toggleDocumentOutput:)) {
         item.state = _editorWindow.outputShown ? NSControlStateValueOn : NSControlStateValueOff;

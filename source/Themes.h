@@ -1443,4 +1443,40 @@ inline constexpr Theme themes[] = {
       .wordMatch = rgb(163, 170, 112), .bracketMatch = rgb(211, 198, 124), .vimFlash = rgb(132, 172, 137),
        .commandCaret = rgb(224, 224, 224)},
      rgb(224, 224, 224), true, false, {}, rgb(116, 115, 93), rgb(0, 0, 0)},
+
+    // Todd Werth's ir_black.vim GUI palette.
+    {"IR_Black", rgb(0, 0, 0), rgb(18, 18, 18), rgb(38, 45, 81),
+     rgb(0, 0, 0), rgb(32, 32, 32), rgb(61, 61, 61), rgb(246, 243, 232),
+     {rgb(246, 243, 232), rgb(150, 203, 254), rgb(102, 153, 204), rgb(255, 255, 182),
+      rgb(255, 210, 167), rgb(198, 197, 254), rgb(168, 255, 96), rgb(255, 115, 253),
+      rgb(124, 124, 124), rgb(150, 203, 254), rgb(153, 204, 153), rgb(0, 160, 160)},
+     {.completionPaper = rgb(68, 68, 68), .completionBorder = rgb(32, 32, 32),
+      .completionSelection = rgb(202, 230, 130), .completionSelectedText = rgb(0, 0, 0),
+      .wordMatch = rgb(255, 255, 182), .bracketMatch = rgb(133, 123, 111), .vimFlash = rgb(168, 255, 96),
+      .commandCaret = rgb(198, 197, 254)},
+     rgb(255, 255, 255), true, false, {}, rgb(128, 128, 128), rgb(0, 0, 0)},
+
+    // NanoTech's jellybeans.vim GUI palette, including italic comments.
+    {"Jellybeans", rgb(21, 21, 21), rgb(28, 28, 28), rgb(64, 64, 64),
+     rgb(21, 21, 21), rgb(64, 60, 65), rgb(96, 89, 88), rgb(204, 197, 196),
+     {rgb(232, 232, 211), rgb(129, 151, 191), rgb(129, 151, 191), rgb(255, 185, 100),
+      rgb(250, 208, 122), rgb(198, 182, 238), rgb(153, 173, 106), rgb(207, 106, 76),
+      rgb(136, 136, 136), rgb(143, 191, 220), rgb(207, 106, 76), rgb(121, 157, 106)},
+     {.completionPaper = rgb(96, 96, 96), .completionBorder = rgb(64, 60, 65),
+      .completionSelection = rgb(238, 238, 238), .completionSelectedText = rgb(16, 16, 16),
+      .wordMatch = rgb(240, 160, 192), .bracketMatch = rgb(85, 103, 121), .vimFlash = rgb(240, 160, 192),
+      .commandCaret = rgb(176, 208, 240)},
+     rgb(176, 208, 240), true, false, {}, rgb(68, 68, 68), rgb(21, 21, 21), true},
+
+    // Andromeda's blue keeps types distinct from its red constants and gold functions.
+    {"Andromeda", rgb(35, 38, 46), rgb(46, 50, 61), rgb(61, 67, 82),
+     rgb(35, 38, 46), rgb(27, 29, 35), rgb(116, 111, 119), rgb(213, 206, 217),
+     {rgb(213, 206, 217), rgb(199, 77, 237), rgb(199, 77, 237), rgb(124, 183, 255),
+      rgb(255, 230, 109), rgb(0, 232, 198), rgb(150, 224, 114), rgb(243, 156, 18),
+      rgba(160, 161, 167, 0.8f), rgb(199, 77, 237), rgb(238, 93, 67), rgb(238, 93, 67)},
+     {.completionPaper = rgb(32, 35, 42), .completionBorder = rgb(55, 47, 60),
+      .completionSelection = rgb(55, 57, 65), .completionSelectedText = rgb(213, 206, 217),
+      .wordMatch = rgb(219, 69, 162), .bracketMatch = rgb(116, 111, 119), .vimFlash = rgb(0, 232, 198),
+      .commandCaret = rgb(0, 232, 198)},
+     rgb(255, 255, 255), true, false, {}, rgb(51, 56, 68), rgb(35, 38, 46)},
 };

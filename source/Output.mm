@@ -157,14 +157,21 @@ static bool OutputLineEnding(unichar character)
     NSUInteger _scrollbackLines;
     BOOL _scrollRepaintPending;
     std::optional<OutputScrollPosition> _deferredScrollPosition;
+    BOOL _diagnostics;
     BOOL _dark;
 }
 
 - (instancetype)initWithFrame:(NSRect)frame
 {
+    return [self initWithFrame:frame diagnostics:NO];
+}
+
+- (instancetype)initWithFrame:(NSRect)frame diagnostics:(BOOL)diagnostics
+{
     self = [super initWithFrame:frame];
     if (!self)
         return nil;
+    _diagnostics = diagnostics;
     _scroll = [[NSScrollView alloc] initWithFrame:self.bounds];
     _scroll.hasVerticalScroller = YES;
     _scroll.autohidesScrollers = YES;
@@ -200,13 +207,15 @@ static bool OutputLineEnding(unichar character)
     _text.smartInsertDeleteEnabled = NO;
     _text.linkTextAttributes = @{NSCursorAttributeName:NSCursor.pointingHandCursor};
     _text.delegate = self;
-    _text.accessibilityLabel = @"Output";
+    _text.accessibilityLabel = diagnostics ? @"Errors" : @"Output";
     __weak OutputPane *pane = self;
     _text.sendEOF = ^{ [pane sendEndOfFile]; };
     _scroll.documentView = _text;
-    NSMenu *menu = [[NSMenu alloc] initWithTitle:@""];
-    [menu addItem:[self clearMenuItem]];
-    _scroll.contentView.menu = menu;
+    if (!diagnostics) {
+        NSMenu *menu = [[NSMenu alloc] initWithTitle:@""];
+        [menu addItem:[self clearMenuItem]];
+        _scroll.contentView.menu = menu;
+    }
     _scroll.contentView.postsBoundsChangedNotifications = YES;
     [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(scrollBoundsChanged:)
                                                name:NSViewBoundsDidChangeNotification object:_scroll.contentView];
@@ -594,6 +603,8 @@ static bool OutputLineEnding(unichar character)
     (void)view;
     (void)event;
     (void)index;
+    if (_diagnostics)
+        return menu;
     NSMenu *context = menu ? [menu copy] : [[NSMenu alloc] initWithTitle:@""];
     if (context.numberOfItems && !context.itemArray.lastObject.isSeparatorItem)
         [context addItem:NSMenuItem.separatorItem];
@@ -676,6 +687,13 @@ static bool OutputLineEnding(unichar character)
     [storage endEditing];
     [self restoreSelection:selection insertion:initial added:insertion - initial removed:removed];
     [self restoreScrollPosition:position removed:removed reflow:NO];
+}
+
+- (void)showDiagnostics:(const std::vector<RunMessage> &)messages source:(SourceDocument *)source
+{
+    [self clear];
+    [self appendMessages:messages source:source];
+    [self restoreScrollPosition:{NSZeroPoint, false} removed:0 reflow:NO];
 }
 
 - (BOOL)textView:(NSTextView *)textView clickedOnLink:(id)link atIndex:(NSUInteger)index

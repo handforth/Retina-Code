@@ -260,8 +260,10 @@ static FolderSearchResults SearchFolder(NSURL *root, FolderSearchPattern *patter
     if (!results.limited && !cancelled.load(std::memory_order_relaxed)) {
         NSArray *keys = @[NSURLIsRegularFileKey, NSURLIsDirectoryKey, NSURLIsSymbolicLinkKey];
         __block bool unreadable = false;
+        NSDirectoryEnumerationOptions options = NSDirectoryEnumerationSkipsPackageDescendants |
+                                                NSDirectoryEnumerationProducesRelativePathURLs;
         NSDirectoryEnumerator<NSURL *> *entries = [NSFileManager.defaultManager enumeratorAtURL:root
-            includingPropertiesForKeys:keys options:NSDirectoryEnumerationSkipsPackageDescendants
+            includingPropertiesForKeys:keys options:options
             errorHandler:^BOOL(NSURL *, NSError *) {
                 unreadable = true;
                 return !cancelled.load(std::memory_order_relaxed);
@@ -278,7 +280,11 @@ static FolderSearchResults SearchFolder(NSURL *root, FolderSearchPattern *patter
                         [entries skipDescendants];
                     continue;
                 }
-                if (![attributes[NSURLIsRegularFileKey] boolValue] || [openPaths containsObject:url.path])
+                if (![attributes[NSURLIsRegularFileKey] boolValue])
+                    continue;
+                if (![url.path hasPrefix:rootPrefix])
+                    url = [root URLByAppendingPathComponent:url.relativePath isDirectory:NO];
+                if ([openPaths containsObject:url.path])
                     continue;
                 NSData *data = [NSData dataWithContentsOfURL:url options:NSDataReadingMappedIfSafe error:nullptr];
                 if (!data) {
@@ -492,6 +498,7 @@ static NSImage *WholeWordIcon()
 - (void)focusSearch:(NSString *)selection replace:(BOOL)replace;
 - (void)refreshSearch;
 - (void)stopSearch;
+@property(nonatomic, copy) NSURL *searchFolder;
 @property(nonatomic, copy) FolderSearchOpenMatch openMatch;
 @end
 
@@ -502,6 +509,8 @@ static NSImage *WholeWordIcon()
     NSSegmentedControl *_options;
     NSTextField *_replacement;
     NSSegmentedControl *_replaceActions;
+    NSTextField *_folderLabel;
+    NSButton *_clearFolder;
     NSTextField *_summary;
     SearchOutline *_outline;
     NSScrollView *_scroll;
@@ -527,6 +536,7 @@ static NSImage *WholeWordIcon()
     _searchQueue = dispatch_queue_create("retina-code.folder-search", DISPATCH_QUEUE_SERIAL);
 
     _field = [[NSSearchField alloc] initWithFrame:NSZeroRect];
+    _field.cell.scrollable = YES;
     _field.placeholderString = @"Find in Files";
     _field.accessibilityLabel = @"Find in Files";
     _field.sendsWholeSearchString = YES;
@@ -539,7 +549,7 @@ static NSImage *WholeWordIcon()
     _replaceToggle.bezelStyle = NSBezelStyleDisclosure;
     [_replaceToggle setButtonType:NSButtonTypeOnOff];
     _replaceToggle.accessibilityLabel = @"Show Replace";
-    _replaceToggle.toolTip = @"Show Replace";
+    _replaceToggle.toolTip = @"Show Replace (⇧⌘H)";
     [self addSubview:_replaceToggle];
 
     _options = [NSSegmentedControl segmentedControlWithLabels:@[@"Aa", @"", @".*"]
@@ -555,6 +565,7 @@ static NSImage *WholeWordIcon()
     [self addSubview:_options];
 
     _replacement = [[NSTextField alloc] initWithFrame:NSZeroRect];
+    _replacement.cell.scrollable = YES;
     _replacement.placeholderString = @"Replace";
     _replacement.accessibilityLabel = @"Replace";
     _replacement.usesSingleLineMode = YES;
@@ -574,6 +585,21 @@ static NSImage *WholeWordIcon()
     [_replaceActions setToolTip:@"Replace All in Folder" forSegment:1];
     _replaceActions.hidden = YES;
     [self addSubview:_replaceActions];
+
+    _folderLabel = [NSTextField labelWithString:@""];
+    _folderLabel.font = [NSFont systemFontOfSize:11];
+    _folderLabel.textColor = NSColor.secondaryLabelColor;
+    _folderLabel.lineBreakMode = NSLineBreakByTruncatingMiddle;
+    _folderLabel.hidden = YES;
+    [self addSubview:_folderLabel];
+    NSImage *clear = [NSImage imageWithSystemSymbolName:@"xmark" accessibilityDescription:nil];
+    _clearFolder = [NSButton buttonWithImage:clear target:self action:@selector(clearSearchFolder:)];
+    _clearFolder.bordered = NO;
+    _clearFolder.controlSize = NSControlSizeSmall;
+    _clearFolder.toolTip = @"Search All Files";
+    _clearFolder.accessibilityLabel = _clearFolder.toolTip;
+    _clearFolder.hidden = YES;
+    [self addSubview:_clearFolder];
 
     _summary = [NSTextField labelWithString:@""];
     _summary.font = [NSFont systemFontOfSize:11];
@@ -639,6 +665,11 @@ static NSImage *WholeWordIcon()
             y -= 24;
         _replaceActions.frame = NSMakeRect(width - right - actionsWidth, y, actionsWidth, 21);
     }
+    if (_searchFolder) {
+        y -= 22;
+        _folderLabel.frame = NSMakeRect(9, y + 1, std::max<CGFloat>(0, width - 39), 15);
+        _clearFolder.frame = NSMakeRect(width - 27, y, 18, 18);
+    }
     _summary.frame = NSMakeRect(9, y - 20, std::max<CGFloat>(0, width - 18), 15);
     _scroll.frame = NSMakeRect(0, 0, width, std::max<CGFloat>(0, y - 24));
     [_outline sizeLastColumnToFit];
@@ -663,6 +694,30 @@ static NSImage *WholeWordIcon()
     NSTextField *focus = replace && _field.stringValue.length ? _replacement : _field;
     [focus selectText:nil];
     [self refreshSearch];
+}
+
+- (void)setSearchFolder:(NSURL *)folder
+{
+    NSURL *scope = CanonicalFileURL(folder);
+    NSString *relative = RelativeWorkspacePath(scope.path, _workspace.folder.path);
+    if (!relative || [relative isEqualToString:@"."])
+        scope = nil;
+    if (_searchFolder == scope || [_searchFolder isEqual:scope])
+        return;
+    _searchFolder = scope;
+    _folderLabel.stringValue = scope ? [@"In " stringByAppendingString:relative] : @"";
+    _folderLabel.toolTip = scope.path;
+    _folderLabel.hidden = _clearFolder.hidden = scope == nil;
+    _replaceStatus = nil;
+    _nextMatchPath = nil;
+    self.needsLayout = YES;
+}
+
+- (IBAction)clearSearchFolder:(id)sender
+{
+    (void)sender;
+    self.searchFolder = nil;
+    [self focusSearch:nil replace:NO];
 }
 
 - (void)stopSearch
@@ -719,14 +774,15 @@ static NSImage *WholeWordIcon()
     }
     _summary.stringValue = @"Searching…";
     std::vector<SearchBuffer> buffers;
-    NSURL *root = _workspace.folder;
+    NSURL *root = _searchFolder ? _searchFolder : _workspace.folder;
     NSString *rootPrefix = [root.path hasSuffix:@"/"] ? root.path : [root.path stringByAppendingString:@"/"];
     for (NSDocument *open in NSDocumentController.sharedDocumentController.documents) {
         if (![open isKindOfClass:SourceDocument.class])
             continue;
         SourceDocument *document = (SourceDocument *)open;
-        NSURL *url = document.fileURL.URLByStandardizingPath;
-        if (url ? ![url.path hasPrefix:rootPrefix] || !document.isDocumentEdited : document.workspace != _workspace)
+        NSURL *url = CanonicalFileURL(document.fileURL);
+        if (url ? ![url.path hasPrefix:rootPrefix] || !document.isDocumentEdited :
+                  _searchFolder || document.workspace != _workspace)
             continue;
         NSString *text = [document.sourceText copy];
         if (!url && !text.length)
@@ -832,8 +888,8 @@ static NSImage *WholeWordIcon()
         return;
     _showsReplace = shown;
     _replaceToggle.state = shown ? NSControlStateValueOn : NSControlStateValueOff;
-    _replaceToggle.toolTip = shown ? @"Hide Replace" : @"Show Replace";
-    _replaceToggle.accessibilityLabel = _replaceToggle.toolTip;
+    _replaceToggle.accessibilityLabel = shown ? @"Hide Replace" : @"Show Replace";
+    _replaceToggle.toolTip = shown ? @"Hide Replace" : @"Show Replace (⇧⌘H)";
     _replacement.hidden = !shown;
     _replaceActions.hidden = !shown;
     self.needsLayout = YES;
@@ -1165,12 +1221,15 @@ static NSImage *WholeWordIcon()
         trackingMode:NSSegmentSwitchTrackingSelectOne target:self action:@selector(switchPane:)];
     _switcher.segmentStyle = NSSegmentStyleRounded;
     _switcher.controlSize = NSControlSizeSmall;
+    [_switcher setToolTip:@"Find in Files (⇧⌘F)" forSegment:1];
     _switcher.selectedSegment = 0;
     [self addSubview:_switcher];
     _rule = [[NSBox alloc] initWithFrame:NSZeroRect];
     _rule.boxType = NSBoxSeparator;
     [self addSubview:_rule];
     _explorer = [[FolderExplorer alloc] initWithWorkspace:workspace];
+    __weak FolderSidebar *view = self;
+    _explorer.findInFolder = ^(NSURL *folder) { [view showSearch:nil replace:NO folder:folder]; };
     [self addSubview:_explorer positioned:NSWindowBelow relativeTo:_switcher];
     return self;
 }
@@ -1198,7 +1257,7 @@ static NSImage *WholeWordIcon()
 - (void)switchPane:(NSSegmentedControl *)sender
 {
     if (sender.selectedSegment == 1) {
-        [self showSearch:nil replace:NO];
+        [self showSearch:nil replace:NO folder:_search.searchFolder];
     } else {
         [_search stopSearch];
         _search.hidden = YES;
@@ -1209,6 +1268,11 @@ static NSImage *WholeWordIcon()
 
 - (void)showSearch:(NSString *)selection replace:(BOOL)replace
 {
+    [self showSearch:selection replace:replace folder:nil];
+}
+
+- (void)showSearch:(NSString *)selection replace:(BOOL)replace folder:(NSURL *)folder
+{
     if (!_search) {
         _search = [[FolderSearchView alloc] initWithWorkspace:_workspace];
         _search.openMatch = _openMatch;
@@ -1217,6 +1281,7 @@ static NSImage *WholeWordIcon()
     }
     _switcher.selectedSegment = 1;
     _explorer.hidden = YES;
+    _search.searchFolder = folder;
     _search.hidden = NO;
     [_search focusSearch:selection replace:replace];
 }

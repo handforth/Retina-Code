@@ -15,6 +15,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_set>
 
 #include <crt_externs.h>
 #include <fcntl.h>
@@ -35,7 +36,7 @@ static bool ExistingFile(NSURL *url)
     return [url getResourceValue:&regular forKey:NSURLIsRegularFileKey error:nil] && regular.boolValue;
 }
 
-static NSURL *ParentManifest(NSURL *directory, NSURL *limit, NSString *name)
+NSURL *ParentManifest(NSURL *directory, NSURL *limit, NSString *name)
 {
     while (directory.path.length) {
         NSURL *manifest = [directory URLByAppendingPathComponent:name];
@@ -389,6 +390,13 @@ bool RunnableLanguage(Language language)
     return ToolName(language) != nil;
 }
 
+bool DebuggableLanguage(Language language, NSURL *file)
+{
+    return CFamily(language) || language == Language::Rust || language == Language::Swift ||
+           language == Language::Go || language == Language::Odin || language == Language::Zig ||
+           (language == Language::Assembly && [file.pathExtension.lowercaseString isEqualToString:@"s"]);
+}
+
 static NSString *SourceSuffix(Language language, NSURL *file)
 {
     NSString *ext = file.pathExtension.lowercaseString;
@@ -446,7 +454,7 @@ static NSString *ExecutableAt(NSString *folder, NSString *name)
         [files isExecutableFileAtPath:candidate] ? candidate : nil;
 }
 
-static NSString *FindTool(NSString *name, Language language)
+NSString *FindTool(NSString *name, Language language)
 {
     NSString *path = NSProcessInfo.processInfo.environment[@"PATH"];
     for (NSString *folder in [path componentsSeparatedByString:@":"]) {
@@ -510,6 +518,33 @@ struct RunFiles {
     }
 };
 
+@interface DebugExecutable ()
+@property(nonatomic) NSURL *scratch;
+@end
+
+@implementation DebugExecutable
+
+- (instancetype)initWithFile:(NSURL *)file directory:(NSURL *)directory
+{
+    self = [super init];
+    if (self) {
+        _file = file;
+        _directory = directory;
+    }
+    return self;
+}
+
+- (void)dealloc
+{
+    if (NSURL *scratch = _scratch) {
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            [NSFileManager.defaultManager removeItemAtURL:scratch error:nil];
+        });
+    }
+}
+
+@end
+
 static NSURL *TemporaryFolder(NSError **error)
 {
     NSString *name = [NSTemporaryDirectory() stringByAppendingPathComponent:@"RetinaCode-XXXXXX"];
@@ -519,6 +554,54 @@ static NSURL *TemporaryFolder(NSError **error)
     *error = RunError(errno);
     return nil;
 }
+
+@interface RustCheckCache ()
+- (NSURL *)directoryWithError:(NSError **)error;
+- (void)removeFiles;
+@end
+
+static NSHashTable<RustCheckCache *> *checkCaches;
+
+@implementation RustCheckCache {
+    NSURL *_directory;
+}
+
+- (instancetype)init
+{
+    self = [super init];
+    if (self) {
+        if (!checkCaches)
+            checkCaches = [NSHashTable weakObjectsHashTable];
+        [checkCaches addObject:self];
+    }
+    return self;
+}
+
+- (NSURL *)directoryWithError:(NSError **)error
+{
+    if (!_directory)
+        _directory = TemporaryFolder(error);
+    return _directory;
+}
+
+- (void)removeFiles
+{
+    if (_directory) {
+        [NSFileManager.defaultManager removeItemAtURL:_directory error:nil];
+        _directory = nil;
+    }
+}
+
+- (void)dealloc
+{
+    if (NSURL *directory = _directory) {
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            [NSFileManager.defaultManager removeItemAtURL:directory error:nil];
+        });
+    }
+}
+
+@end
 
 static NSURL *WriteRunSource(RunFiles &files, NSData *contents, NSURL *directory, NSString *suffix, NSError **error)
 {
@@ -772,6 +855,7 @@ struct DiagnosticContext {
     NSString *name;
     bool byteColumns;
     Language language = Language::C;
+    NSURL *mirror = nil;
 };
 
 static OutputTone ToneForLine(NSString *line, bool stderrLine)
@@ -886,12 +970,24 @@ struct RunLog {
     int programExitCode = -1;
     bool buildError = false;
     bool discarded = false;
+    bool checking = false;
+    NSUInteger errors = 0;
+    std::unordered_set<NSUInteger> seenDiagnostics;
 
     void append(RunMessage message)
     {
         NSUInteger length = message.text.length;
         if (!length)
             return;
+        if (checking) {
+            if (message.tone == OutputTone::Text)
+                return;
+            NSUInteger key = message.text.hash ^ (message.location.file.path.hash << 1);
+            if (seenDiagnostics.size() < outputScrollbackLines && !seenDiagnostics.insert(key).second)
+                return;
+            if (message.tone == OutputTone::Error)
+                ++errors;
+        }
         NSUInteger lines = OutputScrollbackLinesPreference();
         NSUInteger characterLimit = OutputScrollbackCharacterLimit(lines);
         if (length > characterLimit) {
@@ -950,7 +1046,7 @@ struct RunLog {
     void send(bool now = false)
     {
         auto time = Clock::now();
-        if (messages.empty() || (!now && (time < nextUpdate || deliveries->load(std::memory_order_relaxed))))
+        if (checking || messages.empty() || (!now && (time < nextUpdate || deliveries->load(std::memory_order_relaxed))))
             return;
         messages.front().earlierOutputDiscarded = discarded;
         auto batch = std::make_shared<const std::vector<RunMessage>>(std::make_move_iterator(messages.begin()),
@@ -1017,6 +1113,13 @@ static NSDictionary *JSONDictionary(std::string_view bytes)
     return [object isKindOfClass:NSDictionary.class] ? object : nil;
 }
 
+static NSURL *OriginalRustFile(NSURL *file, NSURL *mirror)
+{
+    if (PathIsInFolder(file.path, mirror.path) && file.path.length > mirror.path.length)
+        file = [NSURL fileURLWithPath:[file.path substringFromIndex:mirror.path.length]];
+    return CanonicalFileURL(file);
+}
+
 static RunMessage RustDiagnostic(NSDictionary *message, const DiagnosticContext &context, NSString *manifest = nil)
 {
     if (![message isKindOfClass:NSDictionary.class])
@@ -1062,13 +1165,15 @@ static RunMessage RustDiagnostic(NSDictionary *message, const DiagnosticContext 
         NSURL *package = [NSURL fileURLWithPath:manifest].URLByDeletingLastPathComponent;
         file = [NSURL fileURLWithPath:path isDirectory:NO relativeToURL:package].URLByStandardizingPath;
     }
-    file = CanonicalFileURL(file);
+    file = OriginalRustFile(file, context.mirror);
     NSUInteger line = [primary[@"line_start"] unsignedIntegerValue];
     NSUInteger column = [primary[@"column_start"] unsignedIntegerValue];
     NSUInteger end = [primary[@"line_end"] unsignedIntegerValue] == line ? [primary[@"column_end"] unsignedIntegerValue] : 0;
-    bool current = [file.path isEqualToString:CanonicalFileURL(context.input).path];
+    bool current = [file.path isEqualToString:OriginalRustFile(context.input, context.mirror).path];
     result.location = {current ? context.original : file, line, column, end > column ? column : 0, end, current, false};
     NSString *label = current && context.name.length ? context.name : path;
+    if (PathIsInFolder(label, context.mirror.path))
+        label = file.path;
     NSString *position = [NSString stringWithFormat:@":%lu:%lu", (unsigned long)line, (unsigned long)column];
     if (!rendered) {
         NSString *reference = [label stringByAppendingString:position];
@@ -1092,6 +1197,22 @@ static RunMessage RustDiagnostic(NSDictionary *message, const DiagnosticContext 
         result.linkRange = NSMakeRange(0, firstLineEnd);
     }
     return result;
+}
+
+static void AppendRustDiagnostic(RunLog &log, NSDictionary *message, const DiagnosticContext &context,
+                                 NSString *manifest = nil)
+{
+    if (log.checking) {
+        if (![message isKindOfClass:NSDictionary.class])
+            return;
+        NSString *level = message[@"level"], *text = message[@"message"];
+        if (![level isKindOfClass:NSString.class] || ![text isKindOfClass:NSString.class] ||
+            (![level isEqualToString:@"error"] && ![level isEqualToString:@"warning"]) ||
+            [text hasPrefix:@"aborting due to "] || [text hasSuffix:@" warning emitted"] ||
+            [text hasSuffix:@" warnings emitted"])
+            return;
+    }
+    log.append(RustDiagnostic(message, context, manifest));
 }
 
 template<typename Emit>
@@ -1122,13 +1243,15 @@ static std::string_view ReceiveDiagnosticRecords(std::string_view bytes, std::st
 
 struct CargoSession {
     DiagnosticContext diagnostics;
-    ProgramInput &input;
+    ProgramInput *input;
     void (^ready)(void);
     std::string record;
     bool dropping = false;
     bool finished = false;
     bool built = false;
     TerminalDecoder terminal{};
+    NSMutableOrderedSet<NSString *> *executables = nil;
+    bool testsOnly = false;
 
     void emit(std::string_view bytes, RunLog &log)
     {
@@ -1137,17 +1260,24 @@ struct CargoSession {
         if ([reason isEqualToString:@"build-finished"]) {
             finished = true;
             built = [data[@"success"] boolValue];
-            if (built) {
+            if (built && input) {
                 log.status(@"Build successful\n\n");
                 log.send(true);
-                input.setOpen(true);
+                input->setOpen(true);
                 if (ready)
                     dispatch_async(dispatch_get_main_queue(), ready);
             }
             return;
         }
         if ([reason isEqualToString:@"compiler-message"]) {
-            log.append(RustDiagnostic(data[@"message"], diagnostics, data[@"manifest_path"]));
+            AppendRustDiagnostic(log, data[@"message"], diagnostics, data[@"manifest_path"]);
+        } else if (executables && [reason isEqualToString:@"compiler-artifact"]) {
+            NSString *path = data[@"executable"];
+            NSArray *kind = data[@"target"][@"kind"];
+            if ([path isKindOfClass:NSString.class] && path.isAbsolutePath &&
+                ([kind containsObject:@"test"] || (!testsOnly &&
+                   ([kind containsObject:@"bin"] || [kind containsObject:@"example"]))))
+                [executables addObject:path];
         } else if (!reason.length && !bytes.empty()) {
             log.append(terminal.decode(ConsoleString(bytes)));
         }
@@ -1207,7 +1337,7 @@ struct RunStream {
     {
         if (stderrLine && diagnostics && diagnostics->language == Language::Rust) {
             if (NSDictionary *record = JSONDictionary(bytes)) {
-                log.append(RustDiagnostic(record, *diagnostics));
+                AppendRustDiagnostic(log, record, *diagnostics);
                 return;
             }
         }
@@ -1336,7 +1466,7 @@ static int Spawn(pid_t *pid, NSString *tool, NSArray<NSString *> *arguments, NSU
 static int RunCommand(NSString *tool, NSArray<NSString *> *arguments, NSURL *directory,
                       const DiagnosticContext *diagnostics, const std::atomic_bool &stop, RunLog &log,
                       ProgramInput *input = nullptr, void (^ready)(void) = nil,
-                      CargoSession *cargo = nullptr, std::string *capture = nullptr)
+                      CargoSession *cargo = nullptr, std::string *capture = nullptr, std::string *captureErrors = nullptr)
 {
     if (stop.load(std::memory_order_relaxed))
         return -1;
@@ -1402,10 +1532,10 @@ static int RunCommand(NSString *tool, NSArray<NSString *> *arguments, NSURL *dir
                 ssize_t length = read(watches[i].fd, bytes, sizeof(bytes));
                 if (length > 0) {
                     std::string_view received(bytes, size_t(length));
-                    if (i == 0 && capture) {
-                        constexpr size_t limit = 8 * 1024 * 1024;
-                        if (capture->size() < limit)
-                            capture->append(received.substr(0, limit - capture->size()));
+                    if (auto *buffer = i == 0 ? capture : captureErrors) {
+                        const size_t limit = i == 0 ? 8 * 1024 * 1024 : 64 * 1024;
+                        if (buffer->size() < limit)
+                            buffer->append(received.substr(0, limit - buffer->size()));
                         continue;
                     }
                     if (i == 0 && cargo && !cargo->finished)
@@ -1479,23 +1609,24 @@ static bool Objective(Language language)
     return language == Language::ObjectiveC || language == Language::ObjectiveCpp;
 }
 
-static NSArray<NSString *> *NativeFlags(Language language)
+static NSArray<NSString *> *NativeFlags(Language language, bool debugging = false)
 {
     bool cpp = CPlusPlus(language);
     NSString *kind = Objective(language) ? (cpp ? @"objective-c++" : @"objective-c") : (cpp ? @"c++" : @"c");
-    return @[@"-x", kind, cpp ? @"-std=c++20" : @"-std=c17", @"-Wall", @"-Wextra",
-             @"-fcolor-diagnostics", @"-fno-caret-diagnostics", @"-fdiagnostics-print-source-range-info"];
+    NSArray *flags = @[@"-x", kind, cpp ? @"-std=c++20" : @"-std=c17", @"-Wall", @"-Wextra",
+                       @"-fcolor-diagnostics", @"-fno-caret-diagnostics", @"-fdiagnostics-print-source-range-info"];
+    return debugging ? [flags arrayByAddingObjectsFromArray:@[@"-O0", @"-g"]] : flags;
 }
 
-static void RunNativeProject(NSURL *folder, NSURL *file, NSString *name, const std::atomic_bool &stop,
-                             RunLog &log, ProgramInput &input, void (^ready)(void))
+static NSURL *BuildNativeProject(NSURL *folder, NSURL *file, NSString *name, RunFiles &files, bool debugging,
+                                 const std::atomic_bool &stop, RunLog &log)
 {
     auto sources = SelectNativeSources(folder, CanonicalFileURL(file), stop);
     if (stop.load(std::memory_order_relaxed))
-        return;
+        return nil;
     if (sources.files.empty()) {
         log.status(sources.error, OutputTone::Error);
-        return;
+        return nil;
     }
 
     const auto uses = [&](bool (*test)(Language)) {
@@ -1513,14 +1644,13 @@ static void RunNativeProject(NSURL *folder, NSURL *file, NSString *name, const s
     NSString *clang = c ? GetTool(@"clang", Language::C, log) : nil;
     NSString *clangXX = cpp ? GetTool(@"clang++", Language::Cpp, log) : nil;
     if ((c && !clang) || (cpp && !clangXX))
-        return;
+        return nil;
 
-    RunFiles files;
     NSError *error = nil;
     files.folder = TemporaryFolder(&error);
     if (!files.folder) {
         log.status([NSString stringWithFormat:@"%@\n", error.localizedDescription], OutputTone::Error);
-        return;
+        return nil;
     }
     NSURL *program = [files.folder URLByAppendingPathComponent:@"program"];
     NSArray<NSString *> *includes = @[@"-I", sources.directory.path,
@@ -1537,7 +1667,7 @@ static void RunNativeProject(NSURL *folder, NSURL *file, NSString *name, const s
             bool cplusplus = CPlusPlus(unit.language);
             NSString *object = [files.folder URLByAppendingPathComponent:
                 [NSString stringWithFormat:@"%lu.o", (unsigned long)objects.count]].path;
-            NSMutableArray<NSString *> *arguments = [NativeFlags(unit.language) mutableCopy];
+            NSMutableArray<NSString *> *arguments = [NativeFlags(unit.language, debugging) mutableCopy];
             [arguments addObjectsFromArray:includes];
             [arguments addObjectsFromArray:@[@"-c", unit.url.path, @"-o", object]];
             result = RunCommand(cplusplus ? clangXX : clang, arguments, folder, &diagnostics, stop, log);
@@ -1548,11 +1678,13 @@ static void RunNativeProject(NSURL *folder, NSURL *file, NSString *name, const s
         if (!result) {
             if (objective)
                 [objects addObjectsFromArray:@[@"-framework", @"Foundation"]];
+            if (debugging)
+                [objects addObject:@"-g"];
             [objects addObjectsFromArray:@[@"-o", program.path]];
             result = RunCommand(cpp ? clangXX : clang, objects, folder, &diagnostics, stop, log);
         }
     } else {
-        NSMutableArray<NSString *> *arguments = [NativeFlags(firstLanguage) mutableCopy];
+        NSMutableArray<NSString *> *arguments = [NativeFlags(firstLanguage, debugging) mutableCopy];
         [arguments addObjectsFromArray:includes];
         for (const auto &unit : sources.files)
             [arguments addObject:unit.url.path];
@@ -1562,24 +1694,32 @@ static void RunNativeProject(NSURL *folder, NSURL *file, NSString *name, const s
         result = RunCommand(cpp ? clangXX : clang, arguments, folder, &diagnostics, stop, log);
     }
     if (stop.load(std::memory_order_relaxed))
-        return;
+        return nil;
     if (result) {
         log.status(@"Build failed.\n", OutputTone::Error);
-        return;
+        return nil;
     }
     log.status(@"Build successful\n\n");
     log.send(true);
-    RunProgram(program.path, @[], folder, stop, log, input, ready);
+    return program;
+}
+
+static void RunNativeProject(NSURL *folder, NSURL *file, NSString *name, const std::atomic_bool &stop,
+                             RunLog &log, ProgramInput &input, void (^ready)(void))
+{
+    RunFiles files;
+    if (NSURL *program = BuildNativeProject(folder, file, name, files, false, stop, log))
+        RunProgram(program.path, @[], folder, stop, log, input, ready);
 }
 
 static void AddCargoTarget(NSMutableArray<NSString *> *arguments, NSDictionary *metadata,
-                           NSURL *manifest, NSURL *file)
+                           NSURL *manifest, NSURL *file, bool debugging = false)
 {
     NSString *active = CanonicalFileURL(file).path;
     BOOL packageManifest = NO;
     NSSet<NSString *> *defaultMembers = [NSSet setWithArray:metadata[@"workspace_default_members"] ?
         metadata[@"workspace_default_members"] : metadata[@"workspace_members"]];
-    NSString *onlyPackage = nil, *onlyTarget = nil;
+    NSString *onlyPackage = nil, *onlyTarget = nil, *currentDefault = nil;
     NSUInteger defaults = 0;
     for (NSDictionary *package in metadata[@"packages"]) {
         NSString *manifestPath = package[@"manifest_path"];
@@ -1589,19 +1729,22 @@ static void AddCargoTarget(NSMutableArray<NSString *> *arguments, NSDictionary *
         packageManifest |= current;
         BOOL workspaceDefault = [defaultMembers containsObject:package[@"id"]];
         NSString *defaultRun = package[@"default_run"];
+        if (current && [defaultRun isKindOfClass:NSString.class])
+            currentDefault = defaultRun;
         for (NSDictionary *target in package[@"targets"]) {
             NSArray<NSString *> *kind = target[@"kind"];
             BOOL binary = [kind containsObject:@"bin"];
             BOOL example = [kind containsObject:@"example"] && [target[@"crate_types"] containsObject:@"bin"];
+            BOOL test = debugging && [kind containsObject:@"test"];
             NSString *targetPath = target[@"src_path"];
             NSString *name = target[@"name"];
             if (!name.length)
                 continue;
-            if ((binary || example) && active.length && targetPath.length &&
+            if ((binary || example || test) && active.length && targetPath.length &&
                 [CanonicalFileURL([NSURL fileURLWithPath:targetPath]).path isEqualToString:active]) {
                 if (!current)
                     [arguments addObjectsFromArray:@[@"--package", package[@"name"]]];
-                [arguments addObjectsFromArray:@[binary ? @"--bin" : @"--example", name]];
+                [arguments addObjectsFromArray:@[binary ? @"--bin" : example ? @"--example" : @"--test", name]];
                 return;
             }
             if (binary && workspaceDefault &&
@@ -1614,6 +1757,8 @@ static void AddCargoTarget(NSMutableArray<NSString *> *arguments, NSDictionary *
     }
     if (!packageManifest && defaults == 1)
         [arguments addObjectsFromArray:@[@"--package", onlyPackage, @"--bin", onlyTarget]];
+    else if (debugging && currentDefault.length)
+        [arguments addObjectsFromArray:@[@"--bin", currentDefault]];
 }
 
 static void RunCargo(NSURL *manifest, NSURL *file, const std::atomic_bool &stop, RunLog &log,
@@ -1642,7 +1787,7 @@ static void RunCargo(NSURL *manifest, NSURL *file, const std::atomic_bool &stop,
         @"--message-format=json,json-diagnostic-rendered-ansi", @"--manifest-path", manifest.path] mutableCopy];
     AddCargoTarget(arguments, metadata, manifest, file);
     NSURL *active = CanonicalFileURL(file);
-    CargoSession cargo{{active, active, workspace, nil, false, Language::Rust}, input, ready, {}};
+    CargoSession cargo{{active, active, workspace, nil, false, Language::Rust}, &input, ready, {}};
     result = RunCommand(tool, arguments, directory, nullptr, stop, log, &input, ready, &cargo);
     if (stop.load(std::memory_order_relaxed))
         return;
@@ -1650,6 +1795,212 @@ static void RunCargo(NSURL *manifest, NSURL *file, const std::atomic_bool &stop,
         log.programExitCode = result;
     else
         log.status(@"Build failed.\n", OutputTone::Error);
+}
+
+static void AddCheckBranch(NSMutableSet<NSString *> *branches, NSString *path, NSString *root)
+{
+    while (PathIsInFolder(path, root) && ![branches containsObject:path]) {
+        [branches addObject:path];
+        if ([path isEqualToString:root])
+            break;
+        path = path.stringByDeletingLastPathComponent;
+    }
+}
+
+static NSURL *MirroredCheckURL(NSURL *mirror, NSString *path)
+{
+    return path.length <= 1 ? mirror : [mirror URLByAppendingPathComponent:[path substringFromIndex:1]];
+}
+
+static bool MirrorCheckDirectory(NSString *source, NSURL *destination, NSSet<NSString *> *branches,
+                                 NSDictionary<NSString *, NSData *> *edits, const std::atomic_bool &stop, NSError **error)
+{
+    NSFileManager *files = NSFileManager.defaultManager;
+    NSArray<NSString *> *names = [files contentsOfDirectoryAtPath:source error:error];
+    if (!names || ![files createDirectoryAtURL:destination withIntermediateDirectories:YES attributes:nil error:error])
+        return false;
+    for (NSString *name in names) {
+        if (stop.load(std::memory_order_relaxed))
+            return false;
+        @autoreleasepool {
+            NSString *path = [source stringByAppendingPathComponent:name];
+            if (edits[path])
+                continue;
+            NSURL *link = [destination URLByAppendingPathComponent:name];
+            if ([branches containsObject:path]) {
+                if (!MirrorCheckDirectory(path, link, branches, edits, stop, error))
+                    return false;
+            } else if ([name isEqualToString:@"Cargo.toml"] || [name isEqualToString:@"Cargo.lock"]) {
+                NSData *data = [NSData dataWithContentsOfFile:path options:0 error:error];
+                if (!data || ![data writeToURL:link options:0 error:error])
+                    return false;
+            } else if (![files createSymbolicLinkAtPath:link.path withDestinationPath:path error:error]) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static bool PrepareCargoCheck(NSURL *mirror, NSString *workspace, NSArray *packages,
+                              const std::vector<CheckSource> &sources, const std::atomic_bool &stop, NSError **error)
+{
+    NSString *root = workspace;
+    NSMutableSet<NSString *> *external = [NSMutableSet set];
+    for (NSDictionary *package in packages) {
+        for (NSDictionary *dependency in package[@"dependencies"]) {
+            NSString *path = dependency[@"path"];
+            if ([path isKindOfClass:NSString.class] && path.isAbsolutePath) {
+                path = CanonicalFileURL([NSURL fileURLWithPath:path]).path;
+                if (!PathIsInFolder(path, workspace))
+                    [external addObject:path];
+                while (root.length > 1 && !PathIsInFolder(path, root))
+                    root = root.stringByDeletingLastPathComponent;
+            }
+        }
+    }
+
+    NSMutableSet<NSString *> *branches = [NSMutableSet set];
+    AddCheckBranch(branches, workspace, root);
+    for (NSDictionary *package in packages) {
+        NSString *manifest = package[@"manifest_path"];
+        if ([manifest isKindOfClass:NSString.class]) {
+            NSURL *url = CanonicalFileURL([NSURL fileURLWithPath:manifest]);
+            AddCheckBranch(branches, url.URLByDeletingLastPathComponent.path, root);
+        }
+    }
+    NSMutableDictionary<NSString *, NSData *> *edits = [NSMutableDictionary dictionary];
+    for (const auto &source : sources) {
+        @autoreleasepool {
+            NSString *path = source.file.path;
+            bool inProject = PathIsInFolder(path, workspace);
+            if (!inProject) {
+                for (NSString *dependency in external) {
+                    if (PathIsInFolder(path, dependency)) {
+                        inProject = true;
+                        break;
+                    }
+                }
+            }
+            if (!inProject)
+                continue;
+            NSData *data = [source.text dataUsingEncoding:NSUTF8StringEncoding];
+            NSData *saved = [NSData dataWithContentsOfURL:source.file options:NSDataReadingMappedIfSafe error:nil];
+            if (data && ![data isEqualToData:saved]) {
+                edits[path] = data;
+                AddCheckBranch(branches, source.file.URLByDeletingLastPathComponent.path, root);
+            }
+        }
+    }
+
+    NSFileManager *files = NSFileManager.defaultManager;
+    if ([files fileExistsAtPath:mirror.path] && ![files removeItemAtURL:mirror error:error])
+        return false;
+    if (!MirrorCheckDirectory(root, MirroredCheckURL(mirror, root), branches, edits, stop, error))
+        return false;
+    NSString *mirrorPath = CanonicalFileURL(mirror).path;
+    for (NSString *path in edits) {
+        if (stop.load(std::memory_order_relaxed))
+            return false;
+        NSURL *file = MirroredCheckURL(mirror, path);
+        if (!PathIsInFolder(CanonicalFileURL(file).path, mirrorPath)) {
+            *error = RunError(EACCES);
+            return false;
+        }
+        if (![files createDirectoryAtURL:file.URLByDeletingLastPathComponent withIntermediateDirectories:YES
+                              attributes:nil error:error] || ![edits[path] writeToURL:file options:0 error:error])
+            return false;
+    }
+    return true;
+}
+
+static void CargoCheckStatus(RunLog &log, int status, std::string_view errors, NSURL *mirror)
+{
+    if (status && !log.errors) {
+        if (errors.empty()) {
+            log.status(@"Cargo check failed.\n", OutputTone::Error);
+            return;
+        }
+        NSString *text = ConsoleString(errors);
+        if (mirror)
+            text = [text stringByReplacingOccurrencesOfString:mirror.path withString:@""];
+        RunMessage message = TerminalDecoder{}.decode(text);
+        message.tone = OutputTone::Error;
+        log.append(std::move(message));
+    }
+}
+
+static void CheckCargo(NSURL *manifest, NSURL *file, NSString *name, const std::vector<CheckSource> &sources,
+                       RustCheckCache *cache, const std::atomic_bool &stop, RunLog &log)
+{
+    NSString *tool = GetTool(@"cargo", Language::Rust, log);
+    if (!tool)
+        return;
+    NSURL *directory = manifest.URLByDeletingLastPathComponent;
+    std::string metadata, errors;
+    int status = RunCommand(tool, @[@"metadata", @"--offline", @"--no-deps", @"--format-version", @"1",
+        @"--manifest-path", manifest.path], directory, nullptr, stop, log, nullptr, nil, nullptr, &metadata, &errors);
+    if (stop.load(std::memory_order_relaxed))
+        return;
+    if (status) {
+        CargoCheckStatus(log, status, errors, nil);
+        return;
+    }
+    NSDictionary *project = JSONDictionary(metadata);
+    NSString *root = project[@"workspace_root"];
+    if (![root isKindOfClass:NSString.class] || !root.isAbsolutePath) {
+        log.status(@"Could not read the Cargo workspace.\n", OutputTone::Error);
+        return;
+    }
+    NSURL *workspace = CanonicalFileURL([NSURL fileURLWithPath:root isDirectory:YES]);
+    NSError *error = nil;
+    NSURL *scratch = [cache directoryWithError:&error];
+    NSURL *mirror = [scratch URLByAppendingPathComponent:@"source" isDirectory:YES];
+    if (!scratch || !PrepareCargoCheck(mirror, workspace.path, project[@"packages"], sources, stop, &error)) {
+        if (!stop.load(std::memory_order_relaxed)) {
+            NSString *message = error ? error.localizedDescription : @"Could not prepare the Cargo workspace.";
+            log.status([message stringByAppendingString:@"\n"], OutputTone::Error);
+        }
+        return;
+    }
+
+    NSURL *target = [scratch URLByAppendingPathComponent:@"target" isDirectory:YES];
+    NSURL *checkedManifest = MirroredCheckURL(mirror, manifest.path);
+    NSArray *arguments = @[@"check", @"--quiet", @"--offline", @"--all-targets", @"--color", @"always",
+        @"--message-format=json,json-diagnostic-rendered-ansi", @"--manifest-path", checkedManifest.path, @"--target-dir", target.path];
+    CargoSession cargo{{file, file, MirroredCheckURL(mirror, workspace.path), name, false, Language::Rust, mirror}, nullptr, nil, {}};
+    errors.clear();
+    status = RunCommand(tool, arguments, directory, nullptr, stop, log, nullptr, nil, &cargo, nullptr, &errors);
+    if (!stop.load(std::memory_order_relaxed))
+        CargoCheckStatus(log, status, errors, mirror);
+}
+
+static void CheckRustFile(NSURL *file, NSString *name, NSString *text, const std::atomic_bool &stop, RunLog &log)
+{
+    NSString *tool = GetTool(@"rustc", Language::Rust, log);
+    if (!tool)
+        return;
+    RunFiles files;
+    NSError *error = nil;
+    files.folder = TemporaryFolder(&error);
+    NSURL *directory = file.URLByDeletingLastPathComponent;
+    NSURL *input = file;
+    if (files.folder && text) {
+        NSData *data = [text dataUsingEncoding:NSUTF8StringEncoding];
+        if (!file || ![data isEqualToData:[NSData dataWithContentsOfURL:file]])
+            input = WriteRunSource(files, data, directory, @".rs", &error);
+    }
+    if (!files.folder || !input) {
+        NSString *message = error ? error.localizedDescription : @"Could not prepare the Rust source.";
+        log.status([message stringByAppendingString:@"\n"], OutputTone::Error);
+        return;
+    }
+    DiagnosticContext diagnostics{input, file, directory ? directory : files.folder, name, false, Language::Rust};
+    int status = RunCommand(tool, @[@"--edition=2021", @"--crate-name", @"editor_program", @"--emit=metadata",
+        @"--error-format=json", @"--json=diagnostic-rendered-ansi", input.path, @"--out-dir", files.folder.path],
+        diagnostics.directory, &diagnostics, stop, log);
+    if (status && !log.errors && !stop.load(std::memory_order_relaxed))
+        log.status(@"Rust check failed.\n", OutputTone::Error);
 }
 
 static bool BuildProgram(NSString *tool, NSArray<NSString *> *arguments, NSURL *directory,
@@ -1728,39 +2079,48 @@ static NSString *SwiftProduct(NSDictionary *package, NSURL *folder, NSURL *file)
     return nil;
 }
 
-static void RunSwiftPackage(RunProject project, NSURL *file, const std::atomic_bool &stop,
-                            RunLog &log, ProgramInput &input, void (^ready)(void))
+static NSURL *BuildSwiftPackage(RunProject project, NSURL *file, const std::atomic_bool &stop, RunLog &log, bool debugging)
 {
     NSString *tool = GetTool(@"swift", Language::Swift, log);
     if (!tool)
-        return;
+        return nil;
     DiagnosticContext diagnostics{file, file, project.folder, file.lastPathComponent, false, Language::Swift};
     std::string manifest;
     if (RunCommand(tool, @[@"package", @"dump-package"], project.folder, &diagnostics, stop, log, nullptr,
                    nil, nullptr, &manifest) != 0 || stop.load(std::memory_order_relaxed))
-        return;
+        return nil;
     NSDictionary *package = JSONDictionary(manifest);
     NSString *product = SwiftProduct(package, project.folder, file);
     if (!product.length) {
         log.status(@"Open a source file in an executable Swift package target.\n", OutputTone::Error);
-        return;
+        return nil;
     }
-    if (!BuildProgram(tool, @[@"build", @"--product", product, @"-Xswiftc", @"-color-diagnostics"],
-                      project.folder, diagnostics, stop, log))
-        return;
+    NSArray *arguments = @[@"build", @"--product", product, @"-Xswiftc", @"-color-diagnostics"];
+    if (debugging)
+        arguments = [arguments arrayByAddingObjectsFromArray:@[@"--configuration", @"debug", @"-Xswiftc", @"-g", @"-Xswiftc", @"-Onone"]];
+    if (!BuildProgram(tool, arguments, project.folder, diagnostics, stop, log))
+        return nil;
 
     std::string output;
-    int result = RunCommand(tool, @[@"build", @"--show-bin-path"], project.folder, nullptr, stop, log,
+    NSArray *find = debugging ? @[@"build", @"--configuration", @"debug", @"--show-bin-path"] : @[@"build", @"--show-bin-path"];
+    int result = RunCommand(tool, find, project.folder, nullptr, stop, log,
                             nullptr, nil, nullptr, &output);
     if (result || stop.load(std::memory_order_relaxed))
-        return;
+        return nil;
     NSString *path = [[[NSString alloc] initWithBytes:output.data() length:output.size() encoding:NSUTF8StringEncoding]
         stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
     NSString *program = ExecutableAt(path, product);
     if (program)
-        RunProgram(program, @[], project.folder, stop, log, input, ready);
-    else
-        log.status(@"Swift did not produce an executable.\n", OutputTone::Error);
+        return [NSURL fileURLWithPath:program];
+    log.status(@"Swift did not produce an executable.\n", OutputTone::Error);
+    return nil;
+}
+
+static void RunSwiftPackage(RunProject project, NSURL *file, const std::atomic_bool &stop,
+                            RunLog &log, ProgramInput &input, void (^ready)(void))
+{
+    if (NSURL *program = BuildSwiftPackage(project, file, stop, log, false))
+        RunProgram(program.path, @[], project.folder, stop, log, input, ready);
 }
 
 static NSString *DotNetExecutable(NSURL *folder, NSString *preferred)
@@ -1836,6 +2196,39 @@ static NSArray<NSString *> *ScriptArguments(Language language, NSString *path)
         case Language::CommonLisp: return @[@"--script", path];
         default: return @[path];
     }
+}
+
+static NSArray<NSString *> *NativeSourceArguments(Language language, NSString *path, NSString *program,
+                                                 NSURL *includes, bool package, bool debugging)
+{
+    NSArray<NSString *> *args;
+    if (language == Language::Rust) {
+        args = @[@"--edition=2021", @"--crate-name", @"editor_program", @"--error-format=json",
+                 @"--json=diagnostic-rendered-ansi", path, @"-o", program];
+        return debugging ? [args arrayByAddingObjectsFromArray:@[@"-C", @"debuginfo=2", @"-C", @"opt-level=0"]] : args;
+    }
+    if (language == Language::Swift) {
+        args = @[@"-color-diagnostics", path, @"-o", program];
+        return debugging ? [args arrayByAddingObjectsFromArray:@[@"-g", @"-Onone"]] : args;
+    }
+    if (language == Language::Go) {
+        if (debugging)
+            return @[@"build", @"-gcflags=all=-N -l", @"-o", program, path];
+        return @[@"build", @"-o", program, path];
+    }
+    if (language == Language::Odin) {
+        args = @[@"build", package ? path.stringByDeletingLastPathComponent : path,
+                 [@"-out:" stringByAppendingString:program], @"-error-pos-style:unix", @"-terse-errors"];
+        if (!package)
+            args = [args arrayByAddingObject:@"-file"];
+        return debugging ? [args arrayByAddingObject:@"-debug"] : args;
+    }
+    if (language == Language::Zig)
+        return @[@"build-exe", @"-O", @"Debug", path, [@"-femit-bin=" stringByAppendingString:program]];
+    if (language == Language::Assembly)
+        return @[@"-g", path, @"-o", program];
+    args = [NativeFlags(language, debugging) arrayByAddingObjectsFromArray:@[@"-iquote", includes.path, path, @"-o", program]];
+    return Objective(language) ? [args arrayByAddingObjectsFromArray:@[@"-framework", @"Foundation"]] : args;
 }
 
 static void RunSource(Language language, NSURL *file, NSString *name, NSString *text, NSURL *workingFolder,
@@ -1936,27 +2329,12 @@ static void RunSource(Language language, NSURL *file, NSString *name, NSString *
 
     NSString *program = [files.folder URLByAppendingPathComponent:kotlin ? @"program.jar" : mono ? @"program.exe" : @"program"].path;
     NSArray<NSString *> *arguments;
-    if (language == Language::Rust) {
-        arguments = @[@"--edition=2021", @"--crate-name", @"editor_program", @"--error-format=json",
-                      @"--json=diagnostic-rendered-ansi", path, @"-o", program];
-    } else if (language == Language::Swift) {
-        arguments = @[@"-color-diagnostics", path, @"-o", program];
-    } else if (language == Language::Go) {
-        arguments = @[@"build", @"-o", program, path];
-    } else if (language == Language::Odin) {
-        bool package = !text && [file.pathExtension isEqualToString:@"odin"];
-        arguments = @[@"build", package ? file.URLByDeletingLastPathComponent.path : path,
-                      [@"-out:" stringByAppendingString:program], @"-error-pos-style:unix", @"-terse-errors"];
-        if (!package)
-            arguments = [arguments arrayByAddingObject:@"-file"];
-    } else if (kotlin) {
+    if (kotlin) {
         arguments = @[path, @"-include-runtime", @"-d", program];
     } else if (mono) {
         arguments = @[[@"-out:" stringByAppendingString:program], path];
     } else {
-        arguments = [NativeFlags(language) arrayByAddingObjectsFromArray:@[@"-iquote", includes.path, path, @"-o", program]];
-        if (Objective(language))
-            arguments = [arguments arrayByAddingObjectsFromArray:@[@"-framework", @"Foundation"]];
+        arguments = NativeSourceArguments(language, path, program, includes, !text && [file.pathExtension isEqualToString:@"odin"], false);
     }
     if (!BuildProgram(tool, arguments, directory, diagnostics, stop, log))
         return;
@@ -1970,6 +2348,107 @@ static void RunSource(Language language, NSURL *file, NSString *name, NSString *
         RunProgram(program, @[], directory, stop, log, inputChannel, ready);
 }
 
+static NSURL *BuildCargoDebug(NSURL *manifest, NSURL *file, const std::atomic_bool &stop, RunLog &log)
+{
+    NSString *tool = GetTool(@"cargo", Language::Rust, log);
+    if (!tool)
+        return nil;
+    NSURL *directory = manifest.URLByDeletingLastPathComponent;
+    log.status(@"Building…\n");
+    log.send(true);
+
+    std::string information;
+    int status = RunCommand(tool, @[@"metadata", @"--no-deps", @"--format-version", @"1", @"--manifest-path", manifest.path],
+                            directory, nullptr, stop, log, nullptr, nil, nullptr, &information);
+    if (stop.load(std::memory_order_relaxed))
+        return nil;
+    NSDictionary *metadata = status ? nil : JSONDictionary(information);
+    if (!metadata) {
+        log.status(@"Could not read the Cargo project.\n", OutputTone::Error);
+        return nil;
+    }
+    NSString *root = metadata[@"workspace_root"];
+    NSURL *workspace = root.length ? [NSURL fileURLWithPath:root isDirectory:YES] : directory;
+    NSMutableArray *arguments = [@[@"build", @"--quiet", @"--color", @"always",
+        @"--message-format=json,json-diagnostic-rendered-ansi", @"--config", @"profile.dev.debug=2",
+        @"--config", @"profile.dev.opt-level=0", @"--config", @"profile.dev.strip=false", @"--manifest-path", manifest.path] mutableCopy];
+    AddCargoTarget(arguments, metadata, manifest, file, true);
+    CargoSession cargo{{file, file, workspace, file.lastPathComponent, false, Language::Rust}, nullptr, nil, {}};
+    cargo.executables = [NSMutableOrderedSet orderedSet];
+    cargo.testsOnly = [arguments containsObject:@"--test"];
+    status = RunCommand(tool, arguments, directory, nullptr, stop, log, nullptr, nil, &cargo);
+    if (stop.load(std::memory_order_relaxed))
+        return nil;
+    if (status || !cargo.built) {
+        log.status(@"Build failed.\n", OutputTone::Error);
+        return nil;
+    }
+    if (cargo.executables.count != 1) {
+        NSString *message = cargo.executables.count ? @"Open the main file of the Cargo target you want to debug.\n" :
+                                                     @"Cargo did not produce an executable.\n";
+        log.status(message, OutputTone::Error);
+        return nil;
+    }
+    log.status(@"Build successful\n\n");
+    return [NSURL fileURLWithPath:cargo.executables.firstObject];
+}
+
+static DebugExecutable *BuildDebugExecutable(RunProject project, Language language, NSURL *file,
+                                             const std::atomic_bool &stop, RunLog &log)
+{
+    if (!file || !DebuggableLanguage(language, file)) {
+        log.status(@"Open a native source file or choose Debug Executable.\n", OutputTone::Error);
+        return nil;
+    }
+    RunFiles files;
+    NSURL *directory = project.folder ? project.folder : file.URLByDeletingLastPathComponent;
+    NSURL *program = nil;
+    if (project.kind == RunKind::NativeProject) {
+        program = BuildNativeProject(directory, file, file.lastPathComponent, files, true, stop, log);
+    } else if (project.kind == RunKind::Cargo) {
+        directory = project.manifest.URLByDeletingLastPathComponent;
+        program = BuildCargoDebug(project.manifest, file, stop, log);
+    } else if (project.kind == RunKind::SwiftPackage) {
+        program = BuildSwiftPackage(project, file, stop, log, true);
+    } else {
+        NSString *tool = GetTool(language == Language::Assembly ? @"clang" : ToolName(language), language, log);
+        if (!tool)
+            return nil;
+        NSError *error = nil;
+        files.folder = TemporaryFolder(&error);
+        if (!files.folder) {
+            log.status([error.localizedDescription stringByAppendingString:@"\n"], OutputTone::Error);
+            return nil;
+        }
+        program = [files.folder URLByAppendingPathComponent:@"program"];
+        NSURL *sourceDirectory = file.URLByDeletingLastPathComponent;
+        NSArray *arguments;
+        if (project.kind == RunKind::GoModule) {
+            directory = sourceDirectory;
+            bool test = [file.lastPathComponent hasSuffix:@"_test.go"];
+            arguments = test ? @[@"test", @"-c", @"-gcflags=all=-N -l", @"-o", program.path, @"."] :
+                               @[@"build", @"-gcflags=all=-N -l", @"-o", program.path, @"."];
+        } else {
+            arguments = NativeSourceArguments(language, file.path, program.path, sourceDirectory,
+                                              project.kind == RunKind::OdinPackage, true);
+        }
+        DiagnosticContext diagnostics{file, file, directory, file.lastPathComponent,
+            CFamily(language) || language == Language::Go || language == Language::Zig, language};
+        if (!BuildProgram(tool, arguments, directory, diagnostics, stop, log))
+            return nil;
+    }
+    if (!program || stop.load(std::memory_order_relaxed))
+        return nil;
+    if (![NSFileManager.defaultManager isExecutableFileAtPath:program.path]) {
+        log.status(@"The build did not produce an executable.\n", OutputTone::Error);
+        return nil;
+    }
+    DebugExecutable *artifact = [[DebugExecutable alloc] initWithFile:program directory:directory];
+    artifact.scratch = files.folder;
+    files.folder = nil;
+    return artifact;
+}
+
 // Track live runs on the main thread, including runs whose source tabs have closed.
 static NSMutableSet<SourceRunner *> *activeRunners;
 static dispatch_group_t activeRuns;
@@ -1978,18 +2457,52 @@ static bool quitting;
 bool StopSourceRunsForQuit(dispatch_block_t finished)
 {
     quitting = true;
-    if (!activeRuns || dispatch_group_wait(activeRuns, DISPATCH_TIME_NOW) == 0)
+    NSArray<RustCheckCache *> *caches = checkCaches.allObjects;
+    bool running = activeRuns && dispatch_group_wait(activeRuns, DISPATCH_TIME_NOW) != 0;
+    if (!running && !caches.count)
         return false;
 
     for (SourceRunner *runner in activeRunners)
         [runner stop];
-    dispatch_group_notify(activeRuns, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), finished);
+    dispatch_block_t cleanup = ^{
+        for (RustCheckCache *cache in caches)
+            [cache removeFiles];
+        finished();
+    };
+    dispatch_queue_t queue = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
+    if (running)
+        dispatch_group_notify(activeRuns, queue, cleanup);
+    else
+        dispatch_async(queue, cleanup);
     return true;
 }
 
 @implementation SourceRunner {
     std::atomic_bool _stopped;
     ProgramInput _inputChannel;
+}
+
+- (void)startJob:(dispatch_block_t (^)(void))work qos:(qos_class_t)qos cancelled:(dispatch_block_t)cancelled
+{
+    if (quitting) {
+        [self stop];
+        dispatch_async(dispatch_get_main_queue(), cancelled);
+        return;
+    }
+    if (!activeRuns) {
+        activeRuns = dispatch_group_create();
+        activeRunners = [[NSMutableSet alloc] init];
+    }
+    [activeRunners addObject:self];
+    dispatch_group_async(activeRuns, dispatch_get_global_queue(qos, 0), ^{
+        @autoreleasepool {
+            dispatch_block_t finish = work();
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [activeRunners removeObject:self];
+                finish();
+            });
+        }
+    });
 }
 
 - (void)startLanguage:(Language)language file:(NSURL *)file name:(NSString *)name workingText:(NSString *)text
@@ -2002,57 +2515,76 @@ bool StopSourceRunsForQuit(dispatch_block_t finished)
 - (void)startProject:(RunProject)project language:(Language)language file:(NSURL *)file name:(NSString *)name
          workingText:(NSString *)text output:(RunOutput)output finished:(void (^)(void))finished
 {
-    if (quitting) {
-        [self stop];
-        dispatch_async(dispatch_get_main_queue(), finished);
-        return;
-    }
-    if (!activeRuns) {
-        activeRuns = dispatch_group_create();
-        activeRunners = [[NSMutableSet alloc] init];
-    }
-    [activeRunners addObject:self];
     NSString *snapshot = [text copy];
     void (^ready)(void) = self.inputReady;
-    dispatch_group_async(activeRuns, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        @autoreleasepool {
-            RunLog log{};
-            log.output = output;
-            switch (project.kind) {
-                case RunKind::Cargo:
-                    RunCargo(project.manifest, file, self->_stopped, log, self->_inputChannel, ready);
-                    break;
-                case RunKind::NativeProject:
-                    RunNativeProject(project.folder, file, name, self->_stopped, log, self->_inputChannel, ready);
-                    break;
-                case RunKind::GoModule:
-                    RunGoModule(project, file, self->_stopped, log, self->_inputChannel, ready);
-                    break;
-                case RunKind::SwiftPackage:
-                    RunSwiftPackage(project, file, self->_stopped, log, self->_inputChannel, ready);
-                    break;
-                case RunKind::DotNet:
-                    RunDotNetProject(project, language, file, self->_stopped, log, self->_inputChannel, ready);
-                    break;
-                case RunKind::Script: case RunKind::Source: case RunKind::OdinPackage:
-                    RunSource(language, file, name, snapshot,
-                              project.kind == RunKind::OdinPackage ? nil : project.folder,
-                              self->_stopped, log, self->_inputChannel, ready);
-                    break;
-            }
-            if (self->_stopped.load(std::memory_order_relaxed)) {
-                log.status(@"Stopped.\n");
-            } else if (int code = log.programExitCode; code >= 0) {
-                log.status([NSString stringWithFormat:@"Process exited with code %d.\n", code],
-                           code == 0 ? OutputTone::Text : OutputTone::Error);
-            }
-            log.send(true);
-            dispatch_async(dispatch_get_main_queue(), ^{
-                [activeRunners removeObject:self];
-                finished();
-            });
+    [self startJob:^dispatch_block_t {
+        RunLog log{};
+        log.output = output;
+        switch (project.kind) {
+            case RunKind::Cargo:
+                RunCargo(project.manifest, file, self->_stopped, log, self->_inputChannel, ready);
+                break;
+            case RunKind::NativeProject:
+                RunNativeProject(project.folder, file, name, self->_stopped, log, self->_inputChannel, ready);
+                break;
+            case RunKind::GoModule:
+                RunGoModule(project, file, self->_stopped, log, self->_inputChannel, ready);
+                break;
+            case RunKind::SwiftPackage:
+                RunSwiftPackage(project, file, self->_stopped, log, self->_inputChannel, ready);
+                break;
+            case RunKind::DotNet:
+                RunDotNetProject(project, language, file, self->_stopped, log, self->_inputChannel, ready);
+                break;
+            case RunKind::Script: case RunKind::Source: case RunKind::OdinPackage:
+                RunSource(language, file, name, snapshot,
+                          project.kind == RunKind::OdinPackage ? nil : project.folder,
+                          self->_stopped, log, self->_inputChannel, ready);
+                break;
         }
-    });
+        if (self->_stopped.load(std::memory_order_relaxed)) {
+            log.status(@"Stopped.\n");
+        } else if (int code = log.programExitCode; code >= 0) {
+            log.status([NSString stringWithFormat:@"Process exited with code %d.\n", code],
+                       code == 0 ? OutputTone::Text : OutputTone::Error);
+        }
+        log.send(true);
+        return finished;
+    } qos:QOS_CLASS_USER_INITIATED cancelled:finished];
+}
+
+- (void)checkRustProject:(RunProject)project file:(NSURL *)file name:(NSString *)name
+                 sources:(std::vector<CheckSource>)sources cache:(RustCheckCache *)cache finished:(CheckFinished)finished
+{
+    auto snapshot = std::make_shared<const std::vector<CheckSource>>(std::move(sources));
+    [self startJob:^dispatch_block_t {
+        RunLog log{};
+        log.checking = true;
+        if (project.kind == RunKind::Cargo)
+            CheckCargo(project.manifest, file, name, *snapshot, cache, self->_stopped, log);
+        else
+            CheckRustFile(file, name, snapshot->empty() ? nil : snapshot->front().text, self->_stopped, log);
+        auto result = std::make_shared<CheckResult>();
+        if (!self.isStopped) {
+            result->errors = log.errors;
+            result->diagnostics.assign(std::make_move_iterator(log.messages.begin()), std::make_move_iterator(log.messages.end()));
+        }
+        return ^{ finished(std::move(*result)); };
+    } qos:QOS_CLASS_UTILITY cancelled:^{ finished({}); }];
+}
+
+- (void)buildDebugProject:(RunProject)project language:(Language)language file:(NSURL *)file
+                   output:(RunOutput)output finished:(void (^)(DebugExecutable *))finished
+{
+    [self startJob:^dispatch_block_t {
+        RunLog log{};
+        log.output = output;
+        DebugExecutable *program = BuildDebugExecutable(project, language, file, self->_stopped, log);
+        if (self.isStopped)
+            log.status(@"Stopped.\n");
+        log.send(true);
+        return ^{ finished(program); };
+    } qos:QOS_CLASS_USER_INITIATED cancelled:^{ finished(nil); }];
 }
 
 - (BOOL)isStopped { return _stopped.load(std::memory_order_relaxed); }

@@ -1,5 +1,6 @@
 #import "Editor.h"
 #import "Chrome.h"
+#import "DebugPane.h"
 #import "Preferences.h"
 #import "Rendering.h"
 #import "Runner.h"
@@ -16,6 +17,7 @@
 - (IBAction)showFonts:(id)sender;
 - (IBAction)newWindowForTab:(id)sender;
 - (IBAction)closeWindow:(id)sender;
+- (IBAction)debugCommand:(NSMenuItem *)sender;
 - (IBAction)openFolder:(id)sender;
 - (IBAction)findInFiles:(id)sender;
 - (IBAction)replaceInFiles:(id)sender;
@@ -164,6 +166,18 @@ static void SetUpMenus()
     AddItem(view, @"Output", @selector(toggleDocumentOutput:), @"");
     NSMenuItem *vim = AddItem(view, @"Vim Mode", @selector(toggleVimMode:), @"v");
     vim.keyEquivalentModifierMask = NSEventModifierFlagCommand | NSEventModifierFlagOption;
+
+    NSMenu *debug = AddMenu(bar, @"Debug");
+    for (auto command : {DebugCommand::Continue, DebugCommand::Pause, DebugCommand::StepOver, DebugCommand::StepInto,
+                         DebugCommand::StepOut, DebugCommand::Restart, DebugCommand::Stop,
+                         DebugCommand::ToggleBreakpoint, DebugCommand::EditBreakpoint, DebugCommand::RunToCursor,
+                         DebugCommand::ChooseExecutable, DebugCommand::Attach, DebugCommand::Arguments, DebugCommand::ShowPane}) {
+        if (command == DebugCommand::ToggleBreakpoint || command == DebugCommand::ChooseExecutable)
+            [debug addItem:NSMenuItem.separatorItem];
+        NSMenuItem *item = MakeDebugMenuItem(command);
+        item.target = NSApp.delegate;
+        [debug addItem:item];
+    }
 
     NSMenu *window = AddMenu(bar, @"Window");
     AddItem(window, @"Minimize", @selector(performMiniaturize:), @"m");
@@ -720,8 +734,24 @@ static void AddMenuCommands(NSMutableArray<NSMenuItem *> *commands, NSMenu *menu
     PopulateThemeMenu(menu, @selector(selectTheme:));
 }
 
+- (SourceDocument *)debugDocument
+{
+    if (NSApp.modalWindow)
+        return nil;
+    NSWindow *window = _documents.activeEditorWindow;
+    NSDocument *document = window.windowController.document;
+    return [document isKindOfClass:SourceDocument.class] ? (SourceDocument *)document : nil;
+}
+
+- (IBAction)debugCommand:(NSMenuItem *)sender
+{
+    [self.debugDocument debugCommand:sender];
+}
+
 - (BOOL)validateMenuItem:(NSMenuItem *)item
 {
+    if (item.action == @selector(debugCommand:))
+        return [self.debugDocument validateMenuItem:item];
     if (item.action == @selector(toggleAutoSave:))
         item.state = AutoSavePreference().mode == AutoSaveMode::Off ? NSControlStateValueOff : NSControlStateValueOn;
     if (item.action == @selector(showCommandPalette:)) {
@@ -772,7 +802,19 @@ static void AddMenuCommands(NSMutableArray<NSMenuItem *> *commands, NSMenu *menu
     if (![_documents saveSessionForQuitDiscarding:nil])
         return NSTerminateCancel;
 
-    bool stopping = StopSourceRunsForQuit(^{
+    dispatch_group_t jobs = dispatch_group_create();
+    dispatch_group_enter(jobs);
+    bool stoppingRuns = StopSourceRunsForQuit(^{ dispatch_group_leave(jobs); });
+    if (!stoppingRuns)
+        dispatch_group_leave(jobs);
+    dispatch_group_enter(jobs);
+    bool stoppingDebuggers = StopDebugSessionsForQuit(^{ dispatch_group_leave(jobs); });
+    if (!stoppingDebuggers)
+        dispatch_group_leave(jobs);
+    if (!stoppingRuns && !stoppingDebuggers)
+        return NSTerminateNow;
+
+    dispatch_group_notify(jobs, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         // AppKit waits in its modal run loop after NSTerminateLater.
         CFRunLoopRef mainLoop = CFRunLoopGetMain();
         CFRunLoopPerformBlock(mainLoop, (__bridge CFArrayRef)@[NSDefaultRunLoopMode, NSModalPanelRunLoopMode], ^{
@@ -780,7 +822,7 @@ static void AddMenuCommands(NSMutableArray<NSMenuItem *> *commands, NSMenu *menu
         });
         CFRunLoopWakeUp(mainLoop);
     });
-    return stopping ? NSTerminateLater : NSTerminateNow;
+    return NSTerminateLater;
 }
 
 - (BOOL)applicationSupportsSecureRestorableState:(NSApplication *)application

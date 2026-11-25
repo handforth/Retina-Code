@@ -25,7 +25,7 @@ xcrun --sdk macosx clang++ \
     "$source_dir/main.mm" "$source_dir/Editor.mm" "$source_dir/Rendering.mm" "$source_dir/Lexer.cpp" "$source_dir/Languages.cpp" \
     "$source_dir/VimView.mm" "$source_dir/Vim.cpp" "$source_dir/VimMulti.cpp" "$source_dir/Preferences.mm" "$source_dir/Typing.mm" \
     "$source_dir/Output.mm" "$source_dir/Runner.mm" "$source_dir/Chrome.mm" "$source_dir/Workspace.mm" \
-    "$source_dir/FolderSearch.mm" \
+    "$source_dir/FolderSearch.mm" "$source_dir/Starters.mm" "$source_dir/Debugger.mm" "$source_dir/DebugPane.mm" \
     -o "$macos/Retina Code"
 cp "$project_dir/resources/Info.plist" "$app/Contents/Info.plist"
 cp "$project_dir/THEME_CREDITS.txt" "$resources/THEME_CREDITS.txt"

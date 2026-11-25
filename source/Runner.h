@@ -54,6 +54,21 @@ struct RunMessage {
 
 using RunOutput = void (^)(const std::vector<RunMessage> &);
 
+struct CheckSource {
+    NSURL *file;
+    NSString *text;
+};
+
+struct CheckResult {
+    std::vector<RunMessage> diagnostics;
+    NSUInteger errors = 0;
+};
+
+using CheckFinished = void (^)(CheckResult);
+
+@interface RustCheckCache : NSObject
+@end
+
 enum class RunKind { Source, Script, Cargo, NativeProject, GoModule, SwiftPackage, DotNet, OdinPackage };
 
 struct RunProject {
@@ -62,8 +77,17 @@ struct RunProject {
     NSURL *manifest = nil;
 };
 
+@interface DebugExecutable : NSObject
+@property(nonatomic, readonly) NSURL *file;
+@property(nonatomic, readonly) NSURL *directory;
+- (instancetype)initWithFile:(NSURL *)file directory:(NSURL *)directory;
+@end
+
 RunProject LocateRunProject(Language language, NSURL *file, NSURL *folder);
+NSURL *ParentManifest(NSURL *directory, NSURL *limit, NSString *name);
 bool RunnableLanguage(Language language);
+bool DebuggableLanguage(Language language, NSURL *file);
+NSString *FindTool(NSString *name, Language language);
 bool StopSourceRunsForQuit(dispatch_block_t finished);
 
 @interface SourceRunner : NSObject
@@ -73,6 +97,10 @@ bool StopSourceRunsForQuit(dispatch_block_t finished);
                output:(RunOutput)output finished:(void (^)(void))finished;
 - (void)startProject:(RunProject)project language:(Language)language file:(NSURL *)file name:(NSString *)name
          workingText:(NSString *)text output:(RunOutput)output finished:(void (^)(void))finished;
+- (void)checkRustProject:(RunProject)project file:(NSURL *)file name:(NSString *)name
+                 sources:(std::vector<CheckSource>)sources cache:(RustCheckCache *)cache finished:(CheckFinished)finished;
+- (void)buildDebugProject:(RunProject)project language:(Language)language file:(NSURL *)file
+                   output:(RunOutput)output finished:(void (^)(DebugExecutable *))finished;
 - (void)stop;
 - (BOOL)sendInput:(NSString *)text;
 @end

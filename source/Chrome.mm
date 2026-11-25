@@ -816,6 +816,7 @@ std::optional<DockSide> DockSideAtPoint(NSRect body, NSPoint point)
         return;
     _selected = selected;
     _label.accessibilitySelected = selected;
+    _close.toolTip = selected ? @"Close Tab (⌘W)" : @"Close Tab";
     self.needsDisplay = YES;
 }
 
@@ -895,7 +896,7 @@ std::optional<DockSide> DockSideAtPoint(NSRect body, NSPoint point)
     NSImage *plus = [NSImage imageWithSystemSymbolName:@"plus" accessibilityDescription:@"New Tab"];
     _newTab.image = [plus imageWithSymbolConfiguration:
         [NSImageSymbolConfiguration configurationWithPointSize:11 weight:NSFontWeightMedium]];
-    _newTab.toolTip = @"New Tab";
+    _newTab.toolTip = @"New Tab (⌘T)";
     _newTab.target = self;
     _newTab.action = @selector(newTab:);
     [self addSubview:_newTab];

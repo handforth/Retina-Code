@@ -1032,6 +1032,7 @@ static_assert(std::size(colorTitles) == std::tuple_size_v<decltype(ColorFields(s
     NSButton *choose = [NSButton buttonWithTitle:@"Choose…" target:NSFontManager.sharedFontManager
                                          action:@selector(orderFrontFontPanel:)];
     choose.frame = NSMakeRect(width - margin - 105, 18, 105, 28);
+    choose.toolTip = @"Show Fonts (⌥⌘T)";
     [pane addSubview:choose];
 }
 
@@ -1563,6 +1564,7 @@ static_assert(std::size(colorTitles) == std::tuple_size_v<decltype(ColorFields(s
     _themeEditor.contentView = body;
     Label(body, @"Name", NSMakeRect(20, height - 34, 62, 18), NSTextAlignmentLeft);
     _themeName = [[NSTextField alloc] initWithFrame:NSMakeRect(83, height - 37, width - 103, 24)];
+    _themeName.cell.scrollable = YES;
     _themeName.delegate = self;
     _themeName.stringValue = ThemeRowTitle(_editingTheme);
     _themeName.accessibilityLabel = @"Theme Name";
@@ -1618,6 +1620,7 @@ static_assert(std::size(colorTitles) == std::tuple_size_v<decltype(ColorFields(s
     NSButton *done = [NSButton buttonWithTitle:@"Done" target:self action:@selector(finishThemeEditor:)];
     done.frame = NSMakeRect(width - 105, 14, 89, 29);
     done.keyEquivalent = @"\r";
+    done.toolTip = @"Done (↩)";
     [body addSubview:done];
     NSColorPanel.sharedColorPanel.showsAlpha = NO;
     _themeEditor.initialFirstResponder = _themeName;

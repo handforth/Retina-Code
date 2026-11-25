@@ -17,6 +17,15 @@ inline bool PathIsInFolder(NSString *path, NSString *folder)
         [path hasPrefix:[folder hasSuffix:@"/"] ? folder : [folder stringByAppendingString:@"/"]];
 }
 
+inline NSString *RelativeWorkspacePath(NSString *path, NSString *folder)
+{
+    if (!PathIsInFolder(path, folder))
+        return nil;
+    if ([path isEqualToString:folder])
+        return @".";
+    return [path substringFromIndex:folder.length + ([folder hasSuffix:@"/"] ? 0 : 1)];
+}
+
 inline bool HiddenWorkspaceItem(NSString *name)
 {
     return [name isEqualToString:@".git"] || [name isEqualToString:@".DS_Store"] ||
@@ -47,6 +56,7 @@ extern NSNotificationName const FolderRunChanged;
 @interface FolderExplorer : NSView
 - (instancetype)initWithWorkspace:(FolderWorkspace *)workspace;
 @property(nonatomic, copy) void (^openFile)(NSURL *);
+@property(nonatomic, copy) void (^findInFolder)(NSURL *);
 - (void)revealFile:(NSURL *)file expandingFolders:(BOOL)expand;
 - (void)focusFiles;
 @end

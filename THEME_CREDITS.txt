@@ -35,6 +35,14 @@ Base2Tone VS Code Themes
 https://github.com/atelierbram/Base2Tone-VSCode-Themes
 Copyright (c) 2018 Bram de Haan
 
+Jellybeans
+https://github.com/nanotech/jellybeans.vim
+Copyright (c) 2009-2019 NanoTech
+
+Andromeda
+https://github.com/EliverLara/Andromeda
+Copyright (c) 2017 <eliverlara@gmail.com>
+
 MIT License
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -62,3 +70,8 @@ https://buymeasoda.github.io/soda-theme/
 Palette adapted to Retina Code's token roles and editor accents.
 Creative Commons Attribution-ShareAlike 3.0 Unported
 https://creativecommons.org/licenses/by-sa/3.0/
+
+IR_Black
+Todd Werth
+https://github.com/twerth/ir_black
+Palette adapted to Retina Code's token roles and editor accents.
