@@ -46,4 +46,4 @@ Report any issues you have, bugs, or feature requests please! :D
 
 ## Disclaimers
 All theme credits and licenses are in THEME_CREDITS.txt.
-AI Disclaimer: This project was made with help from Codex
+AI Disclaimer: The code is pretty terrible, the project was made with AI code writing.
