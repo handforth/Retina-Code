@@ -41,6 +41,7 @@ struct BracketMatch {
 Indentation DetectIndentation(NSString *text, Indentation fallback = {});
 void AdjustTypedPairs(std::vector<TypedPair> &pairs, const Vim::EditMap &edit);
 bool MayCompleteCharacter(unichar character);
+NSRange NextCodeBracket(NSAttributedString *storage, NSRange range, bool backwards);
 BracketMatch BracketsAtSelection(NSAttributedString *storage, NSRange selection, bool preferUnderCursor);
 std::vector<Vim::Range> CommentLineRanges(NSString *text, std::vector<Vim::Range> selections);
 void AppendLineCommentEdits(NSString *text, Vim::Range lines, Vim::Comments comments, const Indentation &indentation,

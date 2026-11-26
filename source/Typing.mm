@@ -295,17 +295,18 @@ static bool CodeAt(NSAttributedString *storage, NSUInteger position)
                                              effectiveRange:nullptr];
 }
 
-static NSRange NextBracket(NSAttributedString *storage, NSRange range, bool backwards)
+NSRange NextCodeBracket(NSAttributedString *storage, NSRange range, bool backwards)
 {
     static NSCharacterSet *const characters = [NSCharacterSet characterSetWithCharactersInString:@"()[]{}"];
     NSString *text = storage.string;
     while (range.length) {
         NSStringCompareOptions options = backwards ? NSBackwardsSearch : 0;
         NSRange bracket = [text rangeOfCharacterFromSet:characters options:options range:range];
-        if (bracket.location == NSNotFound || CodeAt(storage, bracket.location))
+        if (bracket.location == NSNotFound)
             return bracket;
         NSRange literal;
-        [storage attribute:EditorNonCodeAttribute atIndex:bracket.location effectiveRange:&literal];
+        if (![storage attribute:EditorNonCodeAttribute atIndex:bracket.location effectiveRange:&literal])
+            return bracket;
         if (backwards) {
             if (literal.location <= range.location)
                 break;
@@ -327,7 +328,7 @@ static NSUInteger ScanBrackets(NSAttributedString *storage, NSUInteger start, bo
         nesting.push_back(expected);
     NSRange remaining = backwards ? NSMakeRange(0, start) : NSMakeRange(start, text.length - start);
     while (remaining.length) {
-        NSRange bracket = NextBracket(storage, remaining, backwards);
+        NSRange bracket = NextCodeBracket(storage, remaining, backwards);
         if (bracket.location == NSNotFound)
             break;
         unichar character = At(text, bracket.location);
@@ -518,7 +519,7 @@ static NSString *PythonSuiteIndent(NSAttributedString *storage, Line line, NSUIn
     if (PythonHeader(code))
         return LeadingIndent(storage.string, line);
     // A header may start above the line containing its closing parenthesis and colon.
-    NSRange bracket = NextBracket(storage, NSMakeRange(line.start, end - line.start), true);
+    NSRange bracket = NextCodeBracket(storage, NSMakeRange(line.start, end - line.start), true);
     if (bracket.location != NSNotFound && OpenFor(At(storage.string, bracket.location))) {
         NSUInteger opening = MatchingBracket(storage, bracket.location);
         if (opening != NSNotFound && opening < line.start) {

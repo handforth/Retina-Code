@@ -920,8 +920,11 @@ static void AddMenuCommands(NSMutableArray<NSMenuItem *> *commands, NSMenu *menu
     CommandPreview preview = nil;
     if (previewThemes) {
         __weak NSView *previewHost = host;
+        __weak CommandPalette *palette = _palette;
         preview = ^(NSMenuItem *item) {
             PreviewEditorTheme(previewHost, item ? item.tag : -1);
+            if (palette.window)
+                [palette applyTheme:*(item ? ThemeAt(item.tag) : SelectedTheme())];
         };
     }
     [window makeKeyAndOrderFront:nil];

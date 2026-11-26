@@ -415,14 +415,16 @@ inline constexpr Theme themes[] = {
      {rgb(16, 16, 16), rgb(160, 0, 136), rgb(160, 0, 136), rgb(79, 33, 138),
       rgb(43, 49, 145), rgb(16, 16, 16), rgb(184, 29, 24), rgb(28, 0, 207),
       rgb(0, 108, 20), rgb(120, 69, 27), rgb(28, 0, 207), rgb(22, 0, 184)},
-     {.completionPaper = rgb(255, 255, 255), .vimFlash = rgb(126, 169, 226)}},
+     {.completionPaper = rgb(250, 251, 253), .completionBorder = rgb(157, 169, 185),
+      .completionSelection = rgb(217, 230, 246), .completionSelectedText = rgb(27, 47, 75), .vimFlash = rgb(126, 169, 226)}},
 
     {"Paper", rgb(255, 251, 234), rgb(243, 232, 190), rgb(234, 211, 139),
      rgb(239, 233, 213), rgb(201, 190, 163), rgb(106, 98, 81), rgb(48, 38, 25),
      {rgb(24, 20, 11), rgb(23, 63, 157), rgb(23, 63, 157), rgb(0, 98, 89),
       rgb(115, 32, 140), rgb(24, 20, 11), rgb(156, 52, 20), rgb(121, 54, 148),
       rgb(56, 96, 32), rgb(141, 23, 71), rgb(0, 60, 148), rgb(104, 32, 139)},
-     {.completionPaper = rgb(255, 251, 234), .vimFlash = rgb(135, 174, 145)}},
+     {.completionPaper = rgb(255, 251, 234), .completionBorder = rgb(166, 153, 117),
+      .completionSelection = rgb(238, 225, 185), .completionSelectedText = rgb(68, 52, 23), .vimFlash = rgb(135, 174, 145)}},
 
     {"Dark+ (2019)", rgb(30, 30, 30), rgb(40, 40, 40), rgb(73, 64, 53),
      rgb(30, 30, 30), rgb(51, 51, 51), rgb(133, 133, 133), rgb(198, 198, 198),

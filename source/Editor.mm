@@ -758,6 +758,8 @@ static NSString *ApplyWorkspaceLanguageEdit(id value, NSURL *root, NSString *nam
 - (void)updateLanguageHoverModifiers:(NSEventModifierFlags)flags atWindowPoint:(NSPoint)point;
 - (void)updateLanguageHoverAtWindowPoint:(NSPoint)point modifiers:(NSEventModifierFlags)modifiers;
 - (void)dismissLanguageInformation;
+- (void)dismissPointerInformation;
+- (void)scheduleSignatureHelp;
 - (void)presentLanguageError:(NSString *)message;
 - (IBAction)languageCommand:(NSMenuItem *)sender;
 @end
@@ -774,9 +776,7 @@ static NSString *ApplyWorkspaceLanguageEdit(id value, NSURL *root, NSString *nam
 - (NSUInteger)lineCount;
 - (BOOL)codeAtOffset:(NSUInteger)offset;
 - (LexState)contextAtOffset:(NSUInteger)offset;
-- (NSArray<NSString *> *)completionsForPrefix:(std::u16string_view)prefix limit:(NSUInteger)limit;
-- (NSArray<NSString *> *)completionsForPrefix:(std::u16string_view)prefix limit:(NSUInteger)limit
-                                   language:(Language)language;
+- (size_t)completionWords:(std::u16string_view)prefix language:(Language)language results:(std::span<std::u16string_view>)results;
 @property(nonatomic, readonly) NSUInteger textVersion;
 - (const std::vector<TypedPair> &)typedPairs;
 - (void)didType:(const TypingEdit &)edit;
@@ -925,34 +925,27 @@ static NSRange LineContents(NSString *text, NSUInteger start)
     return state;
 }
 
-- (NSArray<NSString *> *)completionsForPrefix:(std::u16string_view)prefix limit:(NSUInteger)limit
-{
-    return [self completionsForPrefix:prefix limit:limit language:_language];
-}
-
-- (NSArray<NSString *> *)completionsForPrefix:(std::u16string_view)prefix limit:(NSUInteger)limit
-                                   language:(Language)language
+- (size_t)completionWords:(std::u16string_view)prefix language:(Language)language results:(std::span<std::u16string_view>)results
 {
     [self finishHighlighting];
     const auto &words = CompletionWords(language);
     auto keyword = std::upper_bound(words.begin(), words.end(), prefix);
     auto name = _names.upper_bound(prefix);
-    NSMutableArray<NSString *> *results = [NSMutableArray arrayWithCapacity:limit];
-    while (results.count < limit) {
+    size_t count = 0;
+    while (count < results.size()) {
         bool hasKeyword = keyword != words.end() && keyword->starts_with(prefix);
         bool hasName = name != _names.end() && name->first.starts_with(prefix);
         if (!hasKeyword && !hasName)
             break;
         std::u16string_view word = hasKeyword && (!hasName || *keyword <= name->first) ?
                                    *keyword : std::u16string_view(name->first);
-        [results addObject:[[NSString alloc] initWithCharacters:reinterpret_cast<const unichar *>(word.data())
-                                                       length:word.size()]];
+        results[count++] = word;
         if (hasKeyword && *keyword == word)
             ++keyword;
         if (hasName && name->first == word)
             ++name;
     }
-    return results;
+    return count;
 }
 
 - (const std::vector<TypedPair> &)typedPairs { return _typedPairs; }
@@ -1554,7 +1547,7 @@ static NSRange LineContents(NSString *text, NSUInteger start)
     for (NSLayoutManager *layout in _storage.layoutManagers) {
         NSTextView *view = layout.textContainers.firstObject.textView;
         if ([view isKindOfClass:CodeView.class])
-            [(CodeView *)view dismissLanguageInformation];
+            [(CodeView *)view dismissPointerInformation];
     }
     NSString *text = _storage.string;
     auto splitsNewline = [&](NSUInteger offset) {
@@ -1861,8 +1854,8 @@ static bool IsHideableUnusedWarning(SyntaxBuffer *buffer, NSUInteger offset, NSS
     return true;
 }
 
-static constexpr CGFloat completionRowHeight = 18;
 static constexpr CGFloat completionInset = 2;
+static constexpr CGFloat completionKindWidth = 19;
 static constexpr NSUInteger completionLimit = 8;
 static constexpr size_t completionCacheLimit = 256;
 
@@ -1888,6 +1881,16 @@ struct CompletionEdit {
     NSUInteger existingCaret = NSNotFound;
     NSUInteger newPair = NSNotFound;
 };
+
+static NSFont *PopupCodeFont(NSFont *font)
+{
+    CGFloat size = std::clamp(font.pointSize, 11.0, 14.0);
+    if (font && size == font.pointSize)
+        return font;
+
+    NSFont *resized = font ? [NSFont fontWithName:font.fontName size:size] : nil;
+    return resized ? resized : [NSFont monospacedSystemFontOfSize:size weight:NSFontWeightRegular];
+}
 
 static std::u16string_view TrimSignature(std::u16string_view text)
 {
@@ -1998,6 +2001,18 @@ static NSString *CompletionDisplayLabel(const CompletionItem &item, Language lan
     return [name stringByAppendingString:CompletionTakesArguments(item, language, boundReceiver) ? @"(...)" : @"()"];
 }
 
+static bool SameCompletionLabel(const CompletionItem &a, const CompletionItem &b)
+{
+    if (a.kind != b.kind || ![a.label isEqualToString:b.label])
+        return false;
+    if (a.kind != CompletionKind::Function)
+        return true;
+
+    return (a.detail == b.detail || [a.detail isEqualToString:b.detail]) &&
+           (a.labelDetail == b.labelDetail || [a.labelDetail isEqualToString:b.labelDetail]) &&
+           [a.text hasPrefix:@"self."] == [b.text hasPrefix:@"self."];
+}
+
 static bool CallHasReceiver(NSString *source, NSUInteger before)
 {
     while (before) {
@@ -2097,6 +2112,137 @@ static NSUInteger LastCallOpening(std::u16string_view text)
     }
     return NSNotFound;
 }
+
+static NSUInteger CallOpeningAt(NSAttributedString *storage, NSUInteger caret, Language language)
+{
+    NSString *text = storage.string;
+    NSUInteger start = caret - std::min(caret, NSUInteger(4096));
+    NSUInteger depth = 0;
+    bool lisp = LispSymbols(language);
+    while (caret > start) {
+        NSRange bracket = NextCodeBracket(storage, NSMakeRange(start, caret - start), true);
+        if (bracket.location == NSNotFound)
+            break;
+
+        caret = bracket.location;
+        unichar ch = [text characterAtIndex:caret];
+        if (ch == ')' || ch == ']' || ch == '}') {
+            ++depth;
+        } else if (depth) {
+            --depth;
+        } else if (ch == '(') {
+            if (lisp)
+                return caret;
+
+            NSUInteger name = caret;
+            while (name && [NSCharacterSet.whitespaceAndNewlineCharacterSet characterIsMember:[text characterAtIndex:name - 1]])
+                --name;
+            if (!name)
+                continue;
+
+            unichar tail = [text characterAtIndex:name - 1];
+            if (tail == ')' || tail == ']' || tail == '>' || (tail == '!' && language == Language::Rust) ||
+                (tail == '.' && name > 1 && [text characterAtIndex:name - 2] == '?') || WordCharacterAt(text, name - 1))
+                return caret;
+        }
+    }
+    return NSNotFound;
+}
+
+static NSUInteger ActiveSignatureIndex(NSDictionary *response, NSUInteger count)
+{
+    NSUInteger index = LSPNumber(response[@"activeSignature"]).unsignedIntegerValue;
+    return index < count ? index : 0;
+}
+
+static SignatureLabel ReadSignatureLabel(NSDictionary *response, NSArray *signatures, NSUInteger choice, Language language, id *documentation)
+{
+    NSUInteger activeSignature = ActiveSignatureIndex(response, signatures.count);
+    NSUInteger selected = choice < signatures.count ? choice : activeSignature;
+    NSDictionary *entry = LSPDict(signatures[selected]);
+    SignatureLabel signature{.text = LSPString(entry[@"label"]), .index = selected, .count = signatures.count};
+    *documentation = entry[@"documentation"];
+    NSArray *parameters = LSPArray(entry[@"parameters"]);
+    id index = entry[@"activeParameter"];
+    if (!index)
+        index = response[@"activeParameter"];
+    NSUInteger active = LSPNumber(index).unsignedIntegerValue;
+    if (active >= parameters.count)
+        active = selected == activeSignature ? 0 : NSNotFound;
+    if (index == NSNull.null)
+        active = NSNotFound;
+
+    NSUInteger search = 0, opening = NSNotFound;
+    NSUInteger length = signature.text.length;
+    for (NSUInteger i = 0; i < parameters.count; ++i) {
+        NSDictionary *parameter = LSPDict(parameters[i]);
+        id label = parameter[@"label"];
+        NSRange range = {};
+        if (NSArray *offsets = LSPArray(label); offsets.count == 2) {
+            NSNumber *first = LSPNumber(offsets[0]), *end = LSPNumber(offsets[1]);
+            NSUInteger a = first.unsignedIntegerValue, b = end.unsignedIntegerValue;
+            if (first && end && a < b && b <= length)
+                range = NSMakeRange(a, b - a);
+        } else if (NSString *name = LSPString(label); name.length) {
+            if (!search) {
+                ParametersInSignature(signature.text, language, &opening);
+                if (opening != NSNotFound)
+                    search = opening + 1;
+            }
+            NSRange match = [signature.text rangeOfString:name options:NSLiteralSearch range:NSMakeRange(search, length - search)];
+            if (match.location != NSNotFound)
+                range = match;
+        }
+        if (range.length) {
+            search = std::max(search, NSMaxRange(range));
+            signature.parameters = signature.parameters.length ? NSUnionRange(signature.parameters, range) : range;
+            if (i == active)
+                signature.active = range;
+        }
+        if (i == active && parameter[@"documentation"])
+            *documentation = parameter[@"documentation"];
+    }
+    return signature;
+}
+
+struct PopupSpace {
+    CGFloat top, bottom, above, below;
+};
+
+static PopupSpace SpaceForPopup(NSRect visible, NSRect anchor, CGFloat gap, NSRect other, CGFloat minimum)
+{
+    CGFloat top = NSMinY(anchor) - gap;
+    CGFloat bottom = NSMaxY(anchor) + gap;
+    CGFloat first = NSMinY(visible), last = NSMaxY(visible);
+    if (!NSIsEmptyRect(other)) {
+        if (NSMinY(other) < top) {
+            CGFloat past = NSMaxY(other) + gap;
+            if (top - past >= minimum)
+                first = std::max(first, past);
+            else
+                top = NSMinY(other) - gap;
+        }
+        if (NSMaxY(other) > bottom) {
+            CGFloat before = NSMinY(other) - gap;
+            if (before - bottom >= minimum)
+                last = std::min(last, before);
+            else
+                bottom = NSMaxY(other) + gap;
+        }
+    }
+    return {top, bottom, std::max(0.0, top - first), std::max(0.0, last - bottom)};
+}
+
+struct SignatureSession {
+    NSTimer *timer = nil;
+    NSDictionary *overloads = nil;
+    NSUInteger opening = NSNotFound;
+    NSUInteger offset = NSNotFound;
+    NSUInteger version = 0;
+    NSUInteger dismissed = NSNotFound;
+    NSUInteger choice = NSNotFound;
+    bool manual = false;
+};
 
 static CompletionKind CompletionKindForLSP(NSInteger kind)
 {
@@ -2258,16 +2404,24 @@ NSArray<NSMenuItem *> *LanguageFeatureCommands()
 @property(nonatomic) NSUInteger selectedRow;
 @property(nonatomic, copy) void (^accept)(void);
 - (const std::vector<CompletionItem> &)items;
-- (NSSize)setItems:(std::span<const CompletionItem>)items theme:(const ThemeRef &)theme language:(Language)language boundReceiver:(BOOL)boundReceiver;
+- (NSSize)setItems:(std::span<const CompletionItem>)items theme:(const ThemeRef &)theme font:(NSFont *)font rowHeight:(CGFloat)height
+          language:(Language)language boundReceiver:(BOOL)boundReceiver;
 - (void)clear;
 @end
 
 @implementation CompletionList {
     ThemeRef _theme;
+    PopupColors _colors;
     NSTextFieldCell *_label;
     NSTextFieldCell *_kind;
     std::vector<CompletionItem> _items;
     std::array<NSString *, completionLimit> _displayLabels;
+    NSDictionary *_labelAttributes;
+    NSSize _itemsSize;
+    CGFloat _rowHeight;
+    Language _language;
+    BOOL _boundReceiver;
+    BOOL _showsKinds;
 }
 
 - (instancetype)initWithFrame:(NSRect)frame
@@ -2275,13 +2429,11 @@ NSArray<NSMenuItem *> *LanguageFeatureCommands()
     self = [super initWithFrame:frame];
     if (self) {
         _label = [[NSTextFieldCell alloc] initTextCell:@""];
-        NSFont *font = [NSFont fontWithName:@"Menlo-Regular" size:11];
-        _label.font = font ? font : [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular];
         _label.drawsBackground = NO;
         _label.bordered = NO;
         _label.lineBreakMode = NSLineBreakByTruncatingTail;
         _kind = [[NSTextFieldCell alloc] initTextCell:@""];
-        _kind.font = [NSFont boldSystemFontOfSize:11];
+        _kind.font = [NSFont boldSystemFontOfSize:10];
         _kind.alignment = NSTextAlignmentCenter;
         _kind.drawsBackground = NO;
         _kind.bordered = NO;
@@ -2302,78 +2454,100 @@ NSArray<NSMenuItem *> *LanguageFeatureCommands()
     _displayLabels.fill(nil);
 }
 
-- (NSSize)setItems:(std::span<const CompletionItem>)items theme:(const ThemeRef &)theme language:(Language)language boundReceiver:(BOOL)boundReceiver
+- (NSSize)setItems:(std::span<const CompletionItem>)items theme:(const ThemeRef &)theme font:(NSFont *)font rowHeight:(CGFloat)height
+          language:(Language)language boundReceiver:(BOOL)boundReceiver
 {
+    bool themeChanged = _theme != theme || _items.empty();
+    bool fontChanged = !_labelAttributes || ![_label.font isEqual:font];
+    bool sameLabels = !themeChanged && !fontChanged && _language == language && _boundReceiver == boundReceiver &&
+        _rowHeight == height && std::equal(items.begin(), items.end(), _items.begin(), _items.end(), SameCompletionLabel);
     NSString *selected = !self.hidden && _selectedRow < _items.size() ? _items[_selectedRow].label : nil;
     _items.assign(items.begin(), items.end());
-    _theme = theme;
+    if (sameLabels)
+        return _itemsSize;
+
+    if (themeChanged) {
+        _theme = theme;
+        _colors = EditorPopupColors(*theme);
+    }
+    if (fontChanged) {
+        _label.font = font;
+        _labelAttributes = @{NSFontAttributeName:font};
+    }
+    _language = language;
+    _boundReceiver = boundReceiver;
+    _rowHeight = height;
     auto row = std::find_if(_items.begin(), _items.end(), [&](const CompletionItem &item) {
         return [item.label isEqualToString:selected];
     });
-    self.selectedRow = row == _items.end() ? 0 : NSUInteger(row - _items.begin());
+    _selectedRow = row == _items.end() ? 0 : NSUInteger(row - _items.begin());
+    _showsKinds = std::any_of(_items.begin(), _items.end(), [](const CompletionItem &item) {
+        return item.kind != CompletionKind::Word;
+    });
     CGFloat width = 140;
-    NSDictionary *attributes = @{NSFontAttributeName:_label.font};
+    CGFloat padding = 18 + (_showsKinds ? completionKindWidth : 0);
     for (NSUInteger i = 0; i < _displayLabels.size(); ++i) {
         NSString *label = i < _items.size() ? CompletionDisplayLabel(_items[i], language, boundReceiver) : nil;
         _displayLabels[i] = label;
         if (label)
-            width = std::max(width, std::ceil([label sizeWithAttributes:attributes].width) + 30);
+            width = std::max(width, std::ceil([label sizeWithAttributes:_labelAttributes].width) + padding);
     }
-    return NSMakeSize(std::min(width, 300.0), _items.size() * completionRowHeight + 2 * completionInset);
+    _itemsSize = NSMakeSize(std::min(width, 300.0), _items.size() * height + 2 * completionInset);
+    self.needsDisplay = YES;
+    return _itemsSize;
 }
 
 - (void)setSelectedRow:(NSUInteger)row
 {
     if (_selectedRow != row) {
         for (NSUInteger changed : {_selectedRow, row})
-            [self setNeedsDisplayInRect:NSMakeRect(0, completionInset + changed * completionRowHeight,
-                                                 NSWidth(self.bounds), completionRowHeight)];
+            [self setNeedsDisplayInRect:NSMakeRect(0, completionInset + changed * _rowHeight,
+                                                 NSWidth(self.bounds), _rowHeight)];
     }
     _selectedRow = row;
 }
 
 - (void)drawRect:(NSRect)dirty
 {
-    const EditorAccents &accents = _theme->accents;
-    [SRGBColor(accents.completionBorder) setFill];
-    NSRectFill(self.bounds);
-    [SRGBColor(accents.completionPaper) setFill];
-    NSRectFill(NSInsetRect(self.bounds, 1, 1));
-    static NSString *const symbols[] = {@"·", @"ƒ", @"T", @"x", @"▪", @"▣", @"K", @"#"};
+    DrawPopupFrame(self.bounds, dirty, _colors.paper, _colors.border);
+    NSColor *text = SRGBColor(_colors.text);
+    NSColor *selectedText = SRGBColor(_colors.selectedText);
+    static NSString *const symbols[] = {nil, @"ƒ", @"T", @"x", @"▪", @"▣", @"K", @"#"};
     static constexpr Ink inks[] = {Ink::Text, Ink::Function, Ink::Type, Ink::Name, Ink::Name,
                                    Ink::Type, Ink::Keyword, Ink::Constant};
     for (NSUInteger i = 0; i < _items.size(); ++i) {
-        NSRect row = NSMakeRect(completionInset, completionInset + i * completionRowHeight,
-                                NSWidth(self.bounds) - 2 * completionInset, completionRowHeight);
+        NSRect row = NSMakeRect(completionInset, completionInset + i * _rowHeight,
+                                NSWidth(self.bounds) - 2 * completionInset, _rowHeight);
         if (!NSIntersectsRect(dirty, row))
             continue;
         bool selected = i == _selectedRow;
         if (selected) {
-            [SRGBColor(accents.completionSelection) setFill];
+            [SRGBColor(_colors.selection) setFill];
             NSRectFill(row);
         }
-        const auto &item = _items[i];
-        size_t kind = size_t(item.kind);
-        Col32 base = selected ? accents.completionSelection : accents.completionPaper;
-        Col32 ink = selected ? accents.completionSelectedText : _theme->ink[size_t(inks[kind])];
-        NSRect badge = NSMakeRect(NSMinX(row) + 5, NSMinY(row) + 2, 14, NSHeight(row) - 4);
-        [SRGBColor(BlendColor(base, ink, 14)) setFill];
-        NSRectFill(badge);
-        _kind.stringValue = symbols[kind];
-        _kind.textColor = SRGBColor(ink);
-        [_kind drawInteriorWithFrame:badge inView:self];
+
+        size_t kind = size_t(_items[i].kind);
+        if (symbols[kind]) {
+            Col32 ink = selected ? _colors.selectedText : _colors.text;
+            _kind.stringValue = symbols[kind];
+            _kind.textColor = SRGBColor(BlendColor(ink, _theme->ink[size_t(inks[kind])], 38));
+            NSRect mark = NSMakeRect(NSMaxX(row) - completionKindWidth - 3, NSMinY(row), completionKindWidth, NSHeight(row));
+            [_kind drawInteriorWithFrame:mark inView:self];
+        }
+        NSRect label = NSInsetRect(row, 5, 0);
+        if (_showsKinds)
+            label.size.width -= completionKindWidth;
         _label.stringValue = _displayLabels[i];
-        _label.textColor = SRGBColor(selected ? accents.completionSelectedText : _theme->ink[size_t(Ink::Text)]);
-        [_label drawInteriorWithFrame:NSMakeRect(NSMinX(row) + 24, NSMinY(row), NSWidth(row) - 28, NSHeight(row))
-                              inView:self];
+        _label.textColor = selected ? selectedText : text;
+        [_label drawInteriorWithFrame:label inView:self];
     }
 }
 
 - (void)mouseDown:(NSEvent *)event
 {
     CGFloat y = [self convertPoint:event.locationInWindow fromView:nil].y - completionInset;
-    if (y >= 0 && y < _items.size() * completionRowHeight) {
-        self.selectedRow = NSUInteger(y / completionRowHeight);
+    if (y >= 0 && y < _items.size() * _rowHeight) {
+        self.selectedRow = NSUInteger(y / _rowHeight);
         if (self.accept)
             self.accept();
     }
@@ -2412,6 +2586,7 @@ NSArray<NSMenuItem *> *LanguageFeatureCommands()
     NSTimer *_languageHoverTimer;
     NSTimer *_hoverLeaveTimer;
     EditorHover *_languageInformation;
+    SignatureSession _signature;
     std::optional<BuildError> _hoveredError;
     NSArray<NSDictionary *> *_hoverQuickFixes;
     BOOL _commandHover;
@@ -3005,15 +3180,18 @@ static bool IdentifierAt(NSString *text, NSUInteger offset)
 
     NSRect visible = NSInsetRect(self.visibleRect, 2, 2);
     NSRect anchor = [self vimCaretAt:_completionPrefix.location];
-    CGFloat below = NSMaxY(visible) - NSMaxY(anchor) - 1;
-    CGFloat above = NSMinY(anchor) - NSMinY(visible) - 1;
-    CGFloat available = std::max(below, above) - 2 * completionInset;
-    if (available < completionRowHeight || NSWidth(visible) < 48 ||
+    NSFont *font = PopupCodeFont(self.editorFont);
+    CGFloat rowHeight = std::max(18.0, std::ceil(font.ascender - font.descender + 4));
+    NSRect signature = _signature.opening != NSNotFound && !_languageInformation.hidden
+        ? [self convertRect:_languageInformation.frame fromView:host] : NSZeroRect;
+    PopupSpace space = SpaceForPopup(visible, anchor, 1, signature, rowHeight + 2 * completionInset);
+    CGFloat available = std::max(space.below, space.above) - 2 * completionInset;
+    if (available < rowHeight || NSWidth(visible) < 48 ||
         NSMaxY(anchor) <= NSMinY(visible) || NSMinY(anchor) >= NSMaxY(visible))
         return NO;
-    NSUInteger limit = std::min(items.size(), NSUInteger(available / completionRowHeight));
+    NSUInteger limit = std::min(items.size(), NSUInteger(available / rowHeight));
 
-    [self dismissLanguageInformation];
+    [self dismissPointerInformation];
     if (!_completion) {
         _completion = [[CompletionList alloc] initWithFrame:NSZeroRect];
         __weak CodeView *view = self;
@@ -3021,15 +3199,17 @@ static bool IdentifierAt(NSString *text, NSUInteger offset)
     }
     Language language = self.syntax.language;
     bool boundReceiver = language == Language::Rust && CallHasReceiver(self.string, _completionPrefix.location);
-    NSSize size = [_completion setItems:items.first(limit) theme:_palette language:language boundReceiver:boundReceiver];
+    NSSize size = [_completion setItems:items.first(limit) theme:_palette font:font rowHeight:rowHeight
+                               language:language boundReceiver:boundReceiver];
     size.width = std::min(size.width, NSWidth(visible));
     CGFloat x = std::clamp(NSMinX(anchor), NSMinX(visible), NSMaxX(visible) - size.width);
-    CGFloat y = below >= size.height ? NSMaxY(anchor) + 1 : NSMinY(anchor) - size.height - 1;
-    _completion.frame = [self convertRect:NSMakeRect(x, y, size.width, size.height) toView:host];
+    CGFloat y = space.below >= size.height ? space.bottom : space.top - size.height;
+    NSRect frame = [self convertRect:NSMakeRect(x, y, size.width, size.height) toView:host];
+    if (!NSEqualRects(_completion.frame, frame))
+        _completion.frame = frame;
     if (_completion.superview != host)
         [host addSubview:_completion positioned:NSWindowAbove relativeTo:scroll];
     _completion.hidden = NO;
-    [_completion setNeedsDisplay:YES];
     return YES;
 }
 
@@ -3061,13 +3241,14 @@ static bool IdentifierAt(NSString *text, NSUInteger offset)
         return NO;
     if (language == Language::HTML || language == Language::Markdown || language == Language::PHP)
         language = LanguageInContext(language, [self.syntax contextAtOffset:end]);
-    NSArray<NSString *> *words = [self.syntax completionsForPrefix:LSPText(prefix) limit:completionLimit language:language];
+    std::array<std::u16string_view, completionLimit> words;
+    size_t count = [self.syntax completionWords:LSPText(prefix) language:language results:words];
     std::array<CompletionItem, completionLimit> items;
     std::vector<Token> tokens;
-    size_t count = 0;
-    for (NSString *word in words) {
+    for (size_t i = 0; i < count; ++i) {
+        std::u16string_view word = words[i];
         LexState state;
-        TokenizeLine(LSPText(word), language, state, tokens);
+        TokenizeLine(word, language, state, tokens);
         CompletionKind kind = CompletionKind::Word;
         if (tokens.size() == 1) {
             switch (tokens.front().ink) {
@@ -3077,8 +3258,8 @@ static bool IdentifierAt(NSString *text, NSUInteger offset)
                 default: break;
             }
         }
-        items[count].label = word;
-        items[count++].kind = kind;
+        items[i].label = [[NSString alloc] initWithCharacters:reinterpret_cast<const unichar *>(word.data()) length:word.size()];
+        items[i].kind = kind;
     }
     return [self presentCompletions:std::span(items).first(count)];
 }
@@ -3157,10 +3338,12 @@ static bool IdentifierAt(NSString *text, NSUInteger offset)
         --start;
     NSRange range = NSMakeRange(start, end - start);
     continuing = continuing && _completionActive && range.location == _completionPrefix.location;
-    if (!continuing)
-        [self dismissCompletion];
-    else
+    if (continuing) {
+        minimum = 1;
         [self cancelCompletionRequest];
+    } else {
+        [self dismissCompletion];
+    }
 
     if (range.length < minimum && !(languageCompletion && (trigger || continuing || minimum == 1))) {
         [self dismissCompletion];
@@ -3246,9 +3429,11 @@ static bool IdentifierAt(NSString *text, NSUInteger offset)
     ++_languageInformationGeneration;
 }
 
-- (void)dismissLanguageInformation
+- (void)clearLanguageInformation
 {
     [self cancelLanguageInformationRequests];
+    _signature.overloads = nil;
+    _signature.choice = NSNotFound;
     [_hoverLeaveTimer invalidate];
     _hoverLeaveTimer = nil;
     if (_languageHoverRange.length)
@@ -3266,10 +3451,65 @@ static bool IdentifierAt(NSString *text, NSUInteger offset)
     [_languageInformation clear];
 }
 
+- (void)dismissLanguageInformation
+{
+    [_signature.timer invalidate];
+    _signature.timer = nil;
+    _signature.opening = NSNotFound;
+    _signature.manual = false;
+    [self clearLanguageInformation];
+}
+
+- (void)dismissPointerInformation
+{
+    if (_signature.opening == NSNotFound)
+        [self clearLanguageInformation];
+}
+
+- (void)cancelLanguageInformation
+{
+    if (_signature.opening != NSNotFound)
+        _signature.dismissed = _signature.opening;
+    [self dismissLanguageInformation];
+}
+
+static bool PointBetweenHoverRects(NSPoint point, NSRect source, NSRect popup)
+{
+    if (NSIsEmptyRect(source))
+        return false;
+    if (NSPointInRect(point, NSInsetRect(source, -4, -3)))
+        return true;
+    if (NSMinY(source) > NSMinY(popup))
+        std::swap(source, popup);
+
+    CGFloat first = NSMaxY(source), last = NSMinY(popup);
+    if (last <= first || point.y < first || point.y > last)
+        return false;
+
+    CGFloat t = (point.y - first) / (last - first);
+    return point.x >= std::lerp(NSMinX(source), NSMinX(popup), t) - 4 &&
+           point.x <= std::lerp(NSMaxX(source), NSMaxX(popup), t) + 4;
+}
+
+- (BOOL)keepsLanguageHoverAtPoint:(NSPoint)point
+{
+    if (!_languageInformation || _languageInformation.hidden)
+        return NO;
+    if (self.hoverHasFocus)
+        return YES;
+
+    NSRect popup = [self convertRect:_languageInformation.bounds fromView:_languageInformation];
+    NSPoint local = [self convertPoint:point fromView:nil];
+    return NSPointInRect(local, NSInsetRect(popup, -2, -2)) ||
+           (_hoveredError && PointBetweenHoverRects(local, _languageHoverHighlight, popup));
+}
+
 - (void)scheduleLanguageInformationDismissal
 {
+    if (_signature.opening != NSNotFound)
+        return;
     if (!_languageInformation || _languageInformation.hidden) {
-        [self dismissLanguageInformation];
+        [self dismissPointerInformation];
         return;
     }
     if (_hoverLeaveTimer)
@@ -3280,29 +3520,40 @@ static bool IdentifierAt(NSString *text, NSUInteger offset)
         if (!editor)
             return;
         editor->_hoverLeaveTimer = nil;
-        NSPoint point = [editor->_languageInformation convertPoint:editor.window.mouseLocationOutsideOfEventStream fromView:nil];
-        if (!editor.hoverHasFocus && !NSPointInRect(point, editor->_languageInformation.bounds))
-            [editor dismissLanguageInformation];
+        NSPoint point = editor.window.mouseLocationOutsideOfEventStream;
+        if (![editor keepsLanguageHoverAtPoint:point]) {
+            [editor dismissPointerInformation];
+            [editor updateLanguageHoverAtWindowPoint:point modifiers:NSEvent.modifierFlags];
+        }
     }];
 }
 
-- (void)showLanguageInformation:(id)markup signature:(NSString *)signature error:(const BuildError *)error
+- (void)showLanguageInformation:(id)markup signature:(const SignatureLabel *)signature error:(const BuildError *)error
                             at:(NSUInteger)offset
 {
     NSScrollView *scroll = self.enclosingScrollView;
     NSView *host = scroll.superview;
-    if ((!markup && !signature.length && !error) || !host || !self.theme || !self.window.isKeyWindow ||
-        self.window.attachedSheet || (_completion && !_completion.hidden))
+    if ((!markup && !signature && !error) || !host || !self.theme || !self.window.isKeyWindow ||
+        self.window.attachedSheet || (!signature && _completion && !_completion.hidden))
         return;
     NSRect visible = NSInsetRect(self.visibleRect, 4, 4);
     NSRect anchor = [self vimCaretAt:std::min(offset, self.string.length)];
-    if (NSMaxY(anchor) < NSMinY(visible) || NSMinY(anchor) > NSMaxY(visible))
+    if (NSMaxY(anchor) < NSMinY(visible) || NSMinY(anchor) > NSMaxY(visible)) {
+        if (signature)
+            [self dismissLanguageInformation];
         return;
-    CGFloat below = NSMaxY(visible) - NSMaxY(anchor) - 2;
-    CGFloat above = NSMinY(anchor) - NSMinY(visible) - 2;
-    NSSize limit = NSMakeSize(std::min(580.0, NSWidth(visible)), std::min(306.0, std::max(above, below)));
-    if (limit.width < 75 || limit.height < 54)
+    }
+
+    NSRect suggestions = signature && _completion && !_completion.hidden
+        ? [self convertRect:_completion.frame fromView:host] : NSZeroRect;
+    CGFloat minimum = signature ? 28 : 54;
+    PopupSpace space = SpaceForPopup(visible, anchor, 2, suggestions, minimum);
+    NSSize limit = NSMakeSize(std::min(580.0, NSWidth(visible)), std::min(306.0, std::max(space.above, space.below)));
+    if (limit.width < 75 || limit.height < minimum) {
+        if (signature)
+            [self dismissLanguageInformation];
         return;
+    }
     if (!_languageInformation) {
         _languageInformation = [[EditorHover alloc] initWithFrame:NSZeroRect];
         _languageInformation.hidden = YES;
@@ -3310,12 +3561,9 @@ static bool IdentifierAt(NSString *text, NSUInteger offset)
         _languageInformation.pointerExited = ^{ [view scheduleLanguageInformationDismissal]; };
         _languageInformation.viewError = ^{ [view viewErrorAtCursor]; };
         _languageInformation.quickFix = ^{ [view showHoveredQuickFixes]; };
-        _languageInformation.cancel = ^{ [view dismissLanguageInformation]; };
+        _languageInformation.cancel = ^{ [view cancelLanguageInformation]; };
     }
-    CGFloat fontSize = std::clamp(self.editorFont.pointSize, 11.0, 14.0);
-    NSFont *font = [NSFont fontWithName:self.editorFont.fontName size:fontSize];
-    if (!font)
-        font = [NSFont monospacedSystemFontOfSize:fontSize weight:NSFontWeightRegular];
+    NSFont *font = PopupCodeFont(self.editorFont);
     NSSize size = error
         ? [_languageInformation showMessage:error->message diagnosticLabel:error->label showsQuickFix:_hoverQuickFixes.count != 0
                                       font:font theme:*self.theme limit:limit]
@@ -3323,9 +3571,19 @@ static bool IdentifierAt(NSString *text, NSUInteger offset)
                                               font:font theme:*self.theme limit:limit];
     if (size.height == 0)
         return;
-    CGFloat x = std::clamp(NSMinX(anchor), NSMinX(visible), NSMaxX(visible) - size.width);
-    CGFloat y = size.height <= below ? NSMaxY(anchor) + 2 : NSMinY(anchor) - size.height - 2;
-    _languageInformation.frame = [self convertRect:NSMakeRect(x, y, size.width, size.height) toView:host];
+
+    CGFloat left = NSMinX(anchor);
+    if (signature && _signature.opening <= offset) {
+        NSUInteger line = [self.syntax lineForOffset:offset];
+        if ([self.syntax lineForOffset:_signature.opening] == line)
+            left = NSMinX([self vimCaretAt:_signature.opening]);
+    }
+    CGFloat x = std::clamp(left, NSMinX(visible), NSMaxX(visible) - size.width);
+    bool above = size.height > space.below || (signature && size.height <= space.above);
+    CGFloat y = above ? space.top - size.height : space.bottom;
+    NSRect frame = [self convertRect:NSMakeRect(x, y, size.width, size.height) toView:host];
+    if (!NSEqualRects(_languageInformation.frame, frame))
+        _languageInformation.frame = frame;
     if (_languageInformation.superview != host)
         [host addSubview:_languageInformation positioned:NSWindowAbove relativeTo:scroll];
     _languageInformation.hidden = NO;
@@ -3343,7 +3601,7 @@ static bool IdentifierAt(NSString *text, NSUInteger offset)
 
 - (void)showLanguageInformation:(NSString *)message at:(NSUInteger)offset
 {
-    [self showLanguageInformation:@{@"kind":@"plaintext", @"value":message} signature:nil error:nullptr at:offset];
+    [self showLanguageInformation:@{@"kind":@"plaintext", @"value":message} signature:nullptr error:nullptr at:offset];
 }
 
 - (NSMutableDictionary *)languageParamsAt:(NSUInteger)offset
@@ -3351,6 +3609,161 @@ static bool IdentifierAt(NSString *text, NSUInteger offset)
     LSPDocument *document = self.syntax.languageDocument;
     return [@{@"textDocument":@{@"uri":document.file.absoluteString},
               @"position":LSPPositionValue([self.syntax languagePosition:offset])} mutableCopy];
+}
+
+- (NSUInteger)signatureCaret
+{
+    if (!self.window.isKeyWindow || self.window.firstResponder != self || self.window.attachedSheet ||
+        self.cursorCount != 1 || ![self allowsCompletion])
+        return NSNotFound;
+
+    NSRange caret = self.selectedRange;
+    return !caret.length && caret.location <= self.string.length ? caret.location : NSNotFound;
+}
+
+- (void)refreshSignatureHelpAt:(NSUInteger)caret manual:(BOOL)manual
+{
+    _signature.offset = self.selectedRange.location;
+    _signature.version = self.syntax.textVersion;
+    [self.syntax finishHighlighting];
+    NSUInteger opening = CallOpeningAt(self.textStorage, caret, self.syntax.language);
+    if (manual) {
+        _signature.dismissed = NSNotFound;
+        if (opening == NSNotFound)
+            opening = caret;
+    } else if (opening != _signature.dismissed) {
+        _signature.dismissed = NSNotFound;
+    }
+    if (opening == NSNotFound || opening == _signature.dismissed) {
+        if (_signature.opening != NSNotFound)
+            [self dismissLanguageInformation];
+        return;
+    }
+
+    if (opening == _signature.opening)
+        [self cancelLanguageInformationRequests];
+    else
+        [self clearLanguageInformation];
+
+    _signature.opening = opening;
+    _signature.manual = manual;
+    [self requestSignatureHelpAt:caret retry:YES];
+}
+
+- (void)queueSignatureHelpAfter:(NSTimeInterval)delay retryAt:(NSUInteger)retryOffset
+{
+    __weak CodeView *view = self;
+    _signature.timer = [NSTimer scheduledTimerWithTimeInterval:delay repeats:NO block:^(NSTimer *) {
+        CodeView *editor = view;
+        if (!editor)
+            return;
+
+        auto &signature = editor->_signature;
+        signature.timer = nil;
+        if (retryOffset != NSNotFound && signature.version == editor.syntax.textVersion &&
+            signature.offset == editor.selectedRange.location && editor.window.firstResponder == editor) {
+            [editor requestSignatureHelpAt:retryOffset retry:NO];
+        } else {
+            NSUInteger at = [editor signatureCaret];
+            if (at == NSNotFound)
+                [editor dismissLanguageInformation];
+            else
+                [editor refreshSignatureHelpAt:at manual:NO];
+        }
+    }];
+}
+
+- (void)scheduleSignatureHelp
+{
+    LSPDocument *document = self.syntax.languageDocument;
+    if (!document || _signature.timer)
+        return;
+
+    NSUInteger version = self.syntax.textVersion;
+    if (_signature.manual && _signature.version == version && self.selectedRange.location == _signature.offset)
+        return;
+
+    NSUInteger caret = [self signatureCaret];
+    if (caret == NSNotFound) {
+        if (_signature.opening != NSNotFound)
+            [self dismissLanguageInformation];
+        _signature.offset = NSNotFound;
+        return;
+    }
+    if ((_signature.version == version && _signature.offset == caret) || ![document supports:@"signatureHelpProvider"])
+        return;
+
+    BOOL justOpened = _signature.opening == NSNotFound && caret && [self.string characterAtIndex:caret - 1] == '(';
+    [self queueSignatureHelpAfter:justOpened ? 0 : 0.04 retryAt:NSNotFound];
+}
+
+- (void)showSignatureHelp:(NSDictionary *)response at:(NSUInteger)offset
+{
+    NSArray *signatures = LSPArray(response[@"signatures"]);
+    if (!signatures.count)
+        return;
+
+    NSUInteger choice = _signature.choice;
+    if (choice != NSNotFound && response != _signature.overloads) {
+        NSArray *previous = LSPArray(_signature.overloads[@"signatures"]);
+        NSString *label = LSPString(LSPDict(previous[choice])[@"label"]);
+        // Servers can reorder overloads as the arguments change.
+        if (choice >= signatures.count || ![label isEqualToString:LSPString(LSPDict(signatures[choice])[@"label"])]) {
+            choice = NSNotFound;
+            for (NSUInteger i = 0; i < signatures.count; ++i) {
+                if ([label isEqualToString:LSPString(LSPDict(signatures[i])[@"label"])]) {
+                    choice = i;
+                    break;
+                }
+            }
+        }
+    }
+
+    id documentation = nil;
+    SignatureLabel signature = ReadSignatureLabel(response, signatures, choice, self.syntax.language, &documentation);
+    if (!signature.text.length)
+        return;
+
+    [self showLanguageInformation:documentation signature:&signature error:nullptr at:offset];
+    if (_languageInformation && !_languageInformation.hidden) {
+        _signature.overloads = signatures.count > 1 ? response : nil;
+        _signature.choice = _signature.overloads ? choice : NSNotFound;
+    }
+}
+
+- (void)requestSignatureHelpAt:(NSUInteger)offset retry:(BOOL)retry
+{
+    LSPDocument *document = self.syntax.languageDocument;
+    if (![document supports:@"signatureHelpProvider"] || !self.window.isKeyWindow || self.window.attachedSheet)
+        return;
+
+    NSRange selection = self.selectedRange;
+    NSUInteger version = self.syntax.textVersion;
+    NSUInteger generation = _languageInformationGeneration;
+    __weak CodeView *view = self;
+    _informationDocument = document;
+    _languageInformationRequest = [document request:@"textDocument/signatureHelp" params:[self languageParamsAt:offset]
+        reply:^(id result, NSString *error) {
+        CodeView *editor = view;
+        if (!editor || editor->_languageInformationGeneration != generation)
+            return;
+        editor->_languageInformationRequest = 0;
+        if (editor.syntax.languageDocument != editor->_informationDocument || editor.syntax.textVersion != version ||
+            !NSEqualRanges(editor.selectedRange, selection) || editor.window.firstResponder != editor)
+            return;
+
+        if (error && retry && !editor->_signature.timer) {
+            // A server can cancel while it catches up with the edit that opened the call.
+            [editor queueSignatureHelpAfter:0.10 retryAt:offset];
+            return;
+        }
+        if (!error)
+            [editor showSignatureHelp:LSPDict(result) at:offset];
+        if (!editor->_languageInformation || editor->_languageInformation.hidden)
+            editor->_signature.opening = NSNotFound;
+    }];
+    if (!_languageInformationRequest && (!_languageInformation || _languageInformation.hidden))
+        _signature.opening = NSNotFound;
 }
 
 - (void)requestLanguageInformation:(LanguageCommand)kind at:(NSUInteger)offset
@@ -3376,18 +3789,7 @@ static bool IdentifierAt(NSString *text, NSUInteger offset)
         editor->_languageInformationRequest = 0;
         if (error)
             return;
-        NSDictionary *response = LSPDict(result);
-        if (kind == LanguageCommand::Hover) {
-            [editor showLanguageInformation:response[@"contents"] signature:nil error:nullptr at:offset];
-        } else {
-            NSArray *signatures = LSPArray(response[@"signatures"]);
-            if (signatures.count) {
-                NSUInteger active = std::min([LSPNumber(response[@"activeSignature"]) unsignedIntegerValue], signatures.count - 1);
-                NSDictionary *signature = LSPDict(signatures[active]);
-                [editor showLanguageInformation:signature[@"documentation"] signature:LSPString(signature[@"label"])
-                                          error:nullptr at:offset];
-            }
-        }
+        [editor showLanguageInformation:LSPDict(result)[@"contents"] signature:nullptr error:nullptr at:offset];
     }];
     if (definition)
         _definitionRequest = request;
@@ -3419,7 +3821,7 @@ static bool IdentifierAt(NSString *text, NSUInteger offset)
             return;
         editor->_hoverQuickFixes = actions;
         const BuildError &mark = *editor->_hoveredError;
-        [editor showLanguageInformation:nil signature:nil error:&mark at:mark.range.location];
+        [editor showLanguageInformation:nil signature:nullptr error:&mark at:mark.range.location];
     }];
 }
 
@@ -3437,7 +3839,7 @@ static bool IdentifierAt(NSString *text, NSUInteger offset)
     } else if (!track && _languageTracking) {
         [self removeTrackingArea:_languageTracking];
         _languageTracking = nil;
-        [self dismissLanguageInformation];
+        [self dismissPointerInformation];
     }
 }
 
@@ -3477,7 +3879,7 @@ static bool IdentifierAt(NSString *text, NSUInteger offset)
         return;
     NSWindow *window = self.window;
     if (!window.isKeyWindow || window.attachedSheet || (_completion && !_completion.hidden)) {
-        [self dismissLanguageInformation];
+        [self dismissPointerInformation];
         return;
     }
     BOOL open = _languageInformation && !_languageInformation.hidden;
@@ -3490,16 +3892,20 @@ static bool IdentifierAt(NSString *text, NSUInteger offset)
         [(CodeLayoutManager *)self.layoutManager setDefinitionLinkRange:NSMakeRange(0, 0)];
     }
     _commandHover = command;
-    if (open && (self.hoverHasFocus ||
-                 NSPointInRect([_languageInformation convertPoint:point fromView:nil], _languageInformation.bounds))) {
+    if (open && [self keepsLanguageHoverAtPoint:point]) {
         [_hoverLeaveTimer invalidate];
         _hoverLeaveTimer = nil;
         return;
     }
+    if (open && _hoveredError) {
+        [self scheduleLanguageInformationDismissal];
+        return;
+    }
 
     LSPDocument *document = self.syntax.languageDocument;
-    BOOL documentation = [document supports:@"hoverProvider"];
-    BOOL definition = command && [document supports:@"definitionProvider"];
+    bool signature = _signature.opening != NSNotFound;
+    BOOL documentation = !signature && [document supports:@"hoverProvider"];
+    BOOL definition = !signature && command && [document supports:@"definitionProvider"];
     NSRange word = documentation || definition
         ? [self languageWordAtWindowPoint:point] : NSMakeRange(0, 0);
     __block std::optional<BuildError> error;
@@ -3511,6 +3917,11 @@ static bool IdentifierAt(NSString *text, NSUInteger offset)
                 (error->warning == mark.warning && mark.range.length <= error->range.length)))
                 error = mark;
         }];
+    }
+    if (signature) {
+        if (!error)
+            return;
+        [self dismissLanguageInformation];
     }
     if (!error && !word.length) {
         if (_languageHoverRange.length || _hoveredError) {
@@ -3532,13 +3943,13 @@ static bool IdentifierAt(NSString *text, NSUInteger offset)
         return;
     }
 
-    [self dismissLanguageInformation];
+    [self dismissPointerInformation];
     _commandHover = command;
     _hoveredError = error;
     if (!error)
         _languageHoverRange = word;
     __weak CodeView *view = self;
-    NSTimeInterval delay = error ? 0.20 : definition ? 0.14 : 0.30;
+    NSTimeInterval delay = error ? 0.16 : definition ? 0.12 : 0.24;
     _languageHoverTimer = [NSTimer scheduledTimerWithTimeInterval:delay repeats:NO block:^(NSTimer *) {
         CodeView *editor = view;
         if (!editor)
@@ -3546,7 +3957,7 @@ static bool IdentifierAt(NSString *text, NSUInteger offset)
         editor->_languageHoverTimer = nil;
         if (editor->_hoveredError) {
             const BuildError &mark = *editor->_hoveredError;
-            [editor showLanguageInformation:nil signature:nil error:&mark at:mark.range.location];
+            [editor showLanguageInformation:nil signature:nullptr error:&mark at:mark.range.location];
             [editor requestHoveredQuickFixes];
         } else {
             if (editor->_commandHover)
@@ -3897,7 +4308,11 @@ static bool IdentifierAt(NSString *text, NSUInteger offset)
     [self dismissCompletion];
     NSNumber *clicked = LSPNumber(sender.representedObject);
     NSUInteger offset = std::min(clicked ? clicked.unsignedIntegerValue : self.vimDisplayedCursor, self.string.length);
-    if (kind == LanguageCommand::Hover || kind == LanguageCommand::Signature) {
+    if (kind == LanguageCommand::Signature) {
+        [self refreshSignatureHelpAt:offset manual:YES];
+        return;
+    }
+    if (kind == LanguageCommand::Hover) {
         [self requestLanguageInformation:kind at:offset];
         return;
     }
@@ -3996,6 +4411,18 @@ static bool IdentifierAt(NSString *text, NSUInteger offset)
     _completion.selectedRow = (_completion.selectedRow + (up ? count - 1 : 1)) % count;
 }
 
+- (BOOL)moveSignatureSelectionUp:(BOOL)up
+{
+    if (!_signature.overloads || _languageInformation.hidden)
+        return NO;
+
+    NSUInteger count = LSPArray(_signature.overloads[@"signatures"]).count;
+    NSUInteger index = _signature.choice < count ? _signature.choice : ActiveSignatureIndex(_signature.overloads, count);
+    _signature.choice = (index + (up ? count - 1 : 1)) % count;
+    [self showSignatureHelp:_signature.overloads at:self.selectedRange.location];
+    return YES;
+}
+
 - (BOOL)performKeyEquivalent:(NSEvent *)event
 {
     NSWindow *window = self.window;
@@ -4013,23 +4440,38 @@ static bool IdentifierAt(NSString *text, NSUInteger offset)
 
 - (void)keyDown:(NSEvent *)event
 {
-    [self dismissLanguageInformation];
     NSString *keys = event.charactersIgnoringModifiers;
     unichar key = keys.length == 1 ? [keys characterAtIndex:0] : 0;
     NSEventModifierFlags modifiers = event.modifierFlags &
         (NSEventModifierFlagShift | NSEventModifierFlagControl | NSEventModifierFlagOption | NSEventModifierFlagCommand);
     BOOL open = [self validateCompletion];
-    if (open && !modifiers) {
-        if (key == '\t' && [self acceptCompletion])
-            return;
-        if (key == NSUpArrowFunctionKey || key == NSDownArrowFunctionKey) {
-            [self moveCompletionSelectionUp:key == NSUpArrowFunctionKey];
-            return;
-        }
-        if (key == 27 && !self.vimEnabled) {
+    if (key == 27) {
+        BOOL closeSuggestions = open && !modifiers;
+        BOOL keepSignature = closeSuggestions && _signature.opening != NSNotFound && _languageInformation && !_languageInformation.hidden;
+        if (!keepSignature)
+            [self cancelLanguageInformation];
+        if (closeSuggestions && (keepSignature || !self.vimEnabled)) {
             [self dismissCompletion];
             return;
         }
+    } else {
+        [self dismissPointerInformation];
+    }
+
+    if (!modifiers) {
+        if (key == NSUpArrowFunctionKey || key == NSDownArrowFunctionKey) {
+            BOOL up = key == NSUpArrowFunctionKey;
+            if (open) {
+                [self moveCompletionSelectionUp:up];
+                return;
+            }
+            if ([self moveSignatureSelectionUp:up])
+                return;
+        }
+
+        bool accept = key == '\t' || key == '\r' || key == '\n' || key == NSEnterCharacter;
+        if (open && accept && [self acceptCompletion])
+            return;
     }
     if (self.vimCanComplete && modifiers == NSEventModifierFlagControl && (key == 'n' || key == 'p')) {
         if (open) {
@@ -4063,7 +4505,7 @@ static bool IdentifierAt(NSString *text, NSUInteger offset)
 - (void)mouseDown:(NSEvent *)event
 {
     [self dismissCompletion];
-    [self dismissLanguageInformation];
+    [self dismissPointerInformation];
     if (DefinitionModifier(event.modifierFlags) && [self.syntax.languageDocument supports:@"definitionProvider"]) {
         NSRange word = [self languageWordAtWindowPoint:event.locationInWindow];
         if (word.length) {
@@ -4096,6 +4538,7 @@ static bool IdentifierAt(NSString *text, NSUInteger offset)
 - (void)setMarkedText:(id)string selectedRange:(NSRange)selection replacementRange:(NSRange)replacement
 {
     [self dismissCompletion];
+    [self dismissLanguageInformation];
     [super setMarkedText:string selectedRange:selection replacementRange:replacement];
 }
 
@@ -4145,25 +4588,19 @@ static bool IdentifierAt(NSString *text, NSUInteger offset)
                    WordCharacterAt(text, 0, lisp) && [self allowsCompletion];
     LSPDocument *document = self.syntax.languageDocument;
     BOOL trigger = !_pasting && singleCharacter && [document triggersCompletion:text];
-    BOOL signature = !_pasting && ([text isEqualToString:@"("] || [text isEqualToString:@","]) &&
-        [document supports:@"signatureHelpProvider"];
     BOOL refine = suggest && !selected.length && NSEqualRanges(selected, self.selectedRange) && [self completionAtCaret];
     NSUInteger version = self.syntax.textVersion;
     _editingCompletionPrefix = refine;
     if (text.length != 1 || ![self applyTyping:TypingKey::Character character:[text characterAtIndex:0] selected:selected])
         [super insertText:string replacementRange:range];
     _editingCompletionPrefix = NO;
-    if (version != self.syntax.textVersion) {
-        if (trigger || suggest)
-            [self showCompletionsWithMinimumPrefix:2 trigger:trigger ? text : nil continuing:refine];
-        else if (signature)
-            [self requestLanguageInformation:LanguageCommand::Signature at:self.selectedRange.location];
-    }
+    if (version != self.syntax.textVersion && (trigger || suggest))
+        [self showCompletionsWithMinimumPrefix:2 trigger:trigger ? text : nil continuing:refine];
 }
 
 - (void)insertNewline:(id)sender
 {
-    if (![self applyTyping:TypingKey::Enter character:0 selected:self.selectedRange])
+    if (![self acceptCompletion] && ![self applyTyping:TypingKey::Enter character:0 selected:self.selectedRange])
         [super insertNewline:sender];
 }
 
@@ -4614,8 +5051,28 @@ static NSColor *ContrastingSelectionColor(Col32 background)
 
 - (void)diagnosticsChanged
 {
-    if (_hoveredError)
-        [self dismissLanguageInformation];
+    if (_hoveredError) {
+        const BuildError &previous = *_hoveredError;
+        const BuildError *current = nullptr;
+        for (const auto *errors : {&self.syntax.buildErrors, &self.syntax.languageErrors}) {
+            auto item = std::lower_bound(errors->begin(), errors->end(), previous.range.location,
+                [](const BuildError &error, NSUInteger at) { return error.range.location < at; });
+            for (; item != errors->end() && item->range.location == previous.range.location; ++item) {
+                if (NSEqualRanges(item->range, previous.range) && item->warning == previous.warning &&
+                    (!item->unusedWarning || ShowUnusedWarnings()) && [item->message isEqualToString:previous.message] &&
+                    (item->label == previous.label || [item->label isEqualToString:previous.label])) {
+                    current = &*item;
+                    break;
+                }
+            }
+            if (current)
+                break;
+        }
+        if (current)
+            _hoveredError = *current;
+        else
+            [self dismissPointerInformation];
+    }
     [self updateLanguageTracking];
 }
 
@@ -5722,7 +6179,7 @@ static char selectedOutputTabContext;
 @property(nonatomic) SourceRunner *checkRunner;
 @property(nonatomic) RustCheckCache *checkCache;
 - (void)observeTabGroup:(NSWindowTabGroup *)group;
-- (void)attachTo:(NSView *)body editors:(NSSplitView *)editors;
+- (void)attachTo:(NSView *)content editorPane:(NSView *)editorPane;
 - (void)showDockPage:(DockPage)page;
 - (void)toggleDockPage:(DockPage)page;
 - (void)updateEditorStatus;
@@ -5801,7 +6258,7 @@ static BOOL MoveFocusInDocumentSplit(EditorWindow *from, unichar key);
     __weak SourceDocument *_diagnosticsSource;
     std::optional<std::vector<RunMessage>> _pendingDiagnostics;
     NSUInteger _errorCount, _warningCount;
-    __weak NSSplitView *_editors;
+    __weak NSView *_editorPane;
     WindowStatusBar *_statusBar;
     NSTextField *_position;
     NSTextField *_encoding;
@@ -5838,6 +6295,7 @@ static BOOL MoveFocusInDocumentSplit(EditorWindow *from, unichar key);
     _indentationButton.bordered = NO;
     _indentationButton.refusesFirstResponder = YES;
     _indentationButton.font = [NSFont systemFontOfSize:NSFont.smallSystemFontSize];
+    _indentationButton.cell.lineBreakMode = NSLineBreakByTruncatingTail;
     _indentationButton.toolTip = @"Indentation";
     [_statusBar addSubview:_indentationButton];
     _languageStatus = [NSButton buttonWithTitle:@"LSP" target:nil action:@selector(showLanguageStatus:)];
@@ -5883,6 +6341,7 @@ static BOOL MoveFocusInDocumentSplit(EditorWindow *from, unichar key);
     }
     _language.bordered = NO;
     _language.font = [NSFont systemFontOfSize:NSFont.smallSystemFontSize];
+    _language.cell.lineBreakMode = NSLineBreakByTruncatingTail;
     _language.action = @selector(chooseLanguage:);
     _language.accessibilityLabel = @"Language";
     _language.toolTip = @"Language (Auto Detect)";
@@ -5892,15 +6351,15 @@ static BOOL MoveFocusInDocumentSplit(EditorWindow *from, unichar key);
     return self;
 }
 
-- (void)attachTo:(NSView *)body editors:(NSSplitView *)editors
+- (void)attachTo:(NSView *)content editorPane:(NSView *)editorPane
 {
-    if (self.superview == body)
+    if (self.superview == content)
         return;
 
     [self removeFromSuperview];
-    _editors = editors;
-    self.frame = body.bounds;
-    [body addSubview:self positioned:NSWindowAbove relativeTo:editors];
+    _editorPane = editorPane;
+    self.frame = content.bounds;
+    [content addSubview:self positioned:NSWindowAbove relativeTo:editorPane];
     self.needsLayout = YES;
 }
 
@@ -6103,7 +6562,7 @@ static BOOL MoveFocusInDocumentSplit(EditorWindow *from, unichar key);
     _dropTarget.hidden = !side;
     if (side) {
         DockPage page = _page == DockPage::Hidden ? DockPage::Output : _page;
-        _dropTarget.frame = [self dockFramesAtSide:*side page:page extent:DockIsSide(*side) ? _dockWidth : _dockHeight].output;
+        _dropTarget.frame = LayoutDock(body, *side, page, DockIsSide(*side) ? _dockWidth : _dockHeight).output;
     }
 }
 
@@ -6111,14 +6570,15 @@ static BOOL MoveFocusInDocumentSplit(EditorWindow *from, unichar key);
 {
     bool horizontal = DockIsSide(_dockSide);
     CGFloat &extent = horizontal ? _dockWidth : _dockHeight;
-    NSRect pane = [self dockFramesAtSide:_dockSide page:_page extent:extent].output;
+    NSRect body = [self editorBody];
+    NSRect pane = LayoutDock(body, _dockSide, _page, extent).output;
     CGFloat shown = horizontal ? NSWidth(pane) : NSHeight(pane);
     if (!shown)
         return;
 
     CGFloat sign = (_dockSide == DockSide::Top || _dockSide == DockSide::Right) ? -1 : 1;
     if (delta) {
-        auto next = [self dockFramesAtSide:_dockSide page:_page extent:shown + sign * delta];
+        DockFrames next = LayoutDock(body, _dockSide, _page, shown + sign * delta);
         extent = horizontal ? NSWidth(next.output) : NSHeight(next.output);
         self.needsLayout = YES;
         [self.superview layoutSubtreeIfNeeded];
@@ -6340,22 +6800,14 @@ static NSRect NextDockTab(NSRect tab, CGFloat length, CGFloat railWidth, bool ve
     return body;
 }
 
-- (DockFrames)dockFramesAtSide:(DockSide)side page:(DockPage)page extent:(CGFloat)extent
-{
-    CGFloat minimumEditorWidth = 200;
-    if (DockIsSide(side) && _editors.arrangedSubviews.count > 1)
-        minimumEditorWidth += minimumExplorerWidth + _editors.dividerThickness;
-    return LayoutDock([self editorBody], side, page, extent, minimumEditorWidth);
-}
-
 - (void)layout
 {
     [super layout];
     CGFloat width = NSWidth(self.bounds);
     bool vertical = DockIsSide(_dockSide);
-    DockFrames dock = [self dockFramesAtSide:_dockSide page:_page extent:vertical ? _dockWidth : _dockHeight];
-    if (!NSEqualRects(_editors.frame, dock.editor))
-        _editors.frame = dock.editor;
+    DockFrames dock = LayoutDock([self editorBody], _dockSide, _page, vertical ? _dockWidth : _dockHeight);
+    if (!NSEqualRects(_editorPane.frame, dock.editor))
+        _editorPane.frame = dock.editor;
     CGFloat chromeHeight = statusHeight + (_dockSide == DockSide::Bottom ? NSHeight(dock.rail) : 0);
     _statusBar.frame = NSMakeRect(0, 0, width, chromeHeight);
     if (_outputRail.side != _dockSide) {
@@ -6390,14 +6842,23 @@ static NSRect NextDockTab(NSRect tab, CGFloat length, CGFloat railWidth, bool ve
     if (!_host)
         return;
 
-    CGFloat languageWidth = std::clamp(std::ceil([_language.titleOfSelectedItem sizeWithAttributes:@{NSFontAttributeName:_language.font}].width) + 30,
-                   97.0, 166.0);
-    CGFloat languageLeft = width - 59 - languageWidth;
-    CGFloat lspRight = std::max(0.0, languageLeft - 86);
-    CGFloat lspWidth = std::min(lspRight, std::clamp(std::ceil(_languageStatus.fittingSize.width) + 10, 54.0, 129.0));
-    _position.frame = NSMakeRect(9, 2, std::max(0.0, lspRight - lspWidth - 13), 15);
-    _languageStatus.frame = NSMakeRect(lspRight - lspWidth, 1, lspWidth, 20);
-    _indentationButton.frame = NSMakeRect(languageLeft - 83, 1, 80, 20);
+    CGFloat languageWidth = [_language.titleOfSelectedItem sizeWithAttributes:@{NSFontAttributeName:_language.font}].width;
+    languageWidth = std::clamp(std::ceil(languageWidth) + 30, 97.0, 166.0);
+    CGFloat indentationWidth = 80;
+    CGFloat lspWidth = std::clamp(std::ceil(_languageStatus.fittingSize.width) + 10, 54.0, 129.0);
+    CGFloat languageRight = width - 59;
+    constexpr CGFloat positionSpace = 90;
+    CGFloat scale = std::clamp((languageRight - positionSpace) / (languageWidth + indentationWidth + lspWidth), 0.0, 1.0);
+    languageWidth = std::floor(languageWidth * scale);
+    indentationWidth = std::floor(indentationWidth * scale);
+    lspWidth = std::floor(lspWidth * scale);
+
+    CGFloat languageLeft = languageRight - languageWidth;
+    CGFloat indentationLeft = languageLeft - indentationWidth - 3;
+    CGFloat lspLeft = indentationLeft - lspWidth - 3;
+    _position.frame = NSMakeRect(9, 2, std::max(0.0, lspLeft - 13), 15);
+    _languageStatus.frame = NSMakeRect(lspLeft, 1, lspWidth, 20);
+    _indentationButton.frame = NSMakeRect(indentationLeft, 1, indentationWidth, 20);
     _encoding.frame = NSMakeRect(width - 57, 4, 50, 14);
     _language.frame = NSMakeRect(languageLeft, 1, languageWidth, 20);
 }
@@ -7837,7 +8298,7 @@ static NSRect NextDockTab(NSRect tab, CGFloat length, CGFloat railWidth, bool ve
 {
     (void)notification;
     [_editor completionViewportChanged];
-    [_editor dismissLanguageInformation];
+    [_editor dismissPointerInformation];
     if (_scrollUpdatePending)
         return;
     _scrollUpdatePending = YES;
@@ -7862,6 +8323,7 @@ static NSRect NextDockTab(NSRect tab, CGFloat length, CGFloat railWidth, bool ve
 - (void)scrollTracking:(NSNotification *)notification
 {
     (void)notification;
+    [_editor dismissLanguageInformation];
     [_editor vimDidLiveScroll];
 }
 
@@ -8305,6 +8767,7 @@ static bool CanUseLanguageStatusAction(LSPDocument *document, LanguageStatusActi
     [_editor refreshBracketMatch];
     [_editor refreshWordSelection];
     [_editor validateCompletion];
+    [_editor scheduleSignatureHelp];
     [_gutter refreshBreakpointHover];
     [_gutter setNeedsDisplay:YES];
 }
@@ -8645,6 +9108,7 @@ struct EditorTabLocation {
 - (instancetype)initWithSourceWindow:(SourceWindow *)window;
 - (NSView *)commandPaletteHost;
 - (void)installEditorView:(EditorWindow *)editor;
+- (void)layoutEditorPane;
 - (WindowOutput *)windowOutput;
 - (void)syncWindowOutput;
 - (void)restoreOutputShown:(BOOL)shown;
@@ -9536,6 +10000,12 @@ static NSArray<SourceDocument *> *TabMenuDocuments(SourceDocument *document)
 
 - (BOOL)isOpaque { return YES; }
 
+- (void)resizeSubviewsWithOldSize:(NSSize)oldSize
+{
+    [super resizeSubviewsWithOldSize:oldSize];
+    [((SourceWindow *)self.window).sourceController layoutEditorPane];
+}
+
 - (NSDragOperation)draggingEntered:(id<NSDraggingInfo>)info { return [(SourceWindow *)self.window draggingEntered:info]; }
 - (NSDragOperation)draggingUpdated:(id<NSDraggingInfo>)info { return [(SourceWindow *)self.window draggingUpdated:info]; }
 - (void)draggingExited:(id<NSDraggingInfo>)info { [(SourceWindow *)self.window draggingExited:info]; }
@@ -9584,8 +10054,8 @@ static char windowOutputKey;
     __weak WindowOutput *_attachedOutput;
     FolderWorkspace *_workspace;
     FolderSidebar *_sidebar;
-    NSView *_body;
     NSSplitView *_editorSplit;
+    NSView *_editorContent;
     NSView *_editorPane;
     EditorTabGroup _groups[2];
     NSSplitView *_documentSplit;
@@ -9665,26 +10135,26 @@ static char windowOutputKey;
     [header updateTitle];
     [window registerForDraggedTypes:@[editorTabDragType]];
 
-    _body = [[NSView alloc] initWithFrame:[content convertRect:window.contentLayoutRect fromView:nil]];
-    _body.translatesAutoresizingMaskIntoConstraints = NO;
-    [content addSubview:_body];
-    [NSLayoutConstraint activateConstraints:@[
-        [_body.leadingAnchor constraintEqualToAnchor:layout.leadingAnchor],
-        [_body.trailingAnchor constraintEqualToAnchor:layout.trailingAnchor],
-        [_body.topAnchor constraintEqualToAnchor:layout.topAnchor],
-        [_body.bottomAnchor constraintEqualToAnchor:layout.bottomAnchor]
-    ]];
-
-    _editorSplit = [[ExplorerSplitView alloc] initWithFrame:_body.bounds];
-    _editorSplit.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    _editorSplit = [[ExplorerSplitView alloc] initWithFrame:[content convertRect:window.contentLayoutRect fromView:nil]];
+    _editorSplit.translatesAutoresizingMaskIntoConstraints = NO;
     _editorSplit.vertical = YES;
     _editorSplit.dividerStyle = NSSplitViewDividerStyleThin;
     _editorSplit.delegate = self;
-    _editorPane = [[WorkspaceEditorPane alloc] initWithFrame:_editorSplit.bounds];
+    [content addSubview:_editorSplit];
+    [NSLayoutConstraint activateConstraints:@[
+        [_editorSplit.leadingAnchor constraintEqualToAnchor:layout.leadingAnchor],
+        [_editorSplit.trailingAnchor constraintEqualToAnchor:layout.trailingAnchor],
+        [_editorSplit.topAnchor constraintEqualToAnchor:layout.topAnchor],
+        [_editorSplit.bottomAnchor constraintEqualToAnchor:layout.bottomAnchor]
+    ]];
+
+    _editorContent = [[NSView alloc] initWithFrame:_editorSplit.bounds];
+    _editorContent.clipsToBounds = YES;
+    [_editorSplit addArrangedSubview:_editorContent];
+    _editorPane = [[WorkspaceEditorPane alloc] initWithFrame:_editorContent.bounds];
     _editorPane.clipsToBounds = YES;
     [_editorPane registerForDraggedTypes:@[editorTabDragType]];
-    [_editorSplit addArrangedSubview:_editorPane];
-    [_body addSubview:_editorSplit];
+    [_editorContent addSubview:_editorPane];
     [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(workspaceWindowActivated:)
                                                name:NSWindowDidBecomeKeyNotification object:window];
     [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(editorWindowResignedKey:)
@@ -9807,7 +10277,7 @@ static char windowOutputKey;
 
     WindowOutput *output = self.windowOutput;
     WindowOutput *mounted = _attachedOutput;
-    if (mounted != output && mounted.superview == _body) {
+    if (mounted != output && mounted.superview == _editorContent) {
         mounted.host = nil;
         [mounted removeFromSuperview];
         _attachedOutput = nil;
@@ -9822,7 +10292,7 @@ static char windowOutputKey;
         return;
 
     _attachedOutput = output;
-    [output attachTo:_body editors:_editorSplit];
+    [output attachTo:_editorContent editorPane:_editorPane];
     EditorWindow *active = [self.focusedDocument editorView];
     output.otherEditor = active == primary ? secondary : primary;
     if (output.host != active) {
@@ -10593,7 +11063,6 @@ static void AppendGroupTabs(NSMutableArray<SourceDocument *> *list, const Editor
         [_editorSplit setPosition:width ofDividerAtIndex:0];
     }
     _layingOutExplorer = NO;
-    _attachedOutput.needsLayout = YES;
 }
 
 - (void)showFolderSearchReplacing:(BOOL)replace
@@ -10695,8 +11164,7 @@ static void AppendGroupTabs(NSMutableArray<SourceDocument *> *list, const Editor
         body.origin.x = start;
         body.size.width -= start;
     }
-    _editorPane.frame = body;
-    [self layoutEditorPane];
+    _editorContent.frame = body;
 }
 
 - (CGFloat)splitView:(NSSplitView *)split constrainMinCoordinate:(CGFloat)minimum ofSubviewAt:(NSInteger)index
@@ -10722,7 +11190,6 @@ static void AppendGroupTabs(NSMutableArray<SourceDocument *> *list, const Editor
         _workspace.sidebarWidth = NSWidth(_sidebar.frame);
     }
     _splitWidth = width;
-    [self layoutEditorPane];
 }
 
 @end

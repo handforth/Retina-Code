@@ -1,4 +1,5 @@
 #import "EditorHover.h"
+#import "Chrome.h"
 #import "LanguageServer.h"
 #import "Rendering.h"
 #include "Themes.h"
@@ -8,8 +9,8 @@
 
 static constexpr NSUInteger hoverTextLimit = 16000;
 static constexpr CGFloat hoverInset = 8;
-static constexpr CGFloat footerHeight = 25;
-static constexpr CGFloat actionGap = 10;
+static constexpr CGFloat footerHeight = 22;
+static constexpr CGFloat actionGap = 8;
 static NSString *const viewErrorTitle = @"View Error (⌥F8)";
 static NSString *const quickFixTitle = @"Quick Fix… (⌘.)";
 static NSString *const hoverBlock = @"RetinaCode.HoverBlock";
@@ -26,22 +27,21 @@ static NSString *BoundedHoverText(NSString *text, NSUInteger limit)
 
 struct HoverStyle {
     const Theme &theme;
+    PopupColors colors;
     NSFont *code;
     NSFont *body;
-    Col32 paper;
     NSColor *text;
     NSColor *muted;
     NSColor *rule;
     NSColor *link;
 
     HoverStyle(const Theme &palette, NSFont *font)
-        : theme(palette), code(font), body([NSFont systemFontOfSize:12]), paper(palette.accents.completionPaper)
+        : theme(palette), colors(EditorPopupColors(palette)), code(font), body([NSFont systemFontOfSize:12])
     {
-        Col32 ink = palette.ink[size_t(Ink::Text)];
-        text = SRGBColor(ink);
-        muted = SRGBColor(BlendColor(paper, ink, 65));
-        rule = SRGBColor(BlendColor(paper, ink, 22));
-        link = SRGBColor(palette.dark ? rgb(111, 187, 255) : rgb(0, 93, 182));
+        text = SRGBColor(colors.text);
+        muted = SRGBColor(BlendColor(colors.paper, colors.text, 70));
+        rule = SRGBColor(BlendColor(colors.paper, colors.text, 22));
+        link = SRGBColor(BlendColor(colors.text, palette.ink[size_t(Ink::Type)], 64));
     }
 };
 
@@ -96,6 +96,8 @@ static void AppendCode(NSMutableAttributedString *text, NSString *code, NSString
                 end = source.size();
             TokenizeLine(std::u16string_view(source).substr(start, end - start), codeLanguage, state, tokens);
             for (const Token &token : tokens) {
+                if (token.ink == Ink::Text)
+                    continue;
                 [text addAttribute:NSForegroundColorAttributeName value:SRGBColor(style.theme.ink[size_t(token.ink)])
                              range:NSMakeRange(first + start + token.start, token.length)];
             }
@@ -103,8 +105,6 @@ static void AppendCode(NSMutableAttributedString *text, NSString *code, NSString
         }
     }
     NSMutableParagraphStyle *paragraph = [[NSMutableParagraphStyle alloc] init];
-    paragraph.firstLineHeadIndent = paragraph.headIndent = 6;
-    paragraph.tailIndent = -6;
     paragraph.tabStops = @[];
     paragraph.defaultTabInterval = 4 * [@" " sizeWithAttributes:@{NSFontAttributeName:style.code}].width;
     [text addAttribute:NSParagraphStyleAttributeName value:paragraph range:NSMakeRange(first, text.length - first)];
@@ -334,9 +334,12 @@ static void AppendMarkupPart(NSMutableAttributedString *text, id value, Language
     HoverTextView *_text;
     NSButton *_error;
     NSButton *_fixButton;
-    NSColor *_paper;
-    NSColor *_border;
+    PopupColors _colors;
     NSColor *_rule;
+    SignatureLabel _signature;
+    id _signatureMarkup;
+    NSSize _signatureLimit;
+    NSSize _signatureSize;
 }
 
 - (instancetype)initWithFrame:(NSRect)frame
@@ -374,6 +377,7 @@ static void AppendMarkupPart(NSMutableAttributedString *text, id value, Language
 }
 
 - (BOOL)isFlipped { return YES; }
+- (BOOL)isOpaque { return YES; }
 
 - (BOOL)containsResponder:(NSResponder *)responder
 {
@@ -384,14 +388,23 @@ static void AppendMarkupPart(NSMutableAttributedString *text, id value, Language
 {
     if (self.hidden)
         return;
+
+    NSWindow *window = self.window;
+    BOOL restoreCursor = window.isKeyWindow && NSCursor.currentCursor == NSCursor.pointingHandCursor &&
+        NSPointInRect([self convertPoint:window.mouseLocationOutsideOfEventStream fromView:nil], self.visibleRect);
     self.hidden = YES;
+    if (restoreCursor)
+        [NSCursor.IBeamCursor set];
+
+    _signature = {};
+    _signatureMarkup = nil;
     [_text.textStorage deleteCharactersInRange:NSMakeRange(0, _text.textStorage.length)];
 }
 
 - (void)mouseExited:(NSEvent *)event
 {
     (void)event;
-    if (self.pointerExited)
+    if (!self.hidden && self.pointerExited)
         self.pointerExited();
 }
 
@@ -432,10 +445,7 @@ static void AppendMarkupPart(NSMutableAttributedString *text, id value, Language
     dirty = NSIntersectionRect(dirty, self.bounds);
     if (NSIsEmptyRect(dirty))
         return;
-    [_border setFill];
-    NSRectFill(dirty);
-    [_paper setFill];
-    NSRectFill(NSIntersectionRect(dirty, NSInsetRect(self.bounds, 1, 1)));
+    DrawPopupFrame(self.bounds, dirty, _colors.paper, _colors.border);
     if (!_error.hidden) {
         [_rule setFill];
         NSRectFill(NSIntersectionRect(dirty, NSMakeRect(1, NSMaxY(_scroll.frame), NSWidth(self.bounds) - 2, 1)));
@@ -453,14 +463,18 @@ static void AppendMarkupPart(NSMutableAttributedString *text, id value, Language
         return NSZeroSize;
     BOOL dark = style.theme.dark;
     self.appearance = [NSAppearance appearanceNamed:dark ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua];
-    _paper = SRGBColor(style.paper);
-    _border = SRGBColor(style.theme.accents.completionBorder);
+    _colors = style.colors;
     _rule = style.rule;
     _text.ruleColor = style.rule;
     _text.linkTextAttributes = @{NSForegroundColorAttributeName:style.link, NSUnderlineStyleAttributeName:@1};
+    _text.selectedTextAttributes = @{NSBackgroundColorAttributeName:SRGBColor(_colors.selection),
+                                      NSForegroundColorAttributeName:SRGBColor(_colors.selectedText)};
     CGFloat padding = 2 * hoverInset + 2;
-    _error.attributedTitle = StyledText(viewErrorTitle, style.body, style.link);
-    CGFloat errorWidth = std::ceil(_error.attributedTitle.size.width) + 6;
+    CGFloat errorWidth = 0;
+    if (diagnostic) {
+        _error.attributedTitle = StyledText(viewErrorTitle, style.body, style.link);
+        errorWidth = std::ceil(_error.attributedTitle.size.width) + 6;
+    }
     CGFloat fixWidth = 0;
     if (quickFix) {
         _fixButton.attributedTitle = StyledText(quickFixTitle, style.body, style.link);
@@ -507,12 +521,35 @@ static void AppendMarkupPart(NSMutableAttributedString *text, id value, Language
     return NSMakeSize(width, height + footer);
 }
 
-- (NSSize)showDocumentation:(id)markup signature:(NSString *)signature language:(Language)language
+- (NSSize)showDocumentation:(id)markup signature:(const SignatureLabel *)signature language:(Language)language
                        font:(NSFont *)font theme:(const Theme &)theme limit:(NSSize)limit
 {
+    if (signature && !self.hidden && [_signature.text isEqualToString:signature->text] &&
+        NSEqualRanges(_signature.parameters, signature->parameters) && NSEqualRanges(_signature.active, signature->active) &&
+        _signature.index == signature->index && _signature.count == signature->count &&
+        (_signatureMarkup == markup || [_signatureMarkup isEqual:markup]) && NSEqualSizes(_signatureLimit, limit))
+        return _signatureSize;
+
     HoverStyle style{theme, font};
     NSMutableAttributedString *text = [[NSMutableAttributedString alloc] init];
-    AppendCode(text, BoundedHoverText(signature, hoverTextLimit), nil, language, style);
+    if (signature) {
+        AppendCode(text, BoundedHoverText(signature->text, hoverTextLimit), nil, language, style);
+        NSRange length = NSMakeRange(0, text.length);
+        NSRange parameters = NSIntersectionRange(signature->parameters, length);
+        if (parameters.length)
+            [text addAttribute:NSForegroundColorAttributeName value:style.muted range:parameters];
+
+        NSRange active = NSIntersectionRange(signature->active, length);
+        if (active.length) {
+            [text addAttribute:NSForegroundColorAttributeName value:SRGBColor(style.colors.selectedText) range:active];
+            [text addAttribute:NSBackgroundColorAttributeName value:SRGBColor(style.colors.selection) range:active];
+        }
+
+        if (signature->count > 1) {
+            NSString *position = [NSString stringWithFormat:@"%lu/%lu  ", (unsigned long)signature->index + 1, (unsigned long)signature->count];
+            [text insertAttributedString:StyledText(position, style.code, style.muted) atIndex:0];
+        }
+    }
     if (NSArray *parts = LSPArray(markup)) {
         for (id part in parts) {
             if (text.length >= hoverTextLimit)
@@ -522,12 +559,23 @@ static void AppendMarkupPart(NSMutableAttributedString *text, id value, Language
     } else if (text.length < hoverTextLimit) {
         AppendMarkupPart(text, markup, language, style);
     }
-    return [self showText:text diagnostic:NO quickFix:NO style:style limit:limit];
+    NSSize size = [self showText:text diagnostic:NO quickFix:NO style:style limit:limit];
+    NSString *source = LSPString(markup);
+    if (!source)
+        source = LSPString(LSPDict(markup)[@"value"]);
+    bool cache = signature && signature->text.length <= hoverTextLimit && (!markup || (source && source.length <= hoverTextLimit));
+    _signature = cache ? *signature : SignatureLabel{};
+    _signatureMarkup = cache ? markup : nil;
+    _signatureLimit = limit;
+    _signatureSize = size;
+    return size;
 }
 
 - (NSSize)showMessage:(NSString *)message diagnosticLabel:(NSString *)label showsQuickFix:(BOOL)quickFix
                  font:(NSFont *)font theme:(const Theme &)theme limit:(NSSize)limit
 {
+    _signature = {};
+    _signatureMarkup = nil;
     HoverStyle style{theme, font};
     NSMutableAttributedString *text = [StyledText(BoundedHoverText(message, hoverTextLimit), font, style.text) mutableCopy];
     if (label.length)

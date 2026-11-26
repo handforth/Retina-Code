@@ -907,7 +907,8 @@ static constexpr Json clientCapabilities = R"({
         }},
         "definition":{"linkSupport":true},
         "hover":{"contentFormat":["markdown","plaintext"]},
-        "signatureHelp":{"signatureInformation":{"documentationFormat":["markdown","plaintext"]}},
+        "signatureHelp":{"signatureInformation":{"documentationFormat":["markdown","plaintext"],
+            "parameterInformation":{"labelOffsetSupport":true},"activeParameterSupport":true}},
         "diagnostic":{"relatedDocumentSupport":false},
         "publishDiagnostics":{"versionSupport":true},
         "codeAction":{

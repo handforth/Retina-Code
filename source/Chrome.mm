@@ -27,10 +27,63 @@ void DrawWindowBarGradient(NSRect bounds, NSAppearance *appearance)
     }
 }
 
+static Col32 PopupFill(Col32 color, Col32 underneath)
+{
+    if (ColorAlpha(color) == 255)
+        return color;
+    return BlendColor(underneath, color, (ColorAlpha(color) * 100 + 127) / 255) | rgb(0, 0, 0);
+}
+
+static Col32 PopupText(Col32 ink, Col32 paper)
+{
+    auto luminance = [](Col32 color) {
+        auto linear = [](uint8_t channel) {
+            double value = channel / 255.0;
+            return value <= 0.04045 ? value / 12.92 : std::pow((value + 0.055) / 1.055, 2.4);
+        };
+        return 0.2126 * linear(ColorRed(color)) + 0.7152 * linear(ColorGreen(color)) + 0.0722 * linear(ColorBlue(color));
+    };
+    ink = PopupFill(ink, paper);
+    double background = luminance(paper) + 0.05;
+    double foreground = luminance(ink) + 0.05;
+    if (std::max(background, foreground) >= 4.5 * std::min(background, foreground))
+        return ink;
+    return background < 0.22913 ? rgb(255, 255, 255) : rgb(0, 0, 0);
+}
+
+PopupColors EditorPopupColors(const Theme &theme)
+{
+    const EditorAccents &accents = theme.accents;
+    Col32 paper = PopupFill(accents.completionPaper, theme.paper | rgb(0, 0, 0));
+    Col32 text = PopupText(theme.ink[size_t(Ink::Text)], paper);
+    Col32 selection = PopupFill(accents.completionSelection, paper);
+    int difference = std::max({std::abs(ColorRed(selection) - ColorRed(paper)),
+                               std::abs(ColorGreen(selection) - ColorGreen(paper)),
+                               std::abs(ColorBlue(selection) - ColorBlue(paper))});
+    if (difference < 16)
+        selection = BlendColor(selection, text, 17);
+
+    return {paper, accents.completionBorder, selection, text, PopupText(accents.completionSelectedText, selection)};
+}
+
+void DrawPopupFrame(NSRect frame, NSRect dirty, Col32 paper, Col32 border)
+{
+    [SRGBColor(paper) setFill];
+    NSRectFill(NSIntersectionRect(frame, dirty));
+    [SRGBColor(border) setFill];
+    NSFrameRectWithWidthUsingOperation(frame, 1, NSCompositingOperationSourceOver);
+}
+
 bool DockIsSide(DockSide side) { return side == DockSide::Left || side == DockSide::Right; }
 
 static NSString *const recentCommandsKey = @"RecentPaletteCommands";
 static constexpr NSUInteger recentCommandLimit = 20;
+static constexpr CGFloat paletteChromeHeight = 42;
+
+struct CommandMatch {
+    uint32_t index;
+    uint32_t score;
+};
 
 static NSString *CommandIdentifier(NSMenuItem *item)
 {
@@ -86,9 +139,38 @@ enum class CommandPointerState { Idle, Hover, Pressed };
 
 @interface CommandRow : NSTableRowView
 @property(nonatomic) CommandPointerState pointerState;
+@property(nonatomic) PopupColors colors;
 @end
 
 @implementation CommandRow
+
+- (void)updateForeground
+{
+    NSColor *ink = SRGBColor(self.selected ? _colors.selectedText : _colors.text);
+    for (NSView *child in self.subviews) {
+        if ([child isKindOfClass:NSTableCellView.class]) {
+            NSTableCellView *cell = (NSTableCellView *)child;
+            cell.textField.textColor = ink;
+            cell.imageView.contentTintColor = ink;
+        }
+    }
+}
+
+- (void)setColors:(PopupColors)colors
+{
+    if (_colors == colors)
+        return;
+
+    _colors = colors;
+    [self updateForeground];
+    self.needsDisplay = YES;
+}
+
+- (void)setSelected:(BOOL)selected
+{
+    [super setSelected:selected];
+    [self updateForeground];
+}
 
 - (void)setPointerState:(CommandPointerState)state
 {
@@ -103,26 +185,21 @@ enum class CommandPointerState { Idle, Hover, Pressed };
     [super drawBackgroundInRect:dirty];
     if (_pointerState == CommandPointerState::Idle || self.selected)
         return;
-    CGFloat alpha = _pointerState == CommandPointerState::Pressed ? 0.34 : 0.15;
-    [[NSColor.controlAccentColor colorWithAlphaComponent:alpha] setFill];
-    NSRectFillUsingOperation(dirty, NSCompositingOperationSourceOver);
+    unsigned mix = _pointerState == CommandPointerState::Pressed ? 84 : 52;
+    [SRGBColor(BlendColor(_colors.paper, _colors.selection, mix)) setFill];
+    NSRectFill(dirty);
 }
 
 - (void)drawSelectionInRect:(NSRect)dirty
 {
-    [NSColor.selectedContentBackgroundColor setFill];
+    unsigned mix = _pointerState == CommandPointerState::Pressed ? 16 : _pointerState == CommandPointerState::Hover ? 7 : 0;
+    [SRGBColor(BlendColor(_colors.selection, _colors.selectedText, mix)) setFill];
     NSRectFill(dirty);
-    if (_pointerState != CommandPointerState::Idle) {
-        bool pressed = _pointerState == CommandPointerState::Pressed;
-        NSColor *shade = pressed ? NSColor.blackColor : NSColor.whiteColor;
-        [[shade colorWithAlphaComponent:pressed ? 0.24 : 0.12] setFill];
-        NSRectFillUsingOperation(dirty, NSCompositingOperationSourceOver);
-    }
 }
 
 - (NSBackgroundStyle)interiorBackgroundStyle
 {
-    return self.selected ? NSBackgroundStyleEmphasized : NSBackgroundStyleNormal;
+    return NSBackgroundStyleNormal;
 }
 
 @end
@@ -243,7 +320,8 @@ enum class CommandPointerState { Idle, Hover, Pressed };
     NSArray<NSMenuItem *> *_items;
     NSArray<NSString *> *_searchTitles;
     std::vector<NSUInteger> _recentRanks;
-    std::vector<NSInteger> _rows;
+    std::vector<CommandMatch> _rows;
+    PopupColors _colors;
     __weak NSWindow *_hostWindow;
     __weak NSResponder *_previousFocus;
     id _mouseMonitor;
@@ -266,7 +344,11 @@ enum class CommandPointerState { Idle, Hover, Pressed };
     [NSLayoutConstraint activateConstraints:@[width, _height]];
 
     _query = [NSTextField textFieldWithString:@""];
-    _query.font = [NSFont systemFontOfSize:14];
+    _query.font = [NSFont systemFontOfSize:13];
+    _query.bezeled = NO;
+    _query.bordered = NO;
+    _query.drawsBackground = NO;
+    _query.focusRingType = NSFocusRingTypeNone;
     _query.delegate = self;
     _query.accessibilityLabel = @"Command search";
     [self addSubview:_query];
@@ -275,7 +357,8 @@ enum class CommandPointerState { Idle, Hover, Pressed };
     _scroll.borderType = NSNoBorder;
     _scroll.hasVerticalScroller = YES;
     _scroll.autohidesScrollers = YES;
-    _scroll.scrollerStyle = NSScrollerStyleLegacy;
+    _scroll.scrollerStyle = NSScrollerStyleOverlay;
+    _scroll.drawsBackground = NO;
     _results = [[CommandTable alloc] initWithFrame:NSZeroRect];
     _results.headerView = nil;
     _results.rowHeight = 22;
@@ -307,19 +390,37 @@ enum class CommandPointerState { Idle, Hover, Pressed };
 
 - (void)drawRect:(NSRect)dirty
 {
-    [NSColor.windowBackgroundColor setFill];
-    NSRectFill(dirty);
-    [NSColor.separatorColor setFill];
-    NSFrameRectWithWidthUsingOperation(self.bounds, 1, NSCompositingOperationSourceOver);
+    DrawPopupFrame(self.bounds, dirty, _colors.paper, _colors.border);
+    NSRect field = NSInsetRect(_query.frame, -5, -3);
+    DrawPopupFrame(field, dirty, BlendColor(_colors.paper, _colors.text, 5), _colors.border);
 }
 
 - (void)layout
 {
     [super layout];
-    CGFloat width = std::max<CGFloat>(0, NSWidth(self.bounds) - 16);
-    _query.frame = NSMakeRect(8, 8, width, 27);
-    _scroll.frame = NSMakeRect(8, 40, width, std::max<CGFloat>(0, NSHeight(self.bounds) - 48));
-    _empty.frame = NSMakeRect(13, 42, std::max<CGFloat>(0, width - 10), 20);
+    CGFloat width = NSWidth(self.bounds);
+    _query.frame = NSMakeRect(12, 10, std::max<CGFloat>(0, width - 24), 20);
+    _scroll.frame = NSMakeRect(2, 38, std::max<CGFloat>(0, width - 4), std::max<CGFloat>(0, NSHeight(self.bounds) - paletteChromeHeight));
+    _empty.frame = NSMakeRect(12, 40, std::max<CGFloat>(0, width - 24), 20);
+}
+
+- (void)applyTheme:(const Theme &)theme
+{
+    PopupColors colors = EditorPopupColors(theme);
+    NSAppearance *appearance = [NSAppearance appearanceNamed:theme.dark ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua];
+    if (_colors == colors && self.appearance == appearance)
+        return;
+
+    _colors = colors;
+    self.appearance = appearance;
+    _query.textColor = SRGBColor(colors.text);
+    _query.currentEditor.textColor = _query.textColor;
+    _empty.textColor = SRGBColor(BlendColor(colors.paper, colors.text, 70));
+    _results.backgroundColor = SRGBColor(colors.paper);
+    [_results enumerateAvailableRowViewsUsingBlock:^(NSTableRowView *row, NSInteger) {
+        ((CommandRow *)row).colors = colors;
+    }];
+    self.needsDisplay = YES;
 }
 
 - (void)presentInView:(NSView *)host items:(NSArray<NSMenuItem *> *)items placeholder:(NSString *)placeholder
@@ -355,6 +456,7 @@ enum class CommandPointerState { Idle, Hover, Pressed };
     _searchTitles = titles;
     _query.placeholderString = placeholder;
     _query.stringValue = @"";
+    [self applyTheme:*SelectedTheme()];
 
     [host addSubview:self positioned:NSWindowAbove relativeTo:nil];
     [NSLayoutConstraint activateConstraints:@[
@@ -431,7 +533,7 @@ enum class CommandPointerState { Idle, Hover, Pressed };
     [_results selectRowIndexes:[NSIndexSet indexSetWithIndex:row] byExtendingSelection:NO];
     [_results scrollRowToVisible:row];
     if (_preview)
-        _preview(_items[_rows[row]]);
+        _preview(_items[_rows[row].index]);
 }
 
 - (void)filterCommands
@@ -440,34 +542,32 @@ enum class CommandPointerState { Idle, Hover, Pressed };
     if ([text hasPrefix:@">"])
         text = [text substringFromIndex:1];
     text = [text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
-    struct Match { NSInteger row; NSInteger score; NSUInteger recentRank; };
-    std::vector<Match> matches;
-    matches.reserve(_items.count);
+    _rows.clear();
+    _rows.reserve(_items.count);
     for (NSUInteger i = 0; i < _items.count; ++i) {
         if (!_items[i].enabled)
             continue;
         NSInteger score = CommandMatchScore(_searchTitles[i], text);
-        if (score >= 0) {
-            NSUInteger recentRank = _recentRanks.empty() ? NSNotFound : _recentRanks[i];
-            matches.push_back({NSInteger(i), score, recentRank});
-        }
+        if (score >= 0)
+            _rows.push_back({uint32_t(i), uint32_t(score)});
     }
-    std::stable_sort(matches.begin(), matches.end(), [](Match a, Match b) {
-        return a.score == b.score ? a.recentRank < b.recentRank : a.score < b.score;
+    std::sort(_rows.begin(), _rows.end(), [&](CommandMatch a, CommandMatch b) {
+        if (a.score != b.score)
+            return a.score < b.score;
+        if (!_recentRanks.empty() && _recentRanks[a.index] != _recentRanks[b.index])
+            return _recentRanks[a.index] < _recentRanks[b.index];
+        return a.index < b.index;
     });
     [_results clearPointerState];
-    _rows.clear();
-    for (auto match : matches)
-        _rows.push_back(match.row);
     [_results reloadData];
     _empty.hidden = !_rows.empty();
     _scroll.hidden = _rows.empty();
-    _height.constant = 48 + _results.rowHeight * std::clamp<size_t>(_rows.size(), 1, _rowLimit);
+    _height.constant = paletteChromeHeight + _results.rowHeight * std::clamp<size_t>(_rows.size(), 1, _rowLimit);
     if (!_rows.empty()) {
         NSUInteger row = 0;
         if (_mode == CommandPaletteMode::Choices && !text.length) {
-            auto current = std::find_if(_rows.begin(), _rows.end(), [&](NSInteger index) {
-                return _items[index].state == NSControlStateValueOn;
+            auto current = std::find_if(_rows.begin(), _rows.end(), [&](CommandMatch match) {
+                return _items[match.index].state == NSControlStateValueOn;
             });
             if (current != _rows.end())
                 row = NSUInteger(current - _rows.begin());
@@ -525,6 +625,7 @@ enum class CommandPointerState { Idle, Hover, Pressed };
         view = [[CommandRow alloc] init];
         view.identifier = @"commandRow";
     }
+    view.colors = _colors;
     view.pointerState = [_results pointerStateAtRow:row];
     return view;
 }
@@ -560,9 +661,12 @@ enum class CommandPointerState { Idle, Hover, Pressed };
             [checkmark.centerYAnchor constraintEqualToAnchor:cell.centerYAnchor]
         ]];
     }
-    NSMenuItem *item = _items[_rows[row]];
+    NSMenuItem *item = _items[_rows[row].index];
     cell.textField.stringValue = item.title;
     cell.imageView.hidden = item.state != NSControlStateValueOn;
+    NSColor *ink = SRGBColor(row == table.selectedRow ? _colors.selectedText : _colors.text);
+    cell.textField.textColor = ink;
+    cell.imageView.contentTintColor = ink;
     return cell;
 }
 
@@ -572,7 +676,7 @@ enum class CommandPointerState { Idle, Hover, Pressed };
     NSInteger row = _results.selectedRow;
     if (row < 0 || row >= NSInteger(_rows.size()))
         return;
-    NSMenuItem *command = _items[_rows[row]];
+    NSMenuItem *command = _items[_rows[row].index];
     id target = command.target;
     NSString *identifier = _mode == CommandPaletteMode::Commands ? CommandIdentifier(command) : nil;
     // Apply the command before clearing the preview so the saved theme does not flash.
@@ -589,13 +693,13 @@ enum class CommandPointerState { Idle, Hover, Pressed };
 
 static constexpr CGFloat dockDividerHitPadding = 2;
 
-DockFrames LayoutDock(NSRect body, DockSide side, DockPage page, CGFloat extent, CGFloat minimumEditorWidth)
+DockFrames LayoutDock(NSRect body, DockSide side, DockPage page, CGFloat extent)
 {
     constexpr CGFloat railWidth = 24;
     bool vertical = DockIsSide(side);
     CGFloat rail = std::min(railWidth, vertical ? NSWidth(body) : NSHeight(body));
     CGFloat span = vertical ? NSWidth(body) : NSHeight(body);
-    CGFloat minimumEditor = vertical ? minimumEditorWidth : 104;
+    CGFloat minimumEditor = vertical ? 200 : 104;
     CGFloat dividerThickness = page == DockPage::Debug ? 1 : 5;
     CGFloat maximum = std::max<CGFloat>(0, span - rail - dividerThickness - minimumEditor);
     CGFloat size = page == DockPage::Hidden ? 0 : std::clamp(std::round(extent), std::min<CGFloat>(74, maximum), maximum);

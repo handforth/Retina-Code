@@ -1,9 +1,20 @@
 #pragma once
 
 #import <AppKit/AppKit.h>
+#include "Color.h"
 #include <optional>
 
 void DrawWindowBarGradient(NSRect bounds, NSAppearance *appearance);
+
+struct Theme;
+
+struct PopupColors {
+    Col32 paper, border, selection, text, selectedText;
+    bool operator==(const PopupColors &) const = default;
+};
+
+PopupColors EditorPopupColors(const Theme &theme);
+void DrawPopupFrame(NSRect frame, NSRect dirty, Col32 paper, Col32 border);
 
 enum class DockSide { Bottom, Left, Right, Top };
 enum class DockPage { Hidden, Output, Errors, Debug };
@@ -13,7 +24,7 @@ struct DockFrames {
 };
 
 bool DockIsSide(DockSide side);
-DockFrames LayoutDock(NSRect body, DockSide side, DockPage page, CGFloat extent, CGFloat minimumEditorWidth);
+DockFrames LayoutDock(NSRect body, DockSide side, DockPage page, CGFloat extent);
 std::optional<DockSide> DockSideAtPoint(NSRect body, NSPoint point);
 NSRect SplitDockRect(NSRect body, DockSide side);
 bool SplitDockFirst(DockSide side);
@@ -65,5 +76,6 @@ using CommandPreview = void (^)(NSMenuItem *);
 @interface CommandPalette : NSView
 - (void)presentInView:(NSView *)host items:(NSArray<NSMenuItem *> *)items placeholder:(NSString *)placeholder
                  mode:(CommandPaletteMode)mode rowLimit:(NSUInteger)rowLimit preview:(CommandPreview)preview;
+- (void)applyTheme:(const Theme &)theme;
 - (void)dismiss;
 @end
