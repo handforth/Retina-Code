@@ -29,9 +29,9 @@ struct Buffer {
 
     void reset()
     {
-        length = host.length(host.context);
-        rows = host.lineCount(host.context);
-        bool trailingEmpty = rows > 1 && host.lineStart(host.context, rows - 1) == length;
+        length = host.length(host.document);
+        rows = host.lineCount(host.document);
+        bool trailingEmpty = rows > 1 && host.lineStart(host.document, rows - 1) == length;
         if (trailingEmpty && finalNewline.value_or(true))
             --rows;
         cached = NoOffset;
@@ -39,8 +39,8 @@ struct Buffer {
 
     bool endsWithNewline() const
     {
-        Offset count = host.lineCount(host.context);
-        return count > 1 && host.lineStart(host.context, count - 1) == length;
+        Offset count = host.lineCount(host.document);
+        return count > 1 && host.lineStart(host.document, count - 1) == length;
     }
 
     char16_t at(Offset position) const
@@ -49,7 +49,7 @@ struct Buffer {
             return 0;
         if (cached == NoOffset || position < cached || position - cached >= units.size()) {
             cached = position - position % units.size();
-            host.read(host.context, {cached, std::min(length, cached + units.size())}, units.data());
+            host.read(host.document, {cached, std::min(length, cached + units.size())}, units.data());
         }
         return units[position - cached];
     }
@@ -58,13 +58,13 @@ struct Buffer {
     {
         std::u16string text(range.size(), 0);
         if (!range.empty())
-            host.read(host.context, range, text.data());
+            host.read(host.document, range, text.data());
         return text;
     }
 
     Offset row(Offset position) const
     {
-        return std::min(rows - 1, host.lineAt(host.context, std::min(position, length)));
+        return std::min(rows - 1, host.lineAt(host.document, std::min(position, length)));
     }
 
     Line line(Offset index) const;
@@ -110,8 +110,8 @@ static char32_t Lowercase(char32_t ch)
 
 Line Buffer::line(Offset index) const
 {
-    Offset first = host.lineStart(host.context, index);
-    Offset next = index + 1 < rows ? host.lineStart(host.context, index + 1) : length;
+    Offset first = host.lineStart(host.document, index);
+    Offset next = index + 1 < rows ? host.lineStart(host.document, index + 1) : length;
     Offset end = next;
     if (end > first && Break(at(end - 1))) {
         --end;
@@ -128,7 +128,7 @@ Offset Buffer::next(Offset position) const
     if (at(position) == '\r' && at(position + 1) == '\n')
         return position + 2;
     if (host.cluster && (at(position) >= 0x80 || at(position + 1) >= 0x300))
-        return host.cluster(host.context, position).last;
+        return host.cluster(host.document, position).last;
     return position + 1;
 }
 
@@ -140,7 +140,7 @@ Offset Buffer::prev(Offset position) const
     if (at(position) == '\n' && position && at(position - 1) == '\r')
         return position - 1;
     if (host.cluster && at(position) >= 0x80)
-        return host.cluster(host.context, position).first;
+        return host.cluster(host.document, position).first;
     return position;
 }
 
@@ -250,10 +250,17 @@ void SetCursor(State &state, const Host &host, Offset cursor)
     if (!state.finalNewline)
         state.finalNewline = buffer.endsWithNewline();
     state.cursor = std::min(buffer.length, cursor);
+    state.beforeInlay = false;
     if (!IsInsert(state.mode) && state.mode != Mode::Command)
         state.cursor = NormalPosition(buffer, state.cursor);
     state.goalColumn = NoOffset;
     state.goalEnd = false;
+}
+
+Offset ClampNormalCursor(const Host &host, Offset cursor, std::optional<bool> finalNewline)
+{
+    Buffer buffer(host, finalNewline);
+    return NormalPosition(buffer, std::min(buffer.length, cursor));
 }
 
 static Selection Selected(const State &state, const Buffer &buffer, Range visible = {0, NoOffset},
@@ -336,42 +343,18 @@ static void LeaveVisual(State &state)
     }
 }
 
-static void MoveOffset(Offset &position, Range range, Offset inserted)
-{
-    if (position == NoOffset || position < range.first)
-        return;
-    if (position >= range.last) {
-        position = position - range.size() + inserted;
-    } else {
-        position = range.first;
-    }
-}
-
 void ExternalEdit(State &state, Range range, Offset inserted)
 {
-    for (auto &mark : state.marks)
-        MoveOffset(mark, range, inserted);
-    for (auto &jump : state.jumps)
-        MoveOffset(jump, range, inserted);
-    for (auto &change : state.changes)
-        MoveOffset(change, range, inserted);
-    MoveOffset(state.lastInsert, range, inserted);
-    MoveOffset(state.lastAnchor, range, inserted);
-    MoveOffset(state.lastVisualCursor, range, inserted);
-    MoveOffset(state.exNextLine, range, inserted);
-    MoveOffset(state.exEnd, range, inserted);
-    for (auto &occurrence : state.occurrences) {
-        MoveOffset(occurrence.first, range, inserted);
-        MoveOffset(occurrence.last, range, inserted);
-    }
+    state.beforeInlay = false;
+    MapHistory(state, [&](Offset position) { return OffsetAfterEdit(position, range, inserted); });
 }
 
 void ForeignEdit(State &state, Range range, Offset inserted)
 {
     ExternalEdit(state, range, inserted);
-    MoveOffset(state.cursor, range, inserted);
-    MoveOffset(state.anchor, range, inserted);
-    MoveOffset(state.commandStart, range, inserted);
+    state.cursor = OffsetAfterEdit(state.cursor, range, inserted);
+    state.anchor = OffsetAfterEdit(state.anchor, range, inserted);
+    state.commandStart = OffsetAfterEdit(state.commandStart, range, inserted);
     state.automaticIndent = {};
     state.lineUndo.reset();
     state.goalColumn = NoOffset;
@@ -425,7 +408,7 @@ static void Replace(State &state, Buffer &buffer, Range range, Text replacement)
         edits.push_back({range.first, std::move(before), std::u16string(replacement)});
     }
     ExternalEdit(state, range, replacement.size());
-    buffer.host.replace(buffer.host.context, range, replacement);
+    buffer.host.replace(buffer.host.document, range, replacement);
     buffer.reset();
     state.goalColumn = NoOffset;
     state.goalEnd = false;
@@ -559,7 +542,7 @@ static Offset ColumnPosition(const State &state, const Buffer &buffer, Offset ro
 static Offset StepRow(const Buffer &buffer, Offset row, bool down, Offset count)
 {
     if (buffer.host.stepRow)
-        return std::min(buffer.rows - 1, buffer.host.stepRow(buffer.host.context, row, down, count));
+        return std::min(buffer.rows - 1, buffer.host.stepRow(buffer.host.document, row, down, count));
     return down ? std::min(buffer.rows - 1, row + count) : row - std::min(row, count);
 }
 
@@ -581,31 +564,40 @@ Offset CursorOnRow(const State &state, const Host &host, Offset row)
     return state.mode == Mode::Visual ? position : NormalPosition(buffer, position);
 }
 
-Offset MoveEditorCursor(const Host &host, Key key, Offset position, Offset &column, unsigned tabStop)
+template<bool vimInsert>
+static Offset MoveCaret(const Buffer &buffer, Key key, Offset position, Offset &column, unsigned tabStop)
 {
-    Buffer buffer(host, false);
+    const auto &host = buffer.host;
     Offset row = buffer.row(position);
     if (key == Key::Up || key == Key::Down || key == Key::PageUp || key == Key::PageDown) {
         if (column == NoOffset)
             column = ColumnAt(buffer, position, tabStop);
         Offset count = 1;
         if ((key == Key::PageUp || key == Key::PageDown) && host.viewport)
-            count = std::max(Offset(1), host.viewport(host.context).size());
+            count = std::max(Offset(1), host.viewport(host.document).size());
         bool down = key == Key::Down || key == Key::PageDown;
         return AtColumn(buffer, buffer.line(StepRow(buffer, row, down, count)), column, tabStop);
     }
     column = NoOffset;
     switch (key) {
-        case Key::Left: return buffer.prev(position);
-        case Key::Right: return buffer.next(position);
+        case Key::Left:
+            return vimInsert && position <= buffer.line(row).first ? position : buffer.prev(position);
+        case Key::Right:
+            return vimInsert && position >= buffer.line(row).end ? position : buffer.next(position);
         case Key::WordLeft: return BackwardWord(buffer, position, false);
-        case Key::WordRight: return buffer.next(EndWord(buffer, position, false, false));
+        case Key::WordRight:
+            return vimInsert ? ForwardWord(buffer, position, false) : buffer.next(EndWord(buffer, position, false, false));
         case Key::Home: return buffer.line(row).first;
         case Key::End: return buffer.line(row).end;
         case Key::DocumentStart: return 0;
         case Key::DocumentEnd: return buffer.length;
         default: return position;
     }
+}
+
+Offset MoveEditorCursor(const Host &host, Key key, Offset position, Offset &column, unsigned tabStop)
+{
+    return MoveCaret<false>(Buffer(host, false), key, position, column, tabStop);
 }
 
 static char16_t Paired(char16_t ch)
@@ -630,7 +622,7 @@ static bool Opening(char16_t ch)
 
 static bool Structural(const Buffer &buffer, Offset position)
 {
-    return !buffer.host.structural || buffer.host.structural(buffer.host.context, position);
+    return !buffer.host.structural || buffer.host.structural(buffer.host.document, position);
 }
 
 static Offset MatchPair(const Buffer &buffer, Offset start, bool forward)
@@ -805,7 +797,7 @@ static Motion ReadMotion(State &state, const Buffer &buffer, Key key, unsigned c
         case '}':
             return {Paragraph(buffer, p, key == Key('}'), count), Kind::Character, false, true};
         case 'H': case 'M': case 'L': {
-            Range view = buffer.host.viewport ? buffer.host.viewport(buffer.host.context) : Range{0, buffer.rows};
+            Range view = buffer.host.viewport ? buffer.host.viewport(buffer.host.document) : Range{0, buffer.rows};
             Offset top = std::min(view.first, buffer.rows - 1);
             Offset bottom = std::clamp(view.last, top + 1, buffer.rows) - 1;
             Offset target = key == Key('H') ? std::min(bottom, top + count - 1) :
@@ -1230,7 +1222,7 @@ static std::shared_ptr<const Register> ReadRegister(const State &state, const Ho
     }
     if (key == '+' || key == '*') {
         if (host.readClipboard) {
-            if (auto value = host.readClipboard(host.context))
+            if (auto value = host.readClipboard(host.document))
                 return std::make_shared<Register>(std::move(*value));
         }
         return {};
@@ -1312,7 +1304,7 @@ static void WriteRegister(const State &state, const Host &host, Registers &regis
     std::shared_ptr<const Register> saved;
     if (name == '+' || name == '*') {
         if (host.writeClipboard)
-            host.writeClipboard(host.context, value.text);
+            host.writeClipboard(host.document, value.text);
     } else if (name && name != '"') {
         saved = SetRegister(registers, name, std::move(value));
     }
@@ -1572,10 +1564,10 @@ static void ReplaceSurround(State &state, Buffer &buffer, Text open, Text close)
     for (auto it = state.surrounds.rbegin(); it != state.surrounds.rend(); ++it) {
         Replace(state, buffer, it->right, close);
         if (state.keepSurroundCursor)
-            MoveOffset(cursor, it->right, close.size());
+            cursor = OffsetAfterEdit(cursor, it->right, close.size());
         Replace(state, buffer, it->left, open);
         if (state.keepSurroundCursor)
-            MoveOffset(cursor, it->left, open.size());
+            cursor = OffsetAfterEdit(cursor, it->left, open.size());
     }
     state.cursor = NormalPosition(buffer, cursor);
     state.surrounds.clear();
@@ -1718,7 +1710,7 @@ static void ApplyOperator(State &state, Buffer &buffer, Registers &registers, Op
         WriteRegister(state, buffer.host, registers, ReadSelection(state, buffer, selected), op);
     if (op == Op::Yank) {
         if (buffer.host.flash)
-            buffer.host.flash(buffer.host.context, selected.ranges, selected.kind);
+            buffer.host.flash(buffer.host.document, selected.ranges, selected.kind);
         state.cursor = NormalPosition(buffer, range.first);
         state.goalColumn = NoOffset;
         state.goalEnd = false;
@@ -1888,7 +1880,7 @@ static void OpenLine(State &state, Buffer &buffer, bool below, unsigned count)
     std::u16string indent;
     if (state.autoIndent) {
         indent = below && buffer.host.indentAfter ?
-                 buffer.host.indentAfter(buffer.host.context, line.end, state.tabStop, state.shiftWidth, state.expandTab) :
+                 buffer.host.indentAfter(buffer.host.document, line.end, state.tabStop, state.shiftWidth, state.expandTab) :
                  Indentation(buffer, row);
     }
     Offset at = below ? line.end : line.first;
@@ -1919,6 +1911,20 @@ static void JoinLines(State &state, Buffer &buffer, Offset first, Offset last, b
     state.cursor = NormalPosition(buffer, cursor);
 }
 
+static void JoinAtCursor(State &state, Buffer &buffer, Offset row, unsigned count, bool space)
+{
+    Offset first = row, last = row + std::max(2U, count) - 1;
+    if (IsVisual(state.mode)) {
+        auto selected = Selected(state, buffer);
+        RememberVisual(state, buffer, selected);
+        first = selected.top;
+        last = std::max(selected.bottom, first + Offset(space));
+    }
+
+    LeaveVisual(state);
+    JoinLines(state, buffer, first, std::min(last, buffer.rows - 1), space);
+}
+
 static std::u16string KeyText(Key key, Text text)
 {
     if (key == Key::Text || key == Key::Paste)
@@ -1941,6 +1947,7 @@ static void ReplaceAtInsertCursors(State &state, Buffer &buffer, Range range, Te
         range.last = std::clamp(range.last, range.first, std::max(range.first, state.insertMirrors.front()));
     Replace(state, buffer, range, replacement);
     state.cursor = std::min(cursor, buffer.length);
+    state.beforeInlay = state.mode == Mode::Insert;
     if (state.insertMirrors.empty())
         return;
     Offset before = primary > range.first ? primary - range.first : 0;
@@ -1955,9 +1962,9 @@ static void ReplaceAtInsertCursors(State &state, Buffer &buffer, Range range, Te
         Offset last = std::max(first, std::min(at + after, next));
         if (buffer.host.cluster) {
             if (first < at)
-                first = std::max(occupied, buffer.host.cluster(buffer.host.context, first).first);
+                first = std::max(occupied, buffer.host.cluster(buffer.host.document, first).first);
             if (at < last && last < next) {
-                Range cluster = buffer.host.cluster(buffer.host.context, last);
+                Range cluster = buffer.host.cluster(buffer.host.document, last);
                 if (cluster.first < last)
                     last = std::min(next, cluster.last);
             }
@@ -2054,29 +2061,8 @@ static void MoveInsertMirrors(State &state, const Buffer &buffer, Key key, Offse
     if (state.insertMirrors.empty())
         return;
     for (auto &cursor : state.insertMirrors) {
-        Offset row = buffer.row(cursor);
-        Line line = buffer.line(row);
-        switch (key) {
-            case Key::Left:
-                if (cursor > line.first)
-                    cursor = buffer.prev(cursor);
-                break;
-            case Key::Right:
-                if (cursor < line.end)
-                    cursor = buffer.next(cursor);
-                break;
-            case Key::WordLeft: cursor = BackwardWord(buffer, cursor, false); break;
-            case Key::WordRight: cursor = ForwardWord(buffer, cursor, false); break;
-            case Key::Home: cursor = line.first; break;
-            case Key::End: cursor = line.end; break;
-            case Key::Up: case Key::Down: {
-                Offset target = StepRow(buffer, row, key == Key::Down, 1);
-                Offset column = ColumnAt(buffer, cursor, state.tabStop);
-                cursor = AtColumn(buffer, buffer.line(target), column, state.tabStop);
-                break;
-            }
-            default: break;
-        }
+        Offset column = NoOffset;
+        cursor = MoveCaret<true>(buffer, key, cursor, column, state.tabStop);
     }
     std::sort(state.insertMirrors.begin(), state.insertMirrors.end());
     auto first = std::upper_bound(state.insertMirrors.begin(), state.insertMirrors.end(), primary);
@@ -2110,7 +2096,7 @@ static void InsertKey(State &state, Buffer &buffer, Registers &registers, Key ke
     }
     if (smart && state.mode == Mode::Insert && state.insertCount == 1 && state.blockTop == state.blockBottom &&
         buffer.host.planInsert) {
-        auto edit = buffer.host.planInsert(buffer.host.context, key, state.cursor, state.tabStop,
+        auto edit = buffer.host.planInsert(buffer.host.document, key, state.cursor, state.tabStop,
                                            state.shiftWidth, state.expandTab, state.autoIndent);
         if (edit) {
             state.simpleInsert &= edit->range.first >= state.insertStart;
@@ -2319,7 +2305,7 @@ static std::optional<Match> Find(const Buffer &buffer, const Pattern &pattern, R
 {
     if (!buffer.host.find || pattern.regex.empty())
         return std::nullopt;
-    return buffer.host.find(buffer.host.context, pattern.regex, range, backwards, pattern.ignoreCase, captures);
+    return buffer.host.find(buffer.host.document, pattern.regex, range, backwards, pattern.ignoreCase, captures);
 }
 
 static std::optional<Match> SearchObject(const State &state, const Buffer &buffer, bool backwards, unsigned count)
@@ -2866,7 +2852,7 @@ static void ConfirmSubstitute(State &state, Buffer &buffer, Key key)
             Replace(state, buffer, range, edit.after);
             ++state.substitutionIndex;
             for (Offset i = state.substitutionIndex; i < state.substitutions.size(); ++i)
-                MoveOffset(state.substitutions[i].at, range, edit.after.size());
+                state.substitutions[i].at = OffsetAfterEdit(state.substitutions[i].at, range, edit.after.size());
         } while (all && state.substitutionIndex < state.substitutions.size());
     } else if (key == Key('n')) {
         ++state.substitutionIndex;
@@ -3496,7 +3482,7 @@ static void WordSearch(State &state, Buffer &buffer, Registers &registers, bool 
 
 static void Scroll(State &state, Buffer &buffer, char32_t key, unsigned count)
 {
-    Range view = buffer.host.viewport ? buffer.host.viewport(buffer.host.context) : Range{0, buffer.rows};
+    Range view = buffer.host.viewport ? buffer.host.viewport(buffer.host.document) : Range{0, buffer.rows};
     Offset top = std::min(view.first, buffer.rows - 1);
     Offset rows = std::max<Offset>(1, view.last > top ? view.last - top : 1);
     if (buffer.host.hiddenRows)
@@ -3899,16 +3885,9 @@ static void GCommand(State &state, Buffer &buffer, Registers &registers, char32_
         case 'p': case 'P':
             Put(state, buffer, registers, key == 'p', true, count);
             break;
-        case 'J': {
-            auto selected = Selected(state, buffer);
-            bool visual = IsVisual(state.mode);
-            if (visual)
-                RememberVisual(state, buffer, selected);
-            LeaveVisual(state);
-            JoinLines(state, buffer, visual ? selected.top : row,
-                      visual ? selected.bottom : std::min(buffer.rows - 1, row + std::max(2U, count) - 1), false);
+        case 'J':
+            JoinAtCursor(state, buffer, row, count, false);
             break;
-        }
         case ';': case ',':
             if (!state.changes.empty()) {
                 if (key == ';')
@@ -4226,16 +4205,9 @@ static void NormalKey(State &state, Buffer &buffer, Registers &registers, Key ke
             if (!operated)
                 Put(state, buffer, registers, ch == 'p', false, count);
             break;
-        case 'J': {
-            auto selected = Selected(state, buffer);
-            if (visual)
-                RememberVisual(state, buffer, selected);
-            LeaveVisual(state);
-            JoinLines(state, buffer, visual ? selected.top : row,
-                      visual ? std::max(selected.bottom, std::min(buffer.rows - 1, selected.top + 1)) :
-                      std::min(buffer.rows - 1, row + std::max(2U, count) - 1), true);
+        case 'J':
+            JoinAtCursor(state, buffer, row, count, true);
             break;
-        }
         case '~': case 'U': case 'u':
             if (visual) {
                 StartOperator(state, buffer, registers, Operator(ch));
@@ -4315,6 +4287,27 @@ static void FeedInput(State &state, Buffer &buffer, Registers &registers, Key ke
         StopRecording(state, registers);
         return;
     }
+
+    Mode mode = state.mode;
+    Offset at = state.cursor;
+    bool before = std::exchange(state.beforeInlay, false);
+    bool normal = mode == Mode::Normal && state.op == Op::None && !state.count;
+    bool insert = mode == Mode::Insert && state.insertMirrors.empty() && state.blockTop == state.blockBottom;
+    bool right = key == Key::Right || (normal && key == Key('l'));
+    bool left = key == Key::Left || (normal && key == Key('h'));
+    bool inlayMotion = (left || right) && (normal || insert) && buffer.host.inlayAt &&
+                       state.prefix == Prefix::None && state.surrounds.empty() &&
+                       !state.recording && !state.replaying && !state.executionDepth;
+    // A hint edge is a display stop, so it never enters the Vim command history.
+    if (inlayMotion && before == right && buffer.host.inlayAt(buffer.host.document, at)) {
+        state.beforeInlay = !right;
+        state.goalColumn = NoOffset;
+        return;
+    }
+
+    bool append = normal && state.prefix == Prefix::None && (key == Key('a') || key == Key('A'));
+    if (append && before && key == Key('a') && buffer.host.inlayAt && buffer.host.inlayAt(buffer.host.document, at))
+        key = Key('i');
     if (state.recording && !state.executionDepth)
         state.macro.push_back({key, std::u16string(text), smart});
     bool insertCommand = state.mode == Mode::Normal && state.returnToInsert != Mode::Normal;
@@ -4345,6 +4338,10 @@ static void FeedInput(State &state, Buffer &buffer, Registers &registers, Key ke
     } else if (state.change) {
         state.change->after = state.cursor;
     }
+    if (inlayMotion && state.mode == mode && (right ? state.cursor != at : before && state.cursor == at))
+        state.beforeInlay = buffer.host.inlayAt(buffer.host.document, state.cursor);
+    if (normal && state.mode == Mode::Insert && (append || (before && key == Key('i'))))
+        state.beforeInlay = true;
 }
 
 static unsigned CurrentMappingMode(const State &state)
@@ -4442,6 +4439,7 @@ void MouseSelection(State &state, const Host &host, Range range, bool backwards)
         state.finalNewline = buffer.endsWithNewline();
     Offset first = std::min(range.first, buffer.length);
     Offset last = std::min(range.last, buffer.length);
+    state.beforeInlay = false;
     state.goalEnd = false;
     if (IsInsert(state.mode) && first == last) {
         state.simpleInsert = false;
@@ -4473,7 +4471,7 @@ void MouseSelection(State &state, const Host &host, Range range, bool backwards)
 
 void SelectAll(State &state, const Host &host)
 {
-    MouseSelection(state, host, {0, host.length(host.context)});
+    MouseSelection(state, host, {0, host.length(host.document)});
 }
 
 void CopySelection(State &state, const Host &host, Registers &registers, bool cut)

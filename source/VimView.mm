@@ -1,4 +1,5 @@
 #import "VimView.h"
+#import "Editor.h"
 #import <AppKit/NSTextInsertionIndicator.h>
 
 #include <algorithm>
@@ -95,18 +96,13 @@ static std::optional<Vim::Register> ReadEditorClipboard()
     return value;
 }
 
-static void WriteEditorClipboard(Vim::Text text, const std::vector<std::shared_ptr<const Vim::Register>> *parts = nullptr)
+static void WriteEditorClipboard(NSString *text, NSArray<NSDictionary *> *metadata = nil)
 {
     NSPasteboard *clipboard = NSPasteboard.generalPasteboard;
     [clipboard clearContents];
-    [clipboard setString:String(text) forType:NSPasteboardTypeString];
-    if (!parts || parts->empty())
-        return;
-    NSMutableArray<NSDictionary *> *metadata = [NSMutableArray arrayWithCapacity:parts->size()];
-    for (const auto &part : *parts) {
-        [metadata addObject:@{@"text":String(part->text), @"kind":@(NSUInteger(part->kind)), @"width":@(part->width)}];
-    }
-    [clipboard setPropertyList:metadata forType:cursorClipboardType];
+    [clipboard setString:text forType:NSPasteboardTypeString];
+    if (metadata.count)
+        [clipboard setPropertyList:metadata forType:cursorClipboardType];
 }
 
 static NSRange CocoaRange(Vim::Range range)
@@ -117,6 +113,16 @@ static NSRange CocoaRange(Vim::Range range)
 static Vim::Range ToVimRange(NSRange range)
 {
     return {range.location, NSMaxRange(range)};
+}
+
+static void ReplaceEditorText(NSTextStorage *storage, NSRange range, NSString *text, NSDictionary *attributes)
+{
+    if (text.length) {
+        NSAttributedString *inserted = [[NSAttributedString alloc] initWithString:text attributes:attributes];
+        [storage replaceCharactersInRange:range withAttributedString:inserted];
+    } else {
+        [storage deleteCharactersInRange:range];
+    }
 }
 
 static VimTextView *View(void *context)
@@ -130,6 +136,7 @@ struct CursorPosition {
     NSUInteger column = Vim::NoOffset;
     Vim::Mode mode = Vim::Mode::Normal;
     bool primary = false;
+    bool beforeInlay = false;
 
     bool visual(bool vim) const { return !vim || Vim::IsVisual(mode); }
     NSUInteger first(bool vim) const { return visual(vim) ? std::min(anchor, head) : head; }
@@ -170,7 +177,7 @@ static bool CoalesceCursorInsertions(CursorUndoStep &previous, const Vim::EditBa
     NSUInteger added = 0;
     for (NSUInteger i = 0; i < count; ++i) {
         const auto &text = next.edits[i].text;
-        forward.starts[i] += added;
+        forward.edits[i].newStart += added;
         forward.edits[i].text.append(text);
         backward.edits[i].range.first += added;
         added += text.size();
@@ -286,6 +293,24 @@ API_AVAILABLE(macos(14.0))
 }
 @end
 
+@interface EditorInlayCaret : NSView
+@property(nonatomic) NSColor *color;
+@end
+
+@implementation EditorInlayCaret
+- (NSView *)hitTest:(NSPoint)point
+{
+    (void)point;
+    return nil;
+}
+
+- (void)drawRect:(NSRect)dirty
+{
+    [self.color setFill];
+    NSRectFill(dirty);
+}
+@end
+
 @implementation VimTextView {
     std::unique_ptr<Vim::State> _vim;
     BOOL _vimEnabled;
@@ -296,8 +321,13 @@ API_AVAILABLE(macos(14.0))
     BOOL _hadVimHighlight;
     BOOL _hidesNativeInsertionPoint;
     BOOL _insertionIndicatorPending;
+    BOOL _plainBeforeInlay;
     NSView *_insertionIndicator;
+    EditorInlayCaret *_inlayCaret;
     NSRect _vimCaretRect;
+    NSFont *_caretFont;
+    CGFloat _caretWidth;
+    CGFloat _caretSpaceWidth;
     std::optional<NSUInteger> _requestedScrollRow;
     std::optional<VimScrollAnimation> _scrollAnimation;
     NSUInteger _displayedCursor;
@@ -305,7 +335,7 @@ API_AVAILABLE(macos(14.0))
     NSTimer *_flashTimer;
     NSTimer *_mappingTimer;
     NSTimeInterval _flashStart;
-    NSArray<NSValue *> *_flashRects;
+    std::vector<NSRect> _flashRects;
     NSString *_composition;
     NSString *_pattern;
     NSRegularExpression *_expression;
@@ -367,7 +397,7 @@ API_AVAILABLE(macos(14.0))
             [View(context) flashVimRanges:ranges linewise:kind == Vim::Kind::Line];
         },
         .readClipboard = [](void *) { return ReadEditorClipboard(); },
-        .writeClipboard = [](void *, Vim::Text text) { WriteEditorClipboard(text); },
+        .writeClipboard = [](void *, Vim::Text text) { WriteEditorClipboard(String(text)); },
         .find = [](void *context, Vim::Text text, Vim::Range range, bool back, bool ignoreCase, bool captures) {
             return [View(context) findVimPattern:String(text) range:CocoaRange(range) backward:back
                                       ignoreCase:ignoreCase captures:captures];
@@ -419,12 +449,28 @@ API_AVAILABLE(macos(14.0))
             return [View(context) vimHiddenRows:rows];
         } : nullptr,
         .writeCursorClipboard = [](void *, const Vim::Register &value) {
-            WriteEditorClipboard(value.text, &value.cursors);
+            NSMutableArray<NSDictionary *> *metadata = [NSMutableArray arrayWithCapacity:value.cursors.size()];
+            for (const auto &part : value.cursors)
+                [metadata addObject:@{@"text":String(part->text), @"kind":@(NSUInteger(part->kind)), @"width":@(part->width)}];
+            WriteEditorClipboard(String(value.text), metadata);
+        },
+        .inlayAt = [](void *context, Vim::Offset at) {
+            return [View(context) inlayWidthAtInsertion:at] > 0;
         },
     };
 }
 
 - (void)visitVimFileMark:(NSUInteger)offset exact:(BOOL)exact
+{
+    [self visitVimFileMark:offset exact:exact centerVertically:NO];
+}
+
+- (void)visitDefinitionAtOffset:(NSUInteger)offset
+{
+    [self visitVimFileMark:offset exact:YES centerVertically:YES];
+}
+
+- (void)visitVimFileMark:(NSUInteger)offset exact:(BOOL)exact centerVertically:(BOOL)center
 {
     [self clearAdditionalCursors];
     [self finishVimChange];
@@ -445,11 +491,15 @@ API_AVAILABLE(macos(14.0))
     [self revealVimFoldAt:offset];
     if (_vimEnabled) {
         Vim::MouseSelection(*_vim, [self vimHost], {offset, offset});
-        [self refreshVimSelection:YES];
     } else {
         self.selectedRange = NSMakeRange(offset, 0);
-        [self scrollRangeToVisible:self.selectedRange];
     }
+    if (center)
+        [self centerEditorAtOffset:offset];
+    if (_vimEnabled)
+        [self refreshVimSelection:!center];
+    else if (!center)
+        [self scrollRangeToVisible:self.selectedRange];
 }
 
 - (void)revealSearchMatch:(NSRange)range
@@ -463,14 +513,20 @@ API_AVAILABLE(macos(14.0))
     }
 }
 
-+ (void)jumpToVimFileMark:(char32_t)key exact:(BOOL)exact
++ (void)jumpToVimFileMark:(char32_t)key exact:(BOOL)exact inWindow:(NSWindow *)window
 {
     auto found = FindFileMark(key);
     if (found == fileMarks.end())
         return;
     NSUInteger offset = found->offset;
     VimTextView *view = found->view;
-    if (view.window) {
+    SourceDocument *source = [view.vimDocument isKindOfClass:SourceDocument.class] ? (SourceDocument *)view.vimDocument : nil;
+    if (source.editorHostWindow && [source joinNavigationTabInWindow:window]) {
+        [source showWindows];
+        [view visitVimFileMark:offset exact:exact];
+        return;
+    }
+    if (!source && view.window) {
         [view visitVimFileMark:offset exact:exact];
         return;
     }
@@ -478,13 +534,14 @@ API_AVAILABLE(macos(14.0))
     if (!url)
         url = found->url;
     if (url) {
-        [NSDocumentController.sharedDocumentController openDocumentWithContentsOfURL:url display:YES
-           completionHandler:^(NSDocument *document, BOOL, NSError *error) {
+        OpenSourceTab(url, window, ^(NSDocument *document, BOOL, NSError *error) {
             if (error) {
                 [NSApp presentError:error];
                 return;
             }
-            NSResponder *responder = document.windowControllers.firstObject.window.initialFirstResponder;
+            NSWindow *targetWindow = [document isKindOfClass:SourceDocument.class] ?
+                [(SourceDocument *)document editorHostWindow] : document.windowControllers.firstObject.window;
+            NSResponder *responder = targetWindow.initialFirstResponder;
             if ([responder isKindOfClass:VimTextView.class]) {
                 VimTextView *target = (VimTextView *)responder;
                 auto mark = FindFileMark(key);
@@ -494,7 +551,7 @@ API_AVAILABLE(macos(14.0))
                 }
                 [target visitVimFileMark:offset exact:exact];
             }
-        }];
+        });
     }
 }
 
@@ -513,6 +570,7 @@ API_AVAILABLE(macos(14.0))
     [self cancelVimScroll];
     [self cancelVimFlash];
     _composition = nil;
+    _plainBeforeInlay = NO;
     _vimEnabled = enabled;
     if (enabled) {
         if (!_vim) {
@@ -609,6 +667,7 @@ API_AVAILABLE(macos(14.0))
         cursor.position.head = state.cursor;
         cursor.position.column = state.goalColumn;
         cursor.position.mode = state.mode;
+        cursor.position.beforeInlay = state.beforeInlay;
     }
 }
 
@@ -621,6 +680,7 @@ API_AVAILABLE(macos(14.0))
     if (_vimEnabled)
         point = {_vim->anchor, _vim->cursor, _vim->goalColumn, _vim->mode};
     point.primary = true;
+    point.beforeInlay = _vimEnabled ? _vim->beforeInlay : _plainBeforeInlay;
     _cursors.push_back({point, nullptr});
 }
 
@@ -704,6 +764,8 @@ API_AVAILABLE(macos(14.0))
         state.cursor = std::min(point.head, self.string.length);
     state.anchor = std::min(point.anchor, self.string.length);
     state.goalColumn = point.column;
+    state.beforeInlay = state.cursor == point.head && point.beforeInlay &&
+                       (point.mode == Vim::Mode::Insert || point.mode == Vim::Mode::Normal);
     if (Vim::IsInsert(point.mode)) {
         state.insertStart = state.commandStart = state.cursor;
         if (state.inputs.empty())
@@ -822,8 +884,9 @@ API_AVAILABLE(macos(14.0))
         [self refreshVimSelection:reveal];
     } else {
         self.selectedRange = point.range(false);
+        [self setPlainCaretBeforeInlay:point.beforeInlay && point.anchor == point.head];
         if (reveal)
-            [self scrollRangeToVisible:NSMakeRange(point.head, 0)];
+            [self revealInsertionAt:point.head];
         if (self.vimStatusChanged)
             self.vimStatusChanged();
     }
@@ -1224,60 +1287,23 @@ API_AVAILABLE(macos(14.0))
     [undo disableUndoRegistration];
     if ([self shouldChangeTextInRange:range replacementString:text]) {
         _writingVimStorage = YES;
-        if (text.length) {
-            NSAttributedString *inserted = [[NSAttributedString alloc] initWithString:text
-                                                                          attributes:self.typingAttributes];
-            [self.textStorage replaceCharactersInRange:range withAttributedString:inserted];
-        } else {
-            [self.textStorage deleteCharactersInRange:range];
-        }
+        ReplaceEditorText(self.textStorage, range, text, text.length ? self.typingAttributes : nil);
         _writingVimStorage = NO;
         [self didChangeText];
     }
     [undo enableUndoRegistration];
 }
 
-+ (void)vimStorage:(NSTextStorage *)storage edited:(NSRange)range newLength:(NSUInteger)length
++ (void)vimStorage:(NSTextStorage *)storage edited:(const Vim::EditMap &)edit
 {
     for (auto &mark : fileMarks) {
-        if (mark.storage != storage || mark.offset < range.location)
+        if (mark.storage != storage || (!edit.batch && mark.offset < edit.range.first))
             continue;
-        if (mark.offset >= NSMaxRange(range))
-            mark.offset = mark.offset - range.length + length;
-        else
-            mark.offset = range.location;
-        if (mark.view.vimDocument.fileURL)
+
+        mark.offset = edit.map(mark.offset);
+        if (!edit.batch && mark.view.vimDocument.fileURL)
             mark.url = mark.view.vimDocument.fileURL;
     }
-}
-
-- (void)vimStorageEdited:(NSRange)range newLength:(NSUInteger)length
-{
-    if (_writingVimStorage)
-        return;
-    if (_cursors.size() > 1) {
-        [self finishCursorChange];
-        if (_vim)
-            Vim::MoveCursorOffsets(*_vim, ToVimRange(range), length);
-        for (auto &cursor : _cursors) {
-            if (cursor.state) {
-                Vim::MoveCursorOffsets(*cursor.state, ToVimRange(range), length);
-            } else if (!_vimEnabled) {
-                auto map = [&](NSUInteger position) {
-                    if (position < range.location)
-                        return position;
-                    return position < NSMaxRange(range) ? range.location : position - range.length + length;
-                };
-                cursor.position.anchor = map(cursor.position.anchor);
-                cursor.position.head = map(cursor.position.head);
-            }
-        }
-        [self queueForeignCursorDisplay];
-    } else if (_vim) {
-        Vim::ForeignEdit(*_vim, ToVimRange(range), length);
-    }
-    _cursorHistory.clear();
-    [self resetOccurrenceSearch];
 }
 
 + (const Vim::EditBatch *)cursorBatchForStorage:(NSTextStorage *)storage
@@ -1285,32 +1311,40 @@ API_AVAILABLE(macos(14.0))
     return batchStorage == storage ? storageBatch : nullptr;
 }
 
-+ (void)vimStorage:(NSTextStorage *)storage editedBatch:(const Vim::EditBatch &)batch
-{
-    for (auto &mark : fileMarks) {
-        if (mark.storage == storage)
-            mark.offset = batch.map(mark.offset);
-    }
-}
-
-- (void)vimStorageEditedBatch:(const Vim::EditBatch &)batch
+- (void)vimStorageEdited:(const Vim::EditMap &)edit
 {
     if (_writingVimStorage)
         return;
-    [self finishCursorChange];
+
+    _plainBeforeInlay = NO;
+    bool moveAll = edit.batch || _cursors.size() > 1;
+    if (moveAll)
+        [self finishCursorChange];
+
     [self resetOccurrenceSearch];
     _cursorHistory.clear();
-    [self beginCursorSelection];
+    if (!moveAll) {
+        if (_vim)
+            Vim::ForeignEdit(*_vim, edit.range, edit.inserted);
+        return;
+    }
+
+    if (edit.batch)
+        [self beginCursorSelection];
+
     if (_vim)
-        Vim::MoveCursorOffsets(*_vim, batch, batchCaretAfterInsertion);
+        Vim::MoveCursorOffsets(*_vim, edit, batchCaretAfterInsertion);
     for (auto &cursor : _cursors) {
-        if (cursor.state)
-            Vim::MoveCursorOffsets(*cursor.state, batch, batchCaretAfterInsertion);
-        else if (!_vimEnabled) {
-            cursor.position.anchor = batch.map(cursor.position.anchor, batchCaretAfterInsertion);
-            cursor.position.head = batch.map(cursor.position.head, batchCaretAfterInsertion);
+        if (cursor.state) {
+            Vim::MoveCursorOffsets(*cursor.state, edit, batchCaretAfterInsertion);
+        } else if (!_vimEnabled) {
+            auto &position = cursor.position;
+            position.anchor = edit.map(position.anchor, batchCaretAfterInsertion);
+            position.head = edit.map(position.head, batchCaretAfterInsertion);
+            position.beforeInlay = false;
         }
     }
+
     [self queueForeignCursorDisplay];
 }
 
@@ -1332,11 +1366,27 @@ API_AVAILABLE(macos(14.0))
 
 - (void)setSelectedRange:(NSRange)range
 {
+    if (_plainBeforeInlay && !NSEqualRanges(range, self.selectedRange))
+        _plainBeforeInlay = NO;
     if (_cursors.size() > 1 && !_vimEnabled && !_publishingCursors && !_writingVimStorage &&
         !_foreignCursorDisplayPending && !NSEqualRanges(range, self.selectedRange)) {
         [self clearAdditionalCursors];
     }
     [super setSelectedRange:range];
+}
+
+- (void)setSelectedRanges:(NSArray<NSValue *> *)ranges affinity:(NSSelectionAffinity)affinity stillSelecting:(BOOL)stillSelecting
+{
+    if (_plainBeforeInlay && (ranges.count != 1 || !NSEqualRanges(ranges.firstObject.rangeValue, self.selectedRange)))
+        _plainBeforeInlay = NO;
+    [super setSelectedRanges:ranges affinity:affinity stillSelecting:stillSelecting];
+}
+
+- (void)didChangeText
+{
+    if (!_vimEnabled && _cursors.size() < 2)
+        [self setPlainCaretBeforeInlay:self.selectedRange.length == 0];
+    [super didChangeText];
 }
 
 - (BOOL)applyCursorBatch:(const Vim::EditBatch &)batch caretAfterInsertion:(BOOL)after
@@ -1377,16 +1427,8 @@ API_AVAILABLE(macos(14.0))
         NSAttributedString *inserted = [[NSAttributedString alloc] initWithString:dense attributes:attributes];
         [storage replaceCharactersInRange:range withAttributedString:inserted];
     } else {
-        for (NSUInteger i = ranges.count; i > 0; --i) {
-            NSRange range = ranges[i - 1].rangeValue;
-            NSString *text = strings[i - 1];
-            if (text.length) {
-                NSAttributedString *inserted = [[NSAttributedString alloc] initWithString:text attributes:attributes];
-                [storage replaceCharactersInRange:range withAttributedString:inserted];
-            } else {
-                [storage deleteCharactersInRange:range];
-            }
-        }
+        for (NSUInteger i = ranges.count; i > 0; --i)
+            ReplaceEditorText(storage, ranges[i - 1].rangeValue, strings[i - 1], attributes);
     }
     [storage endEditing];
     batchCaretAfterInsertion = previousCaretAfterInsertion;
@@ -1412,10 +1454,10 @@ API_AVAILABLE(macos(14.0))
     auto host = [self vimHost];
     for (NSUInteger i = 0; i < batch.edits.size(); ++i) {
         const auto &edit = batch.edits[i];
-        Vim::Range range{batch.starts[i], batch.starts[i] + edit.text.size()};
+        Vim::Range range{edit.newStart, edit.newStart + edit.text.size()};
         std::u16string original(edit.range.size(), 0);
         if (!original.empty())
-            host.read(host.context, edit.range, original.data());
+            host.read(host.document, edit.range, original.data());
         if (!inverse.empty() && inverse.back().range.last == range.first) {
             inverse.back().range.last = range.last;
             inverse.back().text.append(original);
@@ -1426,24 +1468,29 @@ API_AVAILABLE(macos(14.0))
     return Vim::EditBatch(std::move(inverse));
 }
 
-- (void)registerCursorUndo:(std::shared_ptr<CursorChange>)change redo:(BOOL)redo
+- (void)registerEditorUndo:(void (^)(VimTextView *))handler name:(NSString *)name
 {
     NSUndoManager *undo = self.undoManager;
     BOOL group = undo && undo.groupingLevel == 0;
-    BOOL separateGroup = group && change->actionName && undo.groupsByEvent;
+    BOOL separateGroup = group && name && undo.groupsByEvent;
     // A document-wide edit is a complete undo step, including when it runs during save.
     if (separateGroup)
         undo.groupsByEvent = NO;
     if (group)
         [undo beginUndoGrouping];
-    [undo registerUndoWithTarget:self handler:^(VimTextView *view) {
-        [view restoreCursorChange:change redo:redo];
-    }];
-    [undo setActionName:change->actionName ? change->actionName : @"Edit"];
+    [undo registerUndoWithTarget:self handler:handler];
+    [undo setActionName:name ? name : @"Edit"];
     if (group)
         [undo endUndoGrouping];
     if (separateGroup)
         undo.groupsByEvent = YES;
+}
+
+- (void)registerCursorUndo:(std::shared_ptr<CursorChange>)change redo:(BOOL)redo
+{
+    [self registerEditorUndo:^(VimTextView *view) {
+        [view restoreCursorChange:change redo:redo];
+    } name:change->actionName];
 }
 
 - (void)syncVimFinalNewline
@@ -1464,13 +1511,7 @@ API_AVAILABLE(macos(14.0))
     }
 }
 
-- (BOOL)applyDocumentEdits:(Vim::EditBatch)batch undoName:(NSString *)name
-{
-    return [self applyDocumentEdits:std::move(batch) undoName:name insertionAdvance:nullptr];
-}
-
-- (BOOL)applyDocumentEdits:(Vim::EditBatch)batch undoName:(NSString *)name
-          insertionAdvance:(Vim::Offset (*)(Vim::Text))advance
+- (BOOL)applyDocumentEdits:(Vim::EditBatch)batch undoName:(NSString *)name options:(DocumentEditOptions)options
 {
     if (batch.edits.empty())
         return YES;
@@ -1487,11 +1528,15 @@ API_AVAILABLE(macos(14.0))
     }
 
     [self syncVimFinalNewline];
+    NSUInteger caret = options.caretAfter;
+    bool placeCaret = caret != NSNotFound && _cursors.size() == 1;
+    if (placeCaret)
+        caret = std::min(caret, self.string.length);
     auto advanceAt = [&](Vim::Offset at) -> Vim::Offset {
-        if (advance) {
+        if (options.insertionAdvance) {
             const auto *edit = batch.find(at);
             if (edit && edit->range.empty())
-                return advance(edit->text);
+                return options.insertionAdvance(edit->text);
         }
         return 0;
     };
@@ -1500,15 +1545,19 @@ API_AVAILABLE(macos(14.0))
             auto &state = [self stateForCursor:cursor];
             auto cursorAdvance = advanceAt(state.cursor);
             auto anchorAdvance = advanceAt(state.anchor);
-            Vim::MoveCursorOffsets(state, batch, false);
+            Vim::MoveCursorOffsets(state, {.batch = &batch}, false);
             state.cursor += cursorAdvance;
             state.anchor += anchorAdvance;
-            if (state.mode == Vim::Mode::Normal)
+            if (placeCaret) {
+                Vim::SetCursor(state, [self vimHost], caret);
+                state.anchor = state.cursor;
+            } else if (state.mode == Vim::Mode::Normal) {
                 Vim::SetCursor(state, [self vimHost], state.cursor);
+            }
         } else {
             auto &position = cursor.position;
-            position.anchor = batch.map(position.anchor, false) + advanceAt(position.anchor);
-            position.head = batch.map(position.head, false) + advanceAt(position.head);
+            position.anchor = placeCaret ? caret : batch.map(position.anchor, false) + advanceAt(position.anchor);
+            position.head = placeCaret ? caret : batch.map(position.head, false) + advanceAt(position.head);
         }
     }
     [self readVimCursorPositions];
@@ -1519,7 +1568,7 @@ API_AVAILABLE(macos(14.0))
     change->steps.push_back({std::move(batch), std::move(inverse)});
     change->actionName = name;
     [self registerCursorUndo:change redo:NO];
-    [self publishCursorSelection:NO];
+    [self publishCursorSelection:placeCaret];
     return YES;
 }
 
@@ -1535,7 +1584,7 @@ API_AVAILABLE(macos(14.0))
         const auto &batch = redo ? step.forward : step.backward;
         [target applyCursorBatch:batch caretAfterInsertion:!change->actionName];
         if (target->_vim) {
-            Vim::MoveCursorOffsets(*target->_vim, batch, !change->actionName);
+            Vim::MoveCursorOffsets(*target->_vim, {.batch = &batch}, !change->actionName);
             target->_vim->change.reset();
         }
     }
@@ -1584,8 +1633,7 @@ static NSUInteger PositionAfterCursorEdit(NSUInteger position, const TypingEdit 
     NSUInteger inserted = edit.text.length;
     if (position >= edit.range.location && position <= edit.range.location + inserted &&
         result && result->range == ToVimRange(edit.range)) {
-        auto index = result - batch.edits.data();
-        return batch.starts[index] + std::min(position - edit.range.location, result->text.size());
+        return result->newStart + std::min(position - edit.range.location, result->text.size());
     }
     if (position > edit.range.location + inserted)
         position = position - inserted + edit.range.length;
@@ -1715,11 +1763,22 @@ static NSUInteger PositionAfterCursorEdit(NSUInteger position, const TypingEdit 
     for (auto &cursor : _cursors) {
         auto &point = cursor.position;
         NSRange range = point.range(false);
-        if (!extend && range.length && (key == Vim::Key::Left || key == Vim::Key::Right)) {
+        bool right = key == Vim::Key::Right;
+        bool horizontal = key == Vim::Key::Left || right;
+        if (!extend && !range.length && horizontal && point.beforeInlay == right && [self inlayWidthAtInsertion:point.head] > 0) {
+            point.beforeInlay = !right;
+            point.column = Vim::NoOffset;
+            continue;
+        }
+
+        point.beforeInlay = false;
+        if (!extend && range.length && horizontal) {
             point.head = key == Vim::Key::Left ? range.location : NSMaxRange(range);
             point.column = Vim::NoOffset;
         } else {
+            NSUInteger previous = point.head;
             point.head = Vim::MoveEditorCursor(host, key, point.head, point.column, tab);
+            point.beforeInlay = !extend && right && point.head != previous && [self inlayWidthAtInsertion:point.head] > 0;
         }
         if (!extend)
             point.anchor = point.head;
@@ -1737,13 +1796,8 @@ static NSUInteger PositionAfterCursorEdit(NSUInteger position, const TypingEdit 
     Indentation indentation = [self cursorIndentation];
     BOOL paste = key == Vim::Key::Paste;
     auto units = paste ? Units(text) : std::u16string{};
-    auto parts = paste ? Vim::ClipboardLines(units, _cursors.size()) : std::vector<Vim::Text>{};
     auto clipboard = paste ? ReadEditorClipboard() : std::nullopt;
-    if (clipboard && clipboard->text == units && clipboard->cursors.size() == _cursors.size()) {
-        parts.clear();
-        for (const auto &part : clipboard->cursors)
-            parts.push_back(part->text);
-    }
+    auto parts = paste ? Vim::ClipboardParts(units, _cursors.size(), clipboard ? &*clipboard : nullptr) : std::vector<Vim::Text>{};
     std::vector<TypingEdit> plans;
     std::vector<Vim::CursorEdit> changes;
     plans.reserve(_cursors.size());
@@ -1786,6 +1840,8 @@ static NSUInteger PositionAfterCursorEdit(NSUInteger position, const TypingEdit 
         point.anchor = PositionAfterCursorEdit(plan.selection.location, plan, batch);
         point.head = PositionAfterCursorEdit(NSMaxRange(plan.selection), plan, batch);
         point.column = Vim::NoOffset;
+        if (!batch.edits.empty())
+            point.beforeInlay = !plan.selection.length;
     }
     [self finishCursorTyping:batch];
     [self normalizeCursors];
@@ -1797,16 +1853,9 @@ static NSUInteger PositionAfterCursorEdit(NSUInteger position, const TypingEdit 
 
 - (void)registerVimUndo:(std::shared_ptr<Vim::Change>)change redo:(BOOL)redo
 {
-    NSUndoManager *undo = self.undoManager;
-    BOOL group = undo && undo.groupingLevel == 0;
-    if (group)
-        [undo beginUndoGrouping];
-    [undo registerUndoWithTarget:self handler:^(VimTextView *target) {
+    [self registerEditorUndo:^(VimTextView *target) {
         [target restoreVimChange:change redo:redo];
-    }];
-    [undo setActionName:@"Edit"];
-    if (group)
-        [undo endUndoGrouping];
+    } name:nil];
 }
 
 - (void)restoreVimChange:(std::shared_ptr<Vim::Change>)change redo:(BOOL)redo
@@ -1887,6 +1936,7 @@ static NSUInteger PositionAfterCursorEdit(NSUInteger position, const TypingEdit 
     Vim::Mode previousMode = _vim->mode;
     NSUInteger previousCursor = _vim->cursor;
     NSUInteger previousAnchor = _vim->anchor;
+    bool previousInlaySide = _vim->beforeInlay;
     bool hadMirrors = !_vim->insertMirrors.empty();
     NSUInteger displayedCursor = self.vimDisplayedCursor;
     bool scrollMotion = IsScrollMotion(key) && _vim->op == Vim::Op::None && _vim->prefix == Vim::Prefix::None;
@@ -1937,6 +1987,8 @@ static NSUInteger PositionAfterCursorEdit(NSUInteger position, const TypingEdit 
     }
     // Prefix keys and clearing a selection should leave a manually scrolled viewport alone.
     [self refreshVimSelection:!useViewport && !keepGliding && !visual && !clearWithoutScrolling];
+    if (previousInlaySide != _vim->beforeInlay)
+        [self updateInsertionPointStateAndRestartTimer:YES];
     if (leavingVisual)
         [self setNeedsDisplay:YES];
     if (_cursors.size() == 1)
@@ -1976,13 +2028,88 @@ static NSUInteger PositionAfterCursorEdit(NSUInteger position, const TypingEdit 
     return YES;
 }
 
+- (CGFloat)vimExtraGlyphWidthAt:(NSUInteger)position
+{
+    (void)position;
+    return 0;
+}
+
+- (CGFloat)inlayWidthAtInsertion:(NSUInteger)position
+{
+    (void)position;
+    return 0;
+}
+
+- (NSUInteger)inlayInsertionAtPoint:(NSPoint)point before:(BOOL *)before
+{
+    (void)point;
+    (void)before;
+    return NSNotFound;
+}
+
+- (CGFloat)insertionCaretInsetAt:(NSUInteger)position
+{
+    bool before = _vimEnabled ? _vim && _vim->cursor == position && _vim->beforeInlay : _plainBeforeInlay;
+    if (!before)
+        return 0;
+    NSRange selected = self.selectedRange;
+    return !selected.length && selected.location == position ? [self inlayWidthAtInsertion:position] : 0;
+}
+
+- (void)setPlainCaretBeforeInlay:(BOOL)before
+{
+    if (_plainBeforeInlay != before) {
+        _plainBeforeInlay = before;
+        [self updateInsertionPointStateAndRestartTimer:YES];
+    }
+}
+
+static NSRect InlayBlockRect(NSRect caret, CGFloat inset)
+{
+    caret.origin.x -= inset;
+    caret.size.width = std::min(caret.size.width, inset);
+    return caret;
+}
+
+- (void)revealInsertionAt:(NSUInteger)position
+{
+    CGFloat inset = [self insertionCaretInsetAt:position];
+    if (inset > 0) {
+        NSRect caret = [self vimCaretAt:position];
+        if (_vimEnabled && _vim->mode == Vim::Mode::Normal) {
+            caret = InlayBlockRect(caret, inset);
+        } else {
+            caret.origin.x -= inset;
+            caret.size.width = 1;
+        }
+        [self scrollRectToVisible:caret];
+    } else {
+        [self scrollRangeToVisible:NSMakeRange(position, 0)];
+    }
+}
+
+- (NSRect)firstRectForCharacterRange:(NSRange)range actualRange:(NSRangePointer)actual
+{
+    NSRect rect = [super firstRectForCharacterRange:range actualRange:actual];
+    if (!range.length && NSHeight(rect) > 0)
+        rect.origin.x -= [self insertionCaretInsetAt:range.location];
+    return rect;
+}
+
 - (NSRect)vimCaretAt:(NSUInteger)position
 {
     NSLayoutManager *layout = self.layoutManager;
     NSPoint origin = self.textContainerOrigin;
     NSFont *font = [self vimFont];
-    CGFloat width = [@"M" sizeWithAttributes:@{NSFontAttributeName:font}].width;
-    NSUInteger length = self.string.length;
+    if (_caretFont != font && ![_caretFont isEqual:font]) {
+        _caretFont = font;
+        NSDictionary *attributes = @{NSFontAttributeName:font};
+        _caretWidth = [@"M" sizeWithAttributes:attributes].width;
+        _caretSpaceWidth = [@" " sizeWithAttributes:attributes].width;
+    }
+    CGFloat width = _caretWidth;
+    NSString *text = self.string;
+    NSUInteger length = text.length;
     NSRect rect;
     if (position >= length) {
         if (length)
@@ -1997,7 +2124,7 @@ static NSUInteger PositionAfterCursorEdit(NSUInteger position, const TypingEdit 
         }
         rect.size.width = width;
     } else {
-        unichar character = [self.string characterAtIndex:position];
+        unichar character = [text characterAtIndex:position];
         bool whitespace = [NSCharacterSet.whitespaceAndNewlineCharacterSet characterIsMember:character];
         [layout ensureLayoutForCharacterRange:NSMakeRange(position, 1)];
         NSUInteger glyph = [layout glyphIndexForCharacterAtIndex:position];
@@ -2005,9 +2132,9 @@ static NSUInteger PositionAfterCursorEdit(NSUInteger position, const TypingEdit 
         rect = [layout lineFragmentRectForGlyphAtIndex:glyph effectiveRange:&fragment];
         CGFloat x = [layout locationForGlyphAtIndex:glyph].x;
         if (whitespace) {
-            width = [@" " sizeWithAttributes:@{NSFontAttributeName:font}].width;
+            width = _caretSpaceWidth;
         } else if (glyph + 1 < NSMaxRange(fragment)) {
-            width = std::max(1.0, [layout locationForGlyphAtIndex:glyph + 1].x - x);
+            width = std::max(1.0, [layout locationForGlyphAtIndex:glyph + 1].x - x - [self vimExtraGlyphWidthAt:position]);
         }
         rect.origin.x += x;
         rect.size.width = width;
@@ -2030,7 +2157,8 @@ static NSUInteger PositionAfterCursorEdit(NSUInteger position, const TypingEdit 
     if (NSIsEmptyRect(visible))
         return visible;
     if (context) {
-        CGFloat columns = std::clamp((NSWidth(visible) - NSWidth(caret)) / 2, 0.0, 2 * NSWidth(caret));
+        BOOL clipped = NSMinX(caret) < NSMinX(visible) || NSMaxX(caret) > NSMaxX(visible);
+        CGFloat columns = clipped ? std::clamp((NSWidth(visible) - NSWidth(caret)) / 2, 0.0, 2 * NSWidth(caret)) : 0;
         CGFloat rows = std::clamp((NSHeight(visible) - NSHeight(caret)) / 2, 0.0, 2 * NSHeight(caret));
         caret = NSInsetRect(caret, -columns, -rows);
     }
@@ -2044,14 +2172,100 @@ static NSUInteger PositionAfterCursorEdit(NSUInteger position, const TypingEdit 
 
 - (void)revealVimCaret:(NSRect)caret withContext:(BOOL)context
 {
-    [self setVimViewport:[self vimViewport:self.enclosingScrollView.documentVisibleRect
-                          revealingCaret:caret withContext:context]];
+    NSRect visible = self.enclosingScrollView.documentVisibleRect;
+    NSRect destination = [self vimViewport:visible revealingCaret:caret withContext:context];
+    if (!NSEqualRects(visible, destination))
+        [self setVimViewport:destination];
+}
+
+- (void)prepareLayoutAroundOffset:(NSUInteger)offset verticalMargin:(CGFloat)margin
+{
+    NSLayoutManager *layout = self.layoutManager;
+    CGFloat lineHeight = std::max(1.0, [layout defaultLineHeightForFont:[self vimFont]]);
+    NSUInteger rows = NSUInteger(std::ceil(margin / lineHeight)) + 2;
+    NSUInteger line = [self vimLineAtOffset:offset];
+    NSUInteger first = [self vimOffsetAtLine:[self vimStepRow:line down:NO count:rows]];
+    NSUInteger endLine = [self vimStepRow:line down:YES count:rows] + 1;
+    NSUInteger end = endLine < self.vimDocumentLineCount ? [self vimOffsetAtLine:endLine] : self.string.length;
+    [layout ensureLayoutForCharacterRange:NSMakeRange(first, end - first)];
+}
+
+- (void)centerEditorAtOffset:(NSUInteger)offset
+{
+    [self.window.contentView layoutSubtreeIfNeeded];
+    NSScrollView *scroll = self.enclosingScrollView;
+    NSRect viewport = scroll.documentVisibleRect;
+    if (NSIsEmptyRect(viewport))
+        return;
+
+    if (self.layoutManager.allowsNonContiguousLayout)
+        [self prepareLayoutAroundOffset:offset verticalMargin:NSHeight(viewport)];
+
+    NSRect caret = [self vimCaretAt:offset];
+    NSRect destination = [self vimViewport:scroll.documentVisibleRect revealingCaret:caret withContext:NO];
+    destination.origin.y = NSMidY(caret) - NSHeight(destination) / 2;
+    [self setVimViewport:destination];
+}
+
+- (void)scrollRangeToVisible:(NSRange)range
+{
+    NSScrollView *scroll = self.enclosingScrollView;
+    NSString *text = self.string;
+    if (!scroll || range.location > text.length || range.length > text.length - range.location) {
+        [super scrollRangeToVisible:range];
+        return;
+    }
+
+    // A definition jump can arrive before a new tab's viewport has been laid out.
+    if (NSIsEmptyRect(scroll.documentVisibleRect))
+        [self.window.contentView layoutSubtreeIfNeeded];
+
+    NSLayoutManager *layout = self.layoutManager;
+    NSRect viewport = scroll.documentVisibleRect;
+    if (layout.hasNonContiguousLayout && !NSIsEmptyRect(viewport)) {
+        Vim::Range visible = [self vimCharactersInViewport:viewport];
+        if (range.location < visible.first || range.location > visible.last)
+            [self prepareLayoutAroundOffset:range.location verticalMargin:NSHeight(viewport)];
+    }
+
+    NSRect target = NSZeroRect;
+    if (range.length) {
+        // Reveal the beginning of a multiline match without measuring the entire selection.
+        NSUInteger end;
+        [text getLineStart:nullptr end:nullptr contentsEnd:&end forRange:NSMakeRange(range.location, 0)];
+        if (end > range.location) {
+            range.length = std::min(NSMaxRange(range), end) - range.location;
+            NSRange glyphs = [layout glyphRangeForCharacterRange:range actualCharacterRange:nullptr];
+            NSPoint origin = self.textContainerOrigin;
+            target = NSOffsetRect([layout boundingRectForGlyphRange:glyphs inTextContainer:self.textContainer], origin.x, origin.y);
+        }
+    }
+    if (NSIsEmptyRect(target))
+        target = [self vimCaretAt:range.location];
+    [self revealVimCaret:target withContext:NO];
 }
 
 - (void)invalidateVimCaret
 {
     if (!NSIsEmptyRect(_vimCaretRect))
         [self setNeedsDisplayInRect:_vimCaretRect];
+}
+
+- (NSRect)vimDisplayedBlockCaret
+{
+    NSUInteger at = std::min(self.vimDisplayedCursor, self.string.length);
+    NSRect caret = [self vimCaretAt:at];
+    CGFloat inset = [self insertionCaretInsetAt:at];
+    return inset > 0 ? InlayBlockRect(caret, inset) : caret;
+}
+
+- (void)refreshVimCaretGeometry
+{
+    if (NSIsEmptyRect(_vimCaretRect))
+        return;
+    [self invalidateVimCaret];
+    _vimCaretRect = [self vimDisplayedBlockCaret];
+    [self invalidateVimCaret];
 }
 
 - (void)refreshVimSelection:(BOOL)scroll
@@ -2067,13 +2281,13 @@ static NSUInteger PositionAfterCursorEdit(NSUInteger position, const TypingEdit 
             self.selectedRange = NSMakeRange(cursor, 0);
         bool visual = Vim::IsVisual(_vim->mode);
         if (_vim->mode != Vim::Mode::Insert && _vim->mode != Vim::Mode::Command)
-            _vimCaretRect = [self vimCaretAt:std::min(self.vimDisplayedCursor, self.string.length)];
+            _vimCaretRect = [self vimDisplayedBlockCaret];
         if (visual && scroll) {
             [self revealVimCaret:_vimCaretRect withContext:YES];
         } else if (scroll) {
             NSUInteger reveal = _vim->searchPreview == Vim::NoOffset ? cursor :
                                 std::min(_vim->searchPreview, self.string.length);
-            [self scrollRangeToVisible:NSMakeRange(reveal, 0)];
+            [self revealInsertionAt:reveal];
         }
         BOOL highlights = visual || _vim->showMatches || self.vimCommandLine;
         if (_hadVimHighlight && !highlights)
@@ -2170,9 +2384,13 @@ static NSUInteger PositionAfterCursorEdit(NSUInteger position, const TypingEdit 
     NSPoint origin = [self clipBoundsForVimViewport:viewport].origin;
     if (!NSEqualPoints(origin, clip.bounds.origin)) {
         [clip scrollToPoint:origin];
+        if (_scrollAnimation) {
+            // A layout correction moves the whole animation with the text.
+            CGFloat shift = NSMinY(clip.bounds) - origin.y;
+            _scrollAnimation->from.y += shift;
+            _scrollAnimation->destination.y += shift;
+        }
         [scroll reflectScrolledClipView:clip];
-        // Recompose the visible text and overlays after AppKit moves the backing pixels.
-        [self setNeedsDisplayInRect:scroll.documentVisibleRect];
     }
 }
 
@@ -2289,8 +2507,14 @@ static NSUInteger PositionAfterCursorEdit(NSUInteger position, const TypingEdit 
 
 - (void)drawInsertionPointInRect:(NSRect)rect color:(NSColor *)color turnedOn:(BOOL)on
 {
-    if (!_hidesNativeInsertionPoint && !self.usesSeparateInsertionIndicator)
-        [super drawInsertionPointInRect:rect color:color turnedOn:on];
+    if (_hidesNativeInsertionPoint || self.usesSeparateInsertionIndicator)
+        return;
+    if ([self insertionCaretInsetAt:self.selectedRange.location] > 0) {
+        _inlayCaret.hidden = !on;
+        return;
+    }
+    _inlayCaret.hidden = YES;
+    [super drawInsertionPointInRect:rect color:color turnedOn:on];
 }
 
 - (BOOL)usesSeparateInsertionIndicator
@@ -2302,22 +2526,44 @@ static NSUInteger PositionAfterCursorEdit(NSUInteger position, const TypingEdit 
 
 - (void)updateInsertionIndicator
 {
+    NSWindow *window = self.window;
+    NSRange selection = self.selectedRange;
+    BOOL separate = self.usesSeparateInsertionIndicator;
+    CGFloat inset = [self insertionCaretInsetAt:selection.location];
+    if (_hidesNativeInsertionPoint || (!separate && inset <= 0) || !window.isKeyWindow ||
+        window.firstResponder != self || selection.location == NSNotFound || selection.length || !super.shouldDrawInsertionPoint) {
+        _inlayCaret.hidden = YES;
+        if (@available(macOS 14.0, *))
+            ((NSTextInsertionIndicator *)_insertionIndicator).displayMode = NSTextInsertionIndicatorDisplayModeHidden;
+        return;
+    }
+
+    NSRect screenRect = [self firstRectForCharacterRange:selection actualRange:nullptr];
+    NSRect rect;
+    if (NSHeight(screenRect) > 0) {
+        rect = [self convertRect:[window convertRectFromScreen:screenRect] fromView:nil];
+    } else {
+        rect = [self vimCaretAt:selection.location];
+        rect.origin.x -= inset;
+    }
+    rect.size.width = 1;
+    rect = [self backingAlignedRect:rect options:NSAlignAllEdgesNearest];
+    if (!separate) {
+        if (!_inlayCaret) {
+            // The system caret still drives blinking on systems without a separate indicator.
+            _inlayCaret = [[EditorInlayCaret alloc] initWithFrame:rect];
+            [self addSubview:_inlayCaret positioned:NSWindowAbove relativeTo:nil];
+        } else {
+            _inlayCaret.frame = rect;
+        }
+        _inlayCaret.color = self.insertionPointColor;
+        _inlayCaret.hidden = NO;
+        return;
+    }
+
+    _inlayCaret.hidden = YES;
     if (@available(macOS 14.0, *)) {
         NSTextInsertionIndicator *indicator = (NSTextInsertionIndicator *)_insertionIndicator;
-        NSWindow *window = self.window;
-        NSRange selection = self.selectedRange;
-        if (_hidesNativeInsertionPoint || !self.usesSeparateInsertionIndicator || !window.isKeyWindow ||
-            window.firstResponder != self || selection.location == NSNotFound || selection.length ||
-            !super.shouldDrawInsertionPoint) {
-            indicator.displayMode = NSTextInsertionIndicatorDisplayModeHidden;
-            return;
-        }
-
-        NSRect screenRect = [self firstRectForCharacterRange:selection actualRange:nullptr];
-        NSRect rect = NSHeight(screenRect) > 0 ? [self convertRect:[window convertRectFromScreen:screenRect] fromView:nil]
-                                              : [self vimCaretAt:selection.location];
-        rect.size.width = 1;
-        rect = [self backingAlignedRect:rect options:NSAlignAllEdgesNearest];
         if (!indicator) {
             // Blink in a separate view so a caret tick never repaints the editor.
             indicator = [[EditorInsertionIndicator alloc] initWithFrame:rect];
@@ -2337,7 +2583,8 @@ static NSUInteger PositionAfterCursorEdit(NSUInteger position, const TypingEdit 
 - (void)updateInsertionPointStateAndRestartTimer:(BOOL)restartFlag
 {
     [super updateInsertionPointStateAndRestartTimer:restartFlag];
-    if (_insertionIndicatorPending || (!_insertionIndicator && !self.usesSeparateInsertionIndicator))
+    if (_insertionIndicatorPending || (!_insertionIndicator && !_inlayCaret && !self.usesSeparateInsertionIndicator &&
+        [self insertionCaretInsetAt:self.selectedRange.location] <= 0))
         return;
     _insertionIndicatorPending = YES;
     __weak VimTextView *view = self;
@@ -2350,7 +2597,7 @@ static NSUInteger PositionAfterCursorEdit(NSUInteger position, const TypingEdit 
     });
 }
 
-- (void)enumerateVimRects:(const std::vector<Vim::Range> &)ranges linewise:(BOOL)linewise
+- (void)enumerateVimRects:(std::span<const Vim::Range>)ranges linewise:(BOOL)linewise
                  handler:(void (^)(NSRect))handler
 {
     Vim::Range visible = [self visibleVimCharacters];
@@ -2385,8 +2632,8 @@ static NSUInteger PositionAfterCursorEdit(NSUInteger position, const TypingEdit 
 
 - (void)invalidateVimFlash
 {
-    for (NSValue *rect in _flashRects)
-        [self setNeedsDisplayInRect:rect.rectValue];
+    for (NSRect rect : _flashRects)
+        [self setNeedsDisplayInRect:rect];
 }
 
 - (void)cancelVimFlash
@@ -2394,20 +2641,18 @@ static NSUInteger PositionAfterCursorEdit(NSUInteger position, const TypingEdit 
     [self invalidateVimFlash];
     [_flashTimer invalidate];
     _flashTimer = nil;
-    _flashRects = nil;
+    std::vector<NSRect>().swap(_flashRects);
 }
 
 - (void)flashVimRanges:(const std::vector<Vim::Range> &)ranges linewise:(BOOL)linewise
 {
     [self cancelVimFlash];
-    NSMutableArray<NSValue *> *rectangles = [NSMutableArray array];
     [self enumerateVimRects:ranges linewise:linewise handler:^(NSRect rect) {
         if (NSIntersectsRect(rect, self.visibleRect))
-            [rectangles addObject:[NSValue valueWithRect:rect]];
+            _flashRects.push_back(rect);
     }];
-    if (!rectangles.count)
+    if (_flashRects.empty())
         return;
-    _flashRects = rectangles;
     _flashStart = NSProcessInfo.processInfo.systemUptime;
     __weak VimTextView *view = self;
     _flashTimer = [NSTimer timerWithTimeInterval:1.0 / 60 repeats:YES block:^(NSTimer *timer) {
@@ -2425,9 +2670,9 @@ static NSUInteger PositionAfterCursorEdit(NSUInteger position, const TypingEdit 
 }
 
 - (void)drawVimOverlays:(NSRect)dirty selection:(NSColor *)selection flash:(NSColor *)flash
-        selectedRanges:(std::vector<NSRange> *)ranges blockCarets:(std::vector<VimBlockCaret> *)blocks
+        selectedRanges:(std::vector<NSRange> *)ranges blockCarets:(std::vector<VimBlockCaret> &)blocks contrastingCaret:(BOOL)contrasting
 {
-    if (!_vimEnabled && _cursors.empty() && !_flashRects.count)
+    if (!_vimEnabled && _cursors.empty() && _flashRects.empty())
         return;
     if (_vimEnabled && (_vim->showMatches || self.vimCommandLine)) {
         auto matches = Vim::SearchHighlights(*_vim, [self vimHost], [self visibleVimCharacters]);
@@ -2438,22 +2683,42 @@ static NSUInteger PositionAfterCursorEdit(NSUInteger position, const TypingEdit 
             }];
         }
     }
-    void (^drawSelection)(const Vim::Selection &) = ^(const Vim::Selection &selected) {
+    auto drawSelection = [&](std::span<const Vim::Range> selected, bool linewise) {
         if (ranges) {
-            for (auto range : selected.ranges) {
+            for (auto range : selected) {
                 if (!range.empty())
                     ranges->push_back(CocoaRange(range));
             }
         }
         [selection setFill];
-        [self enumerateVimRects:selected.ranges linewise:selected.kind == Vim::Kind::Line handler:^(NSRect rect) {
+        [self enumerateVimRects:selected linewise:linewise handler:^(NSRect rect) {
             NSRectFill(NSIntersectionRect(rect, dirty));
         }];
     };
     if (_vimEnabled && !_selectingWithMouse && Vim::IsVisual(_vim->mode)) {
         auto selected = Vim::Selected(*_vim, [self vimHost], [self visibleVimCharacters], self.vimDisplayedCursor);
-        drawSelection(selected);
+        drawSelection(selected.ranges, selected.kind == Vim::Kind::Line);
     }
+    auto drawCaret = [&](NSRect caret, NSUInteger at, Vim::Mode mode, bool atInlay) {
+        if (!NSIntersectsRect(caret, dirty))
+            return;
+
+        bool thin = mode == Vim::Mode::Insert;
+        if (mode == Vim::Mode::Replace) {
+            caret.origin.y = NSMaxY(caret) - 3;
+            caret.size.height = 3;
+        } else if (thin) {
+            caret.size.width = 1;
+        } else if (contrasting || atInlay) {
+            // Paint the virtual block after the hint so its background cannot cover it.
+            blocks.push_back({caret, atInlay ? NSNotFound : at});
+            return;
+        }
+
+        NSColor *color = self.insertionPointColor;
+        [contrasting ? color : [color colorWithAlphaComponent:thin ? 0.9 : 0.39] setFill];
+        NSRectFillUsingOperation(NSIntersectionRect(caret, dirty), NSCompositingOperationSourceOver);
+    };
     BOOL focused = (self.window.isKeyWindow && self.window.firstResponder == self) || !self.window;
     if (_cursors.size() > 1) {
         auto visible = [self vimCharactersInViewport:dirty];
@@ -2467,63 +2732,43 @@ static NSUInteger PositionAfterCursorEdit(NSUInteger position, const TypingEdit 
             const auto &point = it->position;
             if (point.primary)
                 continue;
-            bool visual = _vimEnabled && Vim::IsVisual(point.mode);
-            if (visual || (!_vimEnabled && point.anchor != point.head)) {
-                Vim::Selection selected;
-                if (visual)
-                    selected = Vim::Selected(*it->state, host, visible);
-                else
-                    selected.ranges.push_back(ToVimRange(point.range(false)));
-                drawSelection(selected);
+            if (_vimEnabled && Vim::IsVisual(point.mode)) {
+                auto selected = Vim::Selected(*it->state, host, visible);
+                drawSelection(selected.ranges, selected.kind == Vim::Kind::Line);
+            } else if (!_vimEnabled && point.anchor != point.head) {
+                Vim::Range selected = ToVimRange(point.range(false));
+                drawSelection({&selected, 1}, false);
             }
             if (!focused || point.head < visible.first || point.head > visible.last)
                 continue;
             NSRect caret = [self vimCaretAt:point.head];
-            bool thin = !_vimEnabled || point.mode == Vim::Mode::Insert;
-            bool replace = point.mode == Vim::Mode::Replace;
-            if (thin)
-                caret.size.width = 1;
-            else if (replace) {
-                caret.origin.y = NSMaxY(caret) - 3;
-                caret.size.height = 3;
+            CGFloat inset = point.beforeInlay ? [self inlayWidthAtInsertion:point.head] : 0;
+            Vim::Mode mode = _vimEnabled ? point.mode : Vim::Mode::Insert;
+            if (inset > 0) {
+                if (mode == Vim::Mode::Insert)
+                    caret.origin.x -= inset + 1;
+                else
+                    caret = InlayBlockRect(caret, inset);
             }
-            if (blocks && !thin && !replace) {
-                if (NSIntersectsRect(caret, dirty))
-                    blocks->push_back({caret, point.head});
-            } else {
-                NSColor *color = self.insertionPointColor;
-                [blocks ? color : [color colorWithAlphaComponent:thin ? 0.9 : 0.39] setFill];
-                NSRectFillUsingOperation(NSIntersectionRect(caret, dirty), NSCompositingOperationSourceOver);
-            }
+            drawCaret(caret, point.head, mode, inset > 0);
         }
     }
-    if (_flashRects.count) {
+    if (!_flashRects.empty()) {
         CGFloat remaining = std::clamp(1 - (NSProcessInfo.processInfo.systemUptime - _flashStart) / yankDuration, 0.0, 1.0);
         [[flash colorWithAlphaComponent:remaining * remaining * 0.84] setFill];
-        for (NSValue *rect in _flashRects)
-            NSRectFillUsingOperation(NSIntersectionRect(rect.rectValue, dirty), NSCompositingOperationSourceOver);
+        for (NSRect rect : _flashRects)
+            NSRectFillUsingOperation(NSIntersectionRect(rect, dirty), NSCompositingOperationSourceOver);
     }
     if (_vimEnabled && focused && !_selectingWithMouse) {
         if (NSIntersectsRect(_vimCaretRect, dirty)) {
-            NSRect caret = _vimCaretRect;
-            bool replace = _vim->mode == Vim::Mode::Replace;
-            if (blocks && !replace) {
-                blocks->push_back({caret, self.vimDisplayedCursor});
-            } else {
-                if (replace) {
-                    caret.origin.y = NSMaxY(caret) - 3;
-                    caret.size.height = 3;
-                }
-                NSColor *color = self.insertionPointColor;
-                [blocks ? color : [color colorWithAlphaComponent:0.39] setFill];
-                NSRectFillUsingOperation(NSIntersectionRect(caret, dirty), NSCompositingOperationSourceOver);
-            }
+            NSUInteger at = self.vimDisplayedCursor;
+            drawCaret(_vimCaretRect, at, _vim->mode, [self insertionCaretInsetAt:at] > 0);
         }
         if (!_vim->insertMirrors.empty()) {
             auto visible = [self visibleVimCharacters];
             const auto &mirrors = _vim->insertMirrors;
             NSColor *color = self.insertionPointColor;
-            [blocks ? color : [color colorWithAlphaComponent:0.85] setFill];
+            [contrasting ? color : [color colorWithAlphaComponent:0.85] setFill];
             for (auto at = std::lower_bound(mirrors.begin(), mirrors.end(), visible.first);
                  at != mirrors.end() && *at <= visible.last; ++at) {
                 NSRect caret = [self vimCaretAt:*at];
@@ -2538,7 +2783,9 @@ static NSUInteger PositionAfterCursorEdit(NSUInteger position, const TypingEdit 
 {
     if (!_composition.length || self.vimCommandLine)
         return;
-    NSRect caret = [self vimCaretAt:_vimEnabled ? _vim->cursor : self.selectedRange.location];
+    NSUInteger at = _vimEnabled ? _vim->cursor : self.selectedRange.location;
+    NSRect caret = [self vimCaretAt:at];
+    caret.origin.x -= [self insertionCaretInsetAt:at];
     NSFont *font = [self vimFont];
     NSDictionary *attrs = @{NSFontAttributeName:font, NSForegroundColorAttributeName:self.insertionPointColor,
                             NSBackgroundColorAttributeName:self.backgroundColor,
@@ -2636,15 +2883,12 @@ static NSEventModifierFlags EditorModifiers(NSEvent *event)
     return [super performKeyEquivalent:event];
 }
 
-- (BOOL)handlePlainCursorKey:(NSEvent *)event
+- (BOOL)handlePlainCursorKey:(Vim::Key)key modifiers:(NSEventModifierFlags)flags
 {
-    if (_vimEnabled || _cursors.size() < 2 || _composition.length)
+    if (_vimEnabled || _cursors.size() < 2 || (flags & NSEventModifierFlagControl))
         return NO;
+
     using Vim::Key;
-    auto flags = EditorModifiers(event);
-    if (flags & NSEventModifierFlagControl)
-        return NO;
-    Key key = EventKey(event, false);
     bool command = flags & NSEventModifierFlagCommand;
     bool option = flags & NSEventModifierFlagOption;
     bool extend = flags & NSEventModifierFlagShift;
@@ -2674,6 +2918,7 @@ static NSEventModifierFlags EditorModifiers(NSEvent *event)
             [self movePlainCursors:command ? (key == Key::Up ? Key::DocumentStart : Key::DocumentEnd) : key extend:extend];
             return YES;
         case Key::PageUp: case Key::PageDown: case Key::Home: case Key::End:
+        case Key::DocumentStart: case Key::DocumentEnd:
             [self movePlainCursors:key extend:extend];
             return YES;
         default:
@@ -2681,51 +2926,58 @@ static NSEventModifierFlags EditorModifiers(NSEvent *event)
     }
 }
 
-- (BOOL)handlePlainCursorCommand:(SEL)selector
+struct CursorCommand {
+    Vim::Key key = Vim::Key::None;
+    NSEventModifierFlags modifiers = 0;
+    bool inVim = false;
+    bool smart = false;
+};
+
+static CursorCommand CommandForSelector(SEL selector)
 {
-    if (_vimEnabled || _cursors.size() < 2)
-        return NO;
     using Vim::Key;
-    if (selector == @selector(cancelOperation:)) {
-        [self clearAdditionalCursors];
-    } else if (selector == @selector(deleteBackward:)) {
-        [self editPlainCursors:Key::Backspace text:nil deletion:Key::Left smart:YES];
-    } else if (selector == @selector(deleteForward:)) {
-        [self editPlainCursors:Key::Delete text:nil deletion:Key::Right smart:NO];
-    } else if (selector == @selector(deleteWordBackward:)) {
-        [self editPlainCursors:Key::Backspace text:nil deletion:Key::WordLeft smart:NO];
-    } else if (selector == @selector(deleteWordForward:)) {
-        [self editPlainCursors:Key::Delete text:nil deletion:Key::WordRight smart:NO];
-    } else if (selector == @selector(deleteToBeginningOfLine:) || selector == @selector(deleteToBeginningOfParagraph:)) {
-        [self editPlainCursors:Key::Backspace text:nil deletion:Key::Home smart:NO];
-    } else if (selector == @selector(deleteToEndOfLine:) || selector == @selector(deleteToEndOfParagraph:)) {
-        [self editPlainCursors:Key::Delete text:nil deletion:Key::End smart:NO];
-    } else if (selector == @selector(insertNewline:) || selector == @selector(insertLineBreak:)) {
-        [self editPlainCursors:Key::Enter text:nil deletion:Key::None smart:YES];
-    } else if (selector == @selector(insertTab:) || selector == @selector(insertBacktab:)) {
-        [self editPlainCursors:selector == @selector(insertTab:) ? Key::Tab : Key::Backtab
-                          text:nil deletion:Key::None smart:YES];
-    } else {
-        static const struct { SEL action; Key key; } motions[] = {
-            {@selector(moveLeft:), Key::Left}, {@selector(moveBackward:), Key::Left},
-            {@selector(moveRight:), Key::Right}, {@selector(moveForward:), Key::Right},
-            {@selector(moveUp:), Key::Up}, {@selector(moveDown:), Key::Down},
-            {@selector(moveWordLeft:), Key::WordLeft}, {@selector(moveWordBackward:), Key::WordLeft},
-            {@selector(moveWordRight:), Key::WordRight}, {@selector(moveWordForward:), Key::WordRight},
-            {@selector(moveToBeginningOfLine:), Key::Home}, {@selector(moveToBeginningOfParagraph:), Key::Home},
-            {@selector(moveToEndOfLine:), Key::End}, {@selector(moveToEndOfParagraph:), Key::End},
-            {@selector(moveToBeginningOfDocument:), Key::DocumentStart}, {@selector(moveToEndOfDocument:), Key::DocumentEnd},
-            {@selector(pageUp:), Key::PageUp}, {@selector(pageDown:), Key::PageDown},
-        };
-        for (const auto &motion : motions) {
-            if (selector == motion.action) {
-                [self movePlainCursors:motion.key extend:NO];
-                return YES;
-            }
-        }
-        return NO;
+    static const struct {
+        SEL selector;
+        CursorCommand command;
+    } bindings[] = {
+        {@selector(cancelOperation:), {Key::Escape, 0, true}},
+        {@selector(deleteBackward:), {Key::Backspace, 0, true, true}},
+        {@selector(deleteForward:), {Key::Delete, 0, true}},
+        {@selector(insertNewline:), {Key::Enter, 0, true, true}},
+        {@selector(insertLineBreak:), {Key::Enter, 0, true, true}},
+        {@selector(insertTab:), {Key::Tab, 0, true, true}},
+        {@selector(insertBacktab:), {Key::Backtab, 0, true, true}},
+        {@selector(moveLeft:), {Key::Left, 0, true}},
+        {@selector(moveBackward:), {Key::Left, 0, true}},
+        {@selector(moveRight:), {Key::Right, 0, true}},
+        {@selector(moveForward:), {Key::Right, 0, true}},
+        {@selector(moveUp:), {Key::Up, 0, true}},
+        {@selector(moveDown:), {Key::Down, 0, true}},
+        {@selector(deleteWordBackward:), {Key::Backspace, NSEventModifierFlagOption}},
+        {@selector(deleteWordForward:), {Key::Delete, NSEventModifierFlagOption}},
+        {@selector(deleteToBeginningOfLine:), {Key::Backspace, NSEventModifierFlagCommand}},
+        {@selector(deleteToBeginningOfParagraph:), {Key::Backspace, NSEventModifierFlagCommand}},
+        {@selector(deleteToEndOfLine:), {Key::Delete, NSEventModifierFlagCommand}},
+        {@selector(deleteToEndOfParagraph:), {Key::Delete, NSEventModifierFlagCommand}},
+        {@selector(moveWordLeft:), {Key::WordLeft}},
+        {@selector(moveWordBackward:), {Key::WordLeft}},
+        {@selector(moveWordRight:), {Key::WordRight}},
+        {@selector(moveWordForward:), {Key::WordRight}},
+        {@selector(moveToBeginningOfLine:), {Key::Home}},
+        {@selector(moveToBeginningOfParagraph:), {Key::Home}},
+        {@selector(moveToEndOfLine:), {Key::End}},
+        {@selector(moveToEndOfParagraph:), {Key::End}},
+        {@selector(moveToBeginningOfDocument:), {Key::DocumentStart}},
+        {@selector(moveToEndOfDocument:), {Key::DocumentEnd}},
+        {@selector(pageUp:), {Key::PageUp}},
+        {@selector(pageDown:), {Key::PageDown}},
+    };
+    for (const auto &binding : bindings) {
+        if (selector == binding.selector)
+            return binding.command;
     }
-    return YES;
+
+    return {};
 }
 
 - (BOOL)addCursorAtMouse:(NSEvent *)event
@@ -2736,13 +2988,13 @@ static NSEventModifierFlags EditorModifiers(NSEvent *event)
     [self.window makeFirstResponder:self];
     [self startAddingCursors];
     [self resetOccurrenceSearch];
-    NSUInteger at = std::min(self.string.length,
-        [self characterIndexForInsertionAtPoint:[self convertPoint:event.locationInWindow fromView:nil]]);
-    if (_vimEnabled && !self.vimInserting) {
-        auto state = [self stateForNewCursor];
-        Vim::SetCursor(*state, [self vimHost], at);
-        at = state->cursor;
-    }
+    NSPoint click = [self convertPoint:event.locationInWindow fromView:nil];
+    BOOL beforeInlay = NO;
+    NSUInteger at = [self inlayInsertionAtPoint:click before:&beforeInlay];
+    if (at == NSNotFound)
+        at = std::min(self.string.length, [self characterIndexForInsertionAtPoint:click]);
+    if (_vimEnabled && !self.vimInserting)
+        at = Vim::ClampNormalCursor([self vimHost], at, _vim->finalNewline);
     auto previous = std::find_if(_cursors.begin(), _cursors.end(), [&](const EditorCursor &cursor) {
         NSRange range = [self selectionForCursor:cursor];
         return range.length ? NSLocationInRange(at, range) : range.location == at;
@@ -2763,6 +3015,7 @@ static NSEventModifierFlags EditorModifiers(NSEvent *event)
         CursorPosition point{at, at};
         if (_vimEnabled)
             point.mode = _vim->mode;
+        point.beforeInlay = beforeInlay;
         [self appendCursor:point];
     }
     [self publishCursorSelection:NO];
@@ -2774,7 +3027,8 @@ static NSEventModifierFlags EditorModifiers(NSEvent *event)
     if ([self handleCursorShortcut:event])
         return;
     _skipOccurrence = NO;
-    if ([self handlePlainCursorKey:event])
+    if (!_vimEnabled && _cursors.size() > 1 && !_composition.length &&
+        [self handlePlainCursorKey:EventKey(event, false) modifiers:EditorModifiers(event)])
         return;
     if (!_vimEnabled && _composition.length && EventKey(event, false) == Vim::Key::Escape) {
         _composition = nil;
@@ -2822,67 +3076,78 @@ static NSEventModifierFlags EditorModifiers(NSEvent *event)
 
 - (void)doCommandBySelector:(SEL)selector
 {
+    using Vim::Key;
     if (!_vimEnabled) {
-        if (![self handlePlainCursorCommand:selector])
+        if (_cursors.size() > 1) {
+            auto command = CommandForSelector(selector);
+            if ([self handlePlainCursorKey:command.key modifiers:command.modifiers])
+                return;
+        }
+
+        bool right = selector == @selector(moveRight:) || selector == @selector(moveForward:);
+        bool left = selector == @selector(moveLeft:) || selector == @selector(moveBackward:);
+        NSRange selection = self.selectedRange;
+        if ((!left && !right) || selection.length || selection.location == NSNotFound || self.hasMarkedText) {
             [super doCommandBySelector:selector];
+            return;
+        }
+
+        if (_plainBeforeInlay == right && [self inlayWidthAtInsertion:selection.location] > 0) {
+            [self setPlainCaretBeforeInlay:!right];
+            [self revealInsertionAt:selection.location];
+            return;
+        }
+
+        [super doCommandBySelector:selector];
+        NSRange moved = self.selectedRange;
+        if (right && !moved.length && moved.location != selection.location && [self inlayWidthAtInsertion:moved.location] > 0) {
+            [self setPlainCaretBeforeInlay:YES];
+            [self revealInsertionAt:moved.location];
+        }
         return;
     }
-    using Vim::Key;
-    if (selector == @selector(deleteBackward:))
-        [self applyVimKey:Vim::IsVisual(_vim->mode) ? Key::Delete : Key::Backspace text:nil smart:YES];
-    else if (selector == @selector(deleteForward:))
-        [self applyVimKey:Key::Delete text:nil];
-    else if (selector == @selector(insertNewline:) || selector == @selector(insertLineBreak:))
-        [self applyVimKey:Key::Enter text:nil smart:YES];
-    else if (selector == @selector(insertTab:))
-        [self applyVimKey:Key::Tab text:nil smart:YES];
-    else if (selector == @selector(insertBacktab:))
-        [self applyVimKey:Key::Backtab text:nil smart:YES];
-    else if (selector == @selector(cancelOperation:))
-        [self applyVimKey:Key::Escape text:nil];
-    else if (selector == @selector(moveLeft:))
-        [self applyVimKey:Key::Left text:nil];
-    else if (selector == @selector(moveRight:))
-        [self applyVimKey:Key::Right text:nil];
-    else if (selector == @selector(moveUp:))
-        [self applyVimKey:Key::Up text:nil];
-    else if (selector == @selector(moveDown:))
-        [self applyVimKey:Key::Down text:nil];
+    auto command = CommandForSelector(selector);
+    if (command.inVim) {
+        Key key = command.key;
+        if (key == Key::Backspace && Vim::IsVisual(_vim->mode))
+            key = Key::Delete;
+        [self applyVimKey:key text:nil smart:command.smart];
+    }
 }
 
 - (void)insertNewline:(id)sender
 {
-    if (![self handlePlainCursorCommand:@selector(insertNewline:)])
+    if (![self handlePlainCursorKey:Vim::Key::Enter modifiers:0])
         [super insertNewline:sender];
 }
 
 - (void)insertLineBreak:(id)sender
 {
-    if (![self handlePlainCursorCommand:@selector(insertLineBreak:)])
+    if (![self handlePlainCursorKey:Vim::Key::Enter modifiers:0])
         [super insertLineBreak:sender];
 }
 
 - (void)insertTab:(id)sender
 {
-    if (![self handlePlainCursorCommand:@selector(insertTab:)])
+    if (![self handlePlainCursorKey:Vim::Key::Tab modifiers:0])
         [super insertTab:sender];
 }
 
 - (void)insertBacktab:(id)sender
 {
-    if (![self handlePlainCursorCommand:@selector(insertBacktab:)])
+    if (![self handlePlainCursorKey:Vim::Key::Backtab modifiers:0])
         [super insertBacktab:sender];
 }
 
 - (void)deleteBackward:(id)sender
 {
-    if (![self handlePlainCursorCommand:@selector(deleteBackward:)])
+    if (![self handlePlainCursorKey:Vim::Key::Backspace modifiers:0])
         [super deleteBackward:sender];
 }
 
 - (void)deleteForward:(id)sender
 {
-    if (![self handlePlainCursorCommand:@selector(deleteForward:)])
+    if (![self handlePlainCursorKey:Vim::Key::Delete modifiers:0])
         [super deleteForward:sender];
 }
 
@@ -2959,10 +3224,15 @@ static NSEventModifierFlags EditorModifiers(NSEvent *event)
     [self clearAdditionalCursors];
     BOOL track = _vimEnabled && !_applyingKey;
     NSUInteger anchor = 0;
+    NSUInteger inlay = NSNotFound;
+    BOOL beforeInlay = NO;
+    NSPoint click = [self convertPoint:event.locationInWindow fromView:nil];
+    if (event.clickCount == 1 && !(event.modifierFlags & NSEventModifierFlagShift))
+        inlay = [self inlayInsertionAtPoint:click before:&beforeInlay];
     if (track && event.clickCount == 1) {
         anchor = self.selectedRange.location;
         if (!(event.modifierFlags & NSEventModifierFlagShift))
-            anchor = [self characterIndexForInsertionAtPoint:[self convertPoint:event.locationInWindow fromView:nil]];
+            anchor = inlay == NSNotFound ? [self characterIndexForInsertionAtPoint:click] : inlay;
     }
     _selectingWithMouse = track;
     if (track) {
@@ -2972,11 +3242,21 @@ static NSEventModifierFlags EditorModifiers(NSEvent *event)
     }
     [super mouseDown:event];
     _selectingWithMouse = NO;
+    bool hitInlay = inlay != NSNotFound && !self.selectedRange.length;
+    if (hitInlay)
+        self.selectedRange = NSMakeRange(inlay, 0);
     if (track && _vimEnabled) {
         NSRange selection = self.selectedRange;
         bool backwards = selection.length && anchor >= NSMaxRange(selection);
+        bool oldSide = _vim->beforeInlay;
         Vim::MouseSelection(*_vim, [self vimHost], ToVimRange(selection), backwards);
+        _vim->beforeInlay = hitInlay && beforeInlay && _vim->cursor == inlay &&
+                           (_vim->mode == Vim::Mode::Insert || _vim->mode == Vim::Mode::Normal);
         [self refreshVimSelection:selection.length != 0];
+        if (oldSide != _vim->beforeInlay)
+            [self updateInsertionPointStateAndRestartTimer:YES];
+    } else if (!_vimEnabled) {
+        [self setPlainCaretBeforeInlay:hitInlay && beforeInlay];
     }
 }
 
@@ -3004,30 +3284,32 @@ static NSEventModifierFlags EditorModifiers(NSEvent *event)
     return [super resignFirstResponder];
 }
 
+- (void)undoOrRedo:(BOOL)redo
+{
+    if (_vimEnabled && !Vim::IsInsert(_vim->mode)) {
+        [self applyVimKey:redo ? Vim::Key(18) : Vim::Key('u') text:nil];
+        return;
+    }
+
+    [self finishVimChange];
+    [self finishCursorChange];
+    [self breakUndoCoalescing];
+    if (redo)
+        [self.undoManager redo];
+    else
+        [self.undoManager undo];
+}
+
 - (void)undo:(id)sender
 {
     (void)sender;
-    if (_vimEnabled && !Vim::IsInsert(_vim->mode)) {
-        [self applyVimKey:Vim::Key('u') text:nil];
-    } else {
-        [self finishVimChange];
-        [self finishCursorChange];
-        [self breakUndoCoalescing];
-        [self.undoManager undo];
-    }
+    [self undoOrRedo:NO];
 }
 
 - (void)redo:(id)sender
 {
     (void)sender;
-    if (_vimEnabled && !Vim::IsInsert(_vim->mode)) {
-        [self applyVimKey:Vim::Key(18) text:nil];
-    } else {
-        [self finishVimChange];
-        [self finishCursorChange];
-        [self breakUndoCoalescing];
-        [self.undoManager redo];
-    }
+    [self undoOrRedo:YES];
 }
 
 - (void)copyVimSelectionAndCut:(BOOL)cut
@@ -3056,8 +3338,7 @@ static NSEventModifierFlags EditorModifiers(NSEvent *event)
 - (void)copyPlainCursorsAndCut:(BOOL)cut
 {
     NSMutableString *text = [NSMutableString string];
-    std::vector<std::shared_ptr<const Vim::Register>> parts;
-    parts.reserve(_cursors.size());
+    NSMutableArray<NSDictionary *> *parts = [NSMutableArray arrayWithCapacity:_cursors.size()];
     NSString *document = self.string;
     for (auto &cursor : _cursors) {
         NSRange range = cursor.position.range(false);
@@ -3071,17 +3352,14 @@ static NSEventModifierFlags EditorModifiers(NSEvent *event)
             [text appendString:@"\n"];
         NSString *fragment = [document substringWithRange:range];
         [text appendString:fragment];
-        auto part = std::make_shared<Vim::Register>();
-        part->text = Units(fragment);
-        part->kind = line ? Vim::Kind::Line : Vim::Kind::Character;
-        parts.push_back(std::move(part));
+        [parts addObject:@{@"text":fragment, @"kind":@(NSUInteger(line ? Vim::Kind::Line : Vim::Kind::Character)), @"width":@0}];
         if (cut) {
             cursor.position.anchor = range.location;
             cursor.position.head = NSMaxRange(range);
         }
     }
     if (text.length)
-        WriteEditorClipboard(Units(text), &parts);
+        WriteEditorClipboard(text, parts);
     if (cut)
         [self editPlainCursors:Vim::Key::Delete text:@"" deletion:Vim::Key::None smart:NO];
 }

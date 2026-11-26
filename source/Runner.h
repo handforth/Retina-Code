@@ -3,23 +3,7 @@
 #import <Foundation/Foundation.h>
 #include "Lexer.hpp"
 
-enum class OutputTone { Text, Warning, Error };
-
-// ANSI truecolors are opaque RGBA. The low values hold the default and palette indices.
-inline constexpr uint32_t defaultOutputColor = 0;
-inline constexpr uint32_t outputPaletteStart = 1;
-
-struct OutputColors {
-    uint32_t foreground = defaultOutputColor;
-    uint32_t background = defaultOutputColor;
-
-    bool operator==(const OutputColors &) const = default;
-};
-
-struct OutputColorSpan {
-    NSRange range;
-    OutputColors colors;
-};
+#include "RunText.hpp"
 
 inline constexpr NSUInteger outputScrollbackCharacters = 192 * 1024;
 inline constexpr NSUInteger outputScrollbackLines = 3000;
@@ -39,6 +23,7 @@ struct RunLocation {
     NSUInteger endColumn = 0;
     bool currentSource = false;
     bool byteColumns = true;
+    bool utf16Columns = false;
 };
 
 struct RunMessage {
@@ -50,6 +35,7 @@ struct RunMessage {
     NSRange linkRange = {NSNotFound, 0};
     bool usesTerminalColors = false;
     std::vector<OutputColorSpan> colorSpans{};
+    NSString *diagnosticLabel = nil;
 };
 
 using RunOutput = void (^)(const std::vector<RunMessage> &);
@@ -57,11 +43,13 @@ using RunOutput = void (^)(const std::vector<RunMessage> &);
 struct CheckSource {
     NSURL *file;
     NSString *text;
+    bool saved = false;
 };
 
 struct CheckResult {
     std::vector<RunMessage> diagnostics;
     NSUInteger errors = 0;
+    NSUInteger warnings = 0;
 };
 
 using CheckFinished = void (^)(CheckResult);
@@ -77,15 +65,21 @@ struct RunProject {
     NSURL *manifest = nil;
 };
 
+enum class DebugBackend { LLDB, SBCL, Debugpy };
+
 @interface DebugExecutable : NSObject
 @property(nonatomic, readonly) NSURL *file;
 @property(nonatomic, readonly) NSURL *directory;
+@property(nonatomic, readonly) DebugBackend backend;
+@property(nonatomic, readonly) NSString *interpreter;
 - (instancetype)initWithFile:(NSURL *)file directory:(NSURL *)directory;
+- (instancetype)initWithFile:(NSURL *)file directory:(NSURL *)directory backend:(DebugBackend)backend interpreter:(NSString *)interpreter;
 @end
 
 RunProject LocateRunProject(Language language, NSURL *file, NSURL *folder);
 NSURL *ParentManifest(NSURL *directory, NSURL *limit, NSString *name);
 bool RunnableLanguage(Language language);
+bool CheckableLanguage(Language language);
 bool DebuggableLanguage(Language language, NSURL *file);
 NSString *FindTool(NSString *name, Language language);
 bool StopSourceRunsForQuit(dispatch_block_t finished);
@@ -93,11 +87,9 @@ bool StopSourceRunsForQuit(dispatch_block_t finished);
 @interface SourceRunner : NSObject
 @property(nonatomic, copy) void (^inputReady)(void);
 @property(nonatomic, readonly, getter=isStopped) BOOL stopped;
-- (void)startLanguage:(Language)language file:(NSURL *)file name:(NSString *)name workingText:(NSString *)text
-               output:(RunOutput)output finished:(void (^)(void))finished;
 - (void)startProject:(RunProject)project language:(Language)language file:(NSURL *)file name:(NSString *)name
          workingText:(NSString *)text output:(RunOutput)output finished:(void (^)(void))finished;
-- (void)checkRustProject:(RunProject)project file:(NSURL *)file name:(NSString *)name
+- (void)checkProject:(RunProject)project language:(Language)language file:(NSURL *)file name:(NSString *)name
                  sources:(std::vector<CheckSource>)sources cache:(RustCheckCache *)cache finished:(CheckFinished)finished;
 - (void)buildDebugProject:(RunProject)project language:(Language)language file:(NSURL *)file
                    output:(RunOutput)output finished:(void (^)(DebugExecutable *))finished;

@@ -286,7 +286,7 @@ static constexpr LanguageInfo languages[] = {
      u"vk_alt vk_anykey vk_backspace vk_control vk_delete vk_down vk_end vk_enter vk_escape vk_f1 vk_f2 vk_f3 vk_f4 vk_f5 "
      u"vk_f6 vk_f7 vk_f8 vk_f9 vk_f10 vk_f11 vk_f12 vk_home vk_insert vk_left vk_nokey vk_pagedown vk_pageup vk_right "
      u"vk_shift vk_space vk_tab vk_up"},
-    {"Common Lisp", "lisp lsp asd", {u";", u"#|", u"|#", true},
+    {"Common Lisp", "lisp lsp cl asd asdf", {u";", u"#|", u"|#", true},
      u"&allow-other-keys &aux &body &environment &key &optional &rest &whole and assert check-type declare "
      u"declaim define-compiler-macro define-condition define-method-combination define-modify-macro "
      u"define-setf-expander define-symbol-macro defclass defconstant defgeneric defmacro defmethod defpackage "

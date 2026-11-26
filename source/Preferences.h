@@ -7,6 +7,8 @@
 extern NSString *const EditorPreferencesChanged;
 extern NSString *const AutoSavePreferencesChanged;
 extern NSString *const OutputScrollbackPreferencesChanged;
+extern NSString *const UnusedWarningsPreferencesChanged;
+extern NSString *const InlayPreferencesChanged;
 extern NSString *const themeKey;
 extern NSString *const smoothingKey;
 extern NSString *const sizeKey;
@@ -80,7 +82,14 @@ NSFont *EditorFontPreference();
 void ApplyWindowAppearancePreference();
 void SetEditorPreference(NSString *key, id value);
 void SetEditorFont(NSFont *font);
+void SetUpEditorFontManager();
+
+bool ShowUnusedWarnings();
+bool ShowInlayHints();
+NSFont *InlayFont(NSFont *editor);
 
 @interface PreferencesController : NSWindowController
++ (PreferencesController *)sharedController;
 - (void)showPane:(NSString *)identifier;
+- (void)showLSPPaneForLanguage:(Language)language;
 @end

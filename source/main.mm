@@ -1,6 +1,7 @@
 #import "Editor.h"
 #import "Chrome.h"
 #import "DebugPane.h"
+#import "LanguageServer.h"
 #import "Preferences.h"
 #import "Rendering.h"
 #import "Runner.h"
@@ -16,6 +17,7 @@
 - (IBAction)showPreferences:(id)sender;
 - (IBAction)showFonts:(id)sender;
 - (IBAction)newWindowForTab:(id)sender;
+- (IBAction)newEditorWindow:(id)sender;
 - (IBAction)closeWindow:(id)sender;
 - (IBAction)debugCommand:(NSMenuItem *)sender;
 - (IBAction)openFolder:(id)sender;
@@ -23,31 +25,6 @@
 - (IBAction)replaceInFiles:(id)sender;
 - (IBAction)toggleAutoSave:(id)sender;
 - (IBAction)showCommandPalette:(id)sender;
-@end
-
-@interface EditorFontManager : NSFontManager
-@end
-
-@implementation EditorFontManager
-
-- (void)orderFrontFontPanel:(id)sender
-{
-    self.target = self;
-    self.action = @selector(changeEditorFont:);
-    [self setSelectedFont:EditorFontPreference() isMultiple:NO];
-
-    NSFontPanel *panel = [self fontPanel:YES];
-    [panel makeKeyAndOrderFront:sender];
-    // Keep AppKit's rich-text toolbar out of layout after the Fonts panel closes.
-    panel.toolbar.visible = NO;
-    panel.becomesKeyOnlyIfNeeded = NO;
-}
-
-- (void)changeEditorFont:(NSFontManager *)sender
-{
-    SetEditorFont([sender convertFont:EditorFontPreference()]);
-}
-
 @end
 
 enum class PalettePage { Theme, TabSize, MoreTabSizes, Language, Whitespace, AutoSave, FinalNewline };
@@ -79,7 +56,8 @@ static void SetUpMenus()
     AddItem(app, @"Quit Retina Code", @selector(terminate:), @"q");
 
     NSMenu *file = AddMenu(bar, @"File");
-    AddItem(file, @"New Window", @selector(newDocument:), @"n");
+    AddItem(file, @"New File", @selector(newWindowForTab:), @"n", 1).target = NSApp.delegate;
+    AddItem(file, @"New Window", @selector(newEditorWindow:), @"N").target = NSApp.delegate;
     AddItem(file, @"New Tab", @selector(newWindowForTab:), @"t").target = NSApp.delegate;
     AddItem(file, @"Open…", @selector(openDocument:), @"o");
     AddItem(file, @"Open Folder…", @selector(openFolder:), @"O").target = NSApp.delegate;
@@ -117,6 +95,12 @@ static void SetUpMenus()
     NSMenuItem *replaceInFiles = AddItem(find, @"Replace in Files…", @selector(replaceInFiles:), @"h");
     replaceInFiles.target = NSApp.delegate;
     replaceInFiles.keyEquivalentModifierMask = NSEventModifierFlagCommand | NSEventModifierFlagShift;
+    const unichar f8 = NSF8FunctionKey;
+    AddItem(edit, @"View Error", @selector(viewError:), [NSString stringWithCharacters:&f8 length:1])
+        .keyEquivalentModifierMask = NSEventModifierFlagOption;
+    NSMenu *languageServer = AddMenu(edit, @"Language Server");
+    for (NSMenuItem *command in LanguageFeatureCommands())
+        [languageServer addItem:command];
 
     NSMenu *selection = AddMenu(bar, @"Selection");
     const unichar up = NSUpArrowFunctionKey, down = NSDownArrowFunctionKey;
@@ -163,6 +147,7 @@ static void SetUpMenus()
     AddItem(view, @"Decrease Text Size", @selector(changeFontSize:), @"-", -1);
     AddItem(view, @"Actual Size", @selector(changeFontSize:), @"0");
     [view addItem:NSMenuItem.separatorItem];
+    AddItem(view, @"Close Split", @selector(closeEditorSplit:), @"");
     AddItem(view, @"Output", @selector(toggleDocumentOutput:), @"");
     NSMenuItem *vim = AddItem(view, @"Vim Mode", @selector(toggleVimMode:), @"v");
     vim.keyEquivalentModifierMask = NSEventModifierFlagCommand | NSEventModifierFlagOption;
@@ -579,7 +564,7 @@ static NSWindow *RestoreNativeTabs(NSArray<SourceDocument *> *tabs, SourceDocume
         [super openDocumentWithContentsOfURL:url display:display completionHandler:completion];
         return;
     }
-    [self openSourceURL:url inWindow:self.activeEditorWindow completionHandler:completion];
+    [self openSourceURL:url inWindow:self.activeEditorWindow asTab:NO completionHandler:completion];
 }
 
 - (FolderWorkspace *)workspaceForFile:(NSURL *)file preferred:(FolderWorkspace *)preferred
@@ -596,7 +581,8 @@ static NSWindow *RestoreNativeTabs(NSArray<SourceDocument *> *tabs, SourceDocume
     return nearest;
 }
 
-- (void)openSourceURL:(NSURL *)url inWindow:(NSWindow *)anchor completionHandler:(SourceOpenCompletion)completion
+- (void)openSourceURL:(NSURL *)url inWindow:(NSWindow *)anchor asTab:(BOOL)asTab
+    completionHandler:(SourceOpenCompletion)completion
 {
     if (url.isFileURL)
         url = CanonicalFileURL(url);
@@ -608,7 +594,8 @@ static NSWindow *RestoreNativeTabs(NSArray<SourceDocument *> *tabs, SourceDocume
         return;
     }
     FolderWorkspace *preferred = WorkspaceForEditorWindow(anchor);
-    FolderWorkspace *workspace = [self workspaceForFile:url preferred:preferred];
+    BOOL navigateInTabs = asTab && anchor != nil;
+    FolderWorkspace *workspace = navigateInTabs ? preferred : [self workspaceForFile:url preferred:preferred];
     NSWindow *window = preferred == workspace ? anchor : workspace.selectedDocument.editorHostWindow;
     if (!window && workspace) {
         for (NSWindow *candidate in NSApp.windows) {
@@ -626,6 +613,19 @@ static NSWindow *RestoreNativeTabs(NSArray<SourceDocument *> *tabs, SourceDocume
                        completionHandler:^(NSDocument *document, BOOL alreadyOpen, NSError *error) {
         if ([document isKindOfClass:SourceDocument.class]) {
             SourceDocument *source = (SourceDocument *)document;
+            if (navigateInTabs) {
+                if ([source joinNavigationTabInWindow:window]) {
+                    [self showOpenedDocument:source inWindow:window replacing:placeholder];
+                    completion(source, alreadyOpen, nil);
+                } else {
+                    if (!alreadyOpen && !source.editorHostWindow)
+                        [source close];
+                    NSError *navigationError = [NSError errorWithDomain:NSCocoaErrorDomain code:NSUserCancelledError
+                        userInfo:@{NSLocalizedDescriptionKey:@"The file couldn’t be opened in the current tabs."}];
+                    completion(nil, alreadyOpen, navigationError);
+                }
+                return;
+            }
             if (!alreadyOpen || (workspace && source.workspace != workspace)) {
                 BOOL moveOpenTab = source.editorHostWindow != nil && source.workspace != workspace;
                 source.workspace = workspace;
@@ -700,7 +700,7 @@ static void AddMenuCommands(NSMutableArray<NSMenuItem *> *commands, NSMenu *menu
         if (item.hidden || item.isSeparatorItem)
             continue;
         if (item.submenu) {
-            if (![item.title isEqualToString:@"Theme"])
+            if (![item.title isEqualToString:@"Theme"] && ![item.title isEqualToString:@"Language Server"])
                 AddMenuCommands(commands, item.submenu, category);
             continue;
         }
@@ -725,7 +725,6 @@ static void AddMenuCommands(NSMutableArray<NSMenuItem *> *commands, NSMenu *menu
 
 @implementation ApplicationDelegate {
     SourceDocumentController *_documents;
-    PreferencesController *_preferences;
     CommandPalette *_palette;
 }
 
@@ -739,8 +738,7 @@ static void AddMenuCommands(NSMutableArray<NSMenuItem *> *commands, NSMenu *menu
     if (NSApp.modalWindow)
         return nil;
     NSWindow *window = _documents.activeEditorWindow;
-    NSDocument *document = window.windowController.document;
-    return [document isKindOfClass:SourceDocument.class] ? (SourceDocument *)document : nil;
+    return FocusedEditorDocument(window);
 }
 
 - (IBAction)debugCommand:(NSMenuItem *)sender
@@ -801,6 +799,7 @@ static void AddMenuCommands(NSMutableArray<NSMenuItem *> *commands, NSMenu *menu
 {
     if (![_documents saveSessionForQuitDiscarding:nil])
         return NSTerminateCancel;
+    StopLanguageServers();
 
     dispatch_group_t jobs = dispatch_group_create();
     dispatch_group_enter(jobs);
@@ -833,9 +832,7 @@ static void AddMenuCommands(NSMutableArray<NSMenuItem *> *commands, NSMenu *menu
 
 - (IBAction)showPreferences:(id)sender
 {
-    if (!_preferences)
-        _preferences = [[PreferencesController alloc] init];
-    [_preferences showWindow:sender];
+    [[PreferencesController sharedController] showWindow:sender];
 }
 
 - (IBAction)showPreferencesPane:(NSMenuItem *)sender
@@ -843,9 +840,15 @@ static void AddMenuCommands(NSMutableArray<NSMenuItem *> *commands, NSMenu *menu
     static NSArray<NSString *> *panes = @[@"Appearance", @"Rendering", @"Editing", @"Files", @"Output"];
     if (sender.tag < 0 || sender.tag >= NSInteger(panes.count))
         return;
-    if (!_preferences)
-        _preferences = [[PreferencesController alloc] init];
-    [_preferences showPane:panes[sender.tag]];
+    [[PreferencesController sharedController] showPane:panes[sender.tag]];
+}
+
+- (IBAction)showLSPPreferences:(id)sender
+{
+    (void)sender;
+    SourceDocument *document = FocusedEditorDocument(_documents.activeEditorWindow);
+    auto language = document ? Language(document.languageMode) : Language::Plain;
+    [[PreferencesController sharedController] showLSPPaneForLanguage:language];
 }
 
 - (IBAction)toggleSmoothScrolling:(id)sender
@@ -928,7 +931,7 @@ static void AddMenuCommands(NSMutableArray<NSMenuItem *> *commands, NSMenu *menu
 - (IBAction)showPalettePage:(NSMenuItem *)sender
 {
     NSWindow *window = _documents.activeEditorWindow;
-    SourceDocument *document = window.windowController.document;
+    SourceDocument *document = FocusedEditorDocument(window);
     NSMutableArray<NSMenuItem *> *items = [NSMutableArray array];
     NSString *prompt = nil;
     NSUInteger rowLimit = defaultCommandPaletteRows;
@@ -1015,7 +1018,7 @@ static void AddMenuCommands(NSMutableArray<NSMenuItem *> *commands, NSMenu *menu
     NSWindow *window = _documents.activeEditorWindow;
     if (!CommandPaletteHost(window) || window.attachedSheet)
         return;
-    SourceDocument *document = window.windowController.document;
+    SourceDocument *document = FocusedEditorDocument(window);
     NSMutableArray<NSMenuItem *> *commands = [NSMutableArray arrayWithArray:@[
         PaletteItem(@"Open Settings…", @selector(showPreferences:), self, 0, @"Open Preferences Prefs"),
         PaletteItem(@"Appearance Settings", @selector(showPreferencesPane:), self, 0, @"Appearance Preferences Window Appearance"),
@@ -1023,6 +1026,7 @@ static void AddMenuCommands(NSMutableArray<NSMenuItem *> *commands, NSMenu *menu
         PaletteItem(@"Editing Settings", @selector(showPreferencesPane:), self, 2, @"Editing Preferences Editor Settings"),
         PaletteItem(@"File Settings", @selector(showPreferencesPane:), self, 3, @"Files Preferences File Preferences Files Settings"),
         PaletteItem(@"Output Settings", @selector(showPreferencesPane:), self, 4, @"Output Preferences Scrollback"),
+        PaletteItem(@"LSP: Configure Language Server…", @selector(showLSPPreferences:), self, 0, @"Language Server Settings LSP Configuration"),
         PaletteItem(@"Color Theme…", @selector(showPalettePage:), self, NSInteger(PalettePage::Theme)),
         PaletteItem(@"Choose Editor Font…", @selector(showFonts:), self, 0, @"Open Fonts Show Fonts Font Settings"),
     ]];
@@ -1030,6 +1034,7 @@ static void AddMenuCommands(NSMutableArray<NSMenuItem *> *commands, NSMenu *menu
         [commands addObject:PaletteItem(@"Change Tab Size…", @selector(showPalettePage:), self, NSInteger(PalettePage::TabSize))];
         [commands addObjectsFromArray:FileIndentationCommands(document)];
         [commands addObject:PaletteItem(@"Change Language Mode…", @selector(showPalettePage:), self, NSInteger(PalettePage::Language))];
+        [commands addObjectsFromArray:document.languagePaletteCommands];
     }
     [commands addObjectsFromArray:@[
         PaletteItem(@"Render Whitespace…", @selector(showPalettePage:), self, NSInteger(PalettePage::Whitespace)),
@@ -1055,6 +1060,8 @@ static void AddMenuCommands(NSMutableArray<NSMenuItem *> *commands, NSMenu *menu
 - (IBAction)newWindowForTab:(id)sender
 {
     NSWindow *window = [sender isKindOfClass:NSWindow.class] ? sender : _documents.activeEditorWindow;
+    if (window.attachedSheet || window.tabGroup.selectedWindow.attachedSheet)
+        return;
     NSError *error = nil;
     SourceDocument *document = (SourceDocument *)[_documents openUntitledDocumentAndDisplay:NO error:&error];
     if (!document) {
@@ -1066,6 +1073,14 @@ static void AddMenuCommands(NSMutableArray<NSMenuItem *> *commands, NSMenu *menu
     if (![document joinTabsInWindow:window])
         [document makeWindowControllers];
     [document showWindows];
+}
+
+- (IBAction)newEditorWindow:(id)sender
+{
+    BOOL automaticTabbing = NSWindow.allowsAutomaticWindowTabbing;
+    NSWindow.allowsAutomaticWindowTabbing = NO;
+    [_documents newDocument:sender];
+    NSWindow.allowsAutomaticWindowTabbing = automaticTabbing;
 }
 
 - (void)chooseFolderInWindow:(NSWindow *)window completion:(void (^)(NSWindow *))completion
@@ -1140,7 +1155,7 @@ static void AddMenuCommands(NSMutableArray<NSMenuItem *> *commands, NSMenu *menu
 int main()
 {
     @autoreleasepool {
-        [NSFontManager setFontManagerFactory:EditorFontManager.class];
+        SetUpEditorFontManager();
         NSApplication *application = NSApplication.sharedApplication;
         ApplicationDelegate *delegate = [[ApplicationDelegate alloc] init];
         application.delegate = delegate;

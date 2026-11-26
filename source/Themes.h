@@ -54,6 +54,21 @@ struct EditorAccents {
     Col32 commandCaret = rgb(179, 202, 230);
 };
 
+struct InlayColors {
+    Col32 text, background, border;
+};
+
+constexpr InlayColors DefaultInlayColors(Col32 paper, Col32 ink)
+{
+    auto neutral = ColorLuma(paper) < 128 ? rgb(255, 255, 255) : rgb(0, 0, 0);
+    auto background = BlendColor(paper, neutral, 7);
+    auto text = BlendColor(paper, ink, 65);
+    int difference = ColorLuma(text) - ColorLuma(background);
+    if (difference > -90 && difference < 90)
+        text = BlendColor(paper, neutral, 67);
+    return {text, background, rgba(0, 0, 0, 0)};
+}
+
 struct Theme {
     const char *name;
     Col32 paper;
@@ -73,6 +88,7 @@ struct Theme {
     std::optional<Col32> blockCaretText = {};
     bool italicComments = false;
     bool contrastingSelectionText = false;
+    InlayColors inlay = DefaultInlayColors(paper, ink[size_t(Ink::Text)]);
 };
 
 using ThemeRef = std::shared_ptr<const Theme>;

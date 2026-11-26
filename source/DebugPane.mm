@@ -1,5 +1,8 @@
 #import "DebugPane.h"
+#import "Chrome.h"
 #include <algorithm>
+
+static constexpr CGFloat debugHeaderHeight = 50;
 
 struct DebugControl {
     DebugCommand command;
@@ -30,7 +33,7 @@ static NSImage *StepOverButtonImage()
 {
     static NSImage *image = [] {
         NSImage *symbol = [NSImage imageWithSize:NSMakeSize(16, 16) flipped:YES drawingHandler:^BOOL(NSRect) {
-            [NSColor.systemGrayColor setStroke];
+            [NSColor.blackColor setStroke];
             NSBezierPath *arrow = [NSBezierPath bezierPath];
             arrow.lineWidth = 1.35;
             arrow.lineCapStyle = NSLineCapStyleRound;
@@ -47,6 +50,7 @@ static NSImage *StepOverButtonImage()
             [arrow stroke];
             return YES;
         }];
+        [symbol setTemplate:YES];
         symbol.accessibilityDescription = @"Step Over";
         return symbol;
     }();
@@ -243,13 +247,32 @@ static void SetValue(DebugRow *row, NSDictionary *value, NSString *field)
         x += 25;
     }
     _status.frame = NSMakeRect(x + 5, std::max(0.0, height - 22), std::max(0.0, width - x - 11), 16);
-    CGFloat pageY = std::max(0.0, height - 50);
+    CGFloat pageY = std::max(0.0, height - debugHeaderHeight);
     _pages.frame = NSMakeRect(4, pageY, 106, 22);
     NSRect accessory = NSMakeRect(114, pageY + 1, std::max(0.0, width - 121), 20);
     _threads.frame = accessory;
     _input.frame = accessory;
     _scroll.frame = NSMakeRect(0, 0, width, pageY);
     _console.frame = _scroll.frame;
+}
+
+- (void)viewDidChangeEffectiveAppearance
+{
+    [super viewDidChangeEffectiveAppearance];
+    self.needsDisplay = YES;
+}
+
+- (void)drawRect:(NSRect)dirty
+{
+    NSRect header, body;
+    NSDivideRect(self.bounds, &header, &body, debugHeaderHeight, NSMaxYEdge);
+    if (!NSIntersectsRect(dirty, header))
+        return;
+
+    DrawWindowBarGradient(header, self.effectiveAppearance);
+    NSRect rule = NSMakeRect(NSMinX(header), NSMinY(header), NSWidth(header), 1);
+    [NSColor.separatorColor setFill];
+    NSRectFillUsingOperation(NSIntersectionRect(dirty, rule), NSCompositingOperationSourceOver);
 }
 
 - (void)performControl:(NSButton *)button

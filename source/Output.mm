@@ -129,7 +129,7 @@ static bool OutputLineEnding(unichar character)
 
 - (void)drawRect:(NSRect)dirty
 {
-    dirty = NSIntersectionRect(dirty, self.visibleRect);
+    dirty = NSIntersectionRect(dirty, self.bounds);
     if (NSIsEmptyRect(dirty))
         return;
     DrawEditorSurface(self, dirty, self.rendering, self.backgroundColor,
@@ -260,7 +260,6 @@ static bool OutputLineEnding(unichar character)
 {
     [super layout];
     NSRect area = self.bounds;
-    area.size.height = std::max<CGFloat>(0, NSHeight(area) - 1);
     if (NSEqualRects(area, _scroll.frame) && !_deferredScrollPosition)
         return;
     OutputScrollPosition position = [self scrollPosition];
@@ -273,8 +272,6 @@ static bool OutputLineEnding(unichar character)
     dirty = NSIntersectionRect(dirty, self.bounds);
     [_text.backgroundColor setFill];
     NSRectFill(dirty);
-    [SRGBColor(_dark ? rgb(85, 85, 85) : rgb(160, 160, 160)) setFill];
-    NSRectFill(NSIntersectionRect(dirty, NSMakeRect(0, NSHeight(self.bounds) - 1, NSWidth(self.bounds), 1)));
 }
 
 - (BOOL)hasKeyboardFocus
@@ -694,6 +691,26 @@ static bool OutputLineEnding(unichar character)
     [self clear];
     [self appendMessages:messages source:source];
     [self restoreScrollPosition:{NSZeroPoint, false} removed:0 reflow:NO];
+}
+
+- (void)revealDiagnostic:(const RunLocation &)location source:(SourceDocument *)source
+{
+    if (!location.line)
+        return;
+    for (auto it = _locations.rbegin(); it != _locations.rend(); ++it) {
+        const RunLocation &candidate = it->location;
+        if (candidate.line != location.line || candidate.column != location.column ||
+            !(candidate.currentSource ? it->source == source :
+              location.file && [candidate.file.path isEqualToString:location.file.path]))
+            continue;
+        NSUInteger index = it->end - _historyStart - 1;
+        if (index < _text.string.length) {
+            NSRange line = [_text.string lineRangeForRange:NSMakeRange(index, 0)];
+            [_text setSelectedRange:line];
+            [_text scrollRangeToVisible:line];
+        }
+        break;
+    }
 }
 
 - (BOOL)textView:(NSTextView *)textView clickedOnLink:(id)link atIndex:(NSUInteger)index

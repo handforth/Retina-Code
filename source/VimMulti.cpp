@@ -1,23 +1,39 @@
 #include "VimMulti.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <utility>
 
 namespace Vim {
 
 EditBatch::EditBatch(std::vector<CursorEdit> changes)
 {
-    std::stable_sort(changes.begin(), changes.end(), [](const CursorEdit &a, const CursorEdit &b) {
+    assign(std::move(changes), EditOrder::Cursors);
+}
+
+bool EditBatch::assign(std::vector<CursorEdit> changes, EditOrder order)
+{
+    auto less = [order](const CursorEdit &a, const CursorEdit &b) {
         if (a.range.first != b.range.first)
             return a.range.first < b.range.first;
-        return a.range.last > b.range.last;
-    });
-    // A command can reach the same line or text object from several cursors.
-    for (auto &edit : changes) {
-        if (!edits.empty()) {
-            auto &last = edits.back();
+        return order == EditOrder::Cursors && a.range.last > b.range.last;
+    };
+    if (!std::is_sorted(changes.begin(), changes.end(), less))
+        std::stable_sort(changes.begin(), changes.end(), less);
+
+    size_t count = 0;
+    for (size_t i = 0; i < changes.size(); ++i) {
+        auto &edit = changes[i];
+        if (count) {
+            auto &last = changes[count - 1];
             if (edit.range.first < last.range.last || edit.range.first == last.range.first) {
-                if (last.text.empty() && edit.text.empty()) {
+                if (order == EditOrder::Server) {
+                    if (edit.range.first < last.range.last)
+                        return false;
+
+                    last.range.last = edit.range.last;
+                    last.text += edit.text;
+                } else if (last.text.empty() && edit.text.empty()) {
                     last.range.last = std::max(last.range.last, edit.range.last);
                 } else if (last.range.size() == last.text.size() && edit.range.size() == edit.text.size() &&
                            edit.range.last > last.range.last) {
@@ -27,16 +43,25 @@ EditBatch::EditBatch(std::vector<CursorEdit> changes)
                 continue;
             }
         }
-        edits.push_back(std::move(edit));
+        if (count != i)
+            changes[count] = std::move(edit);
+        ++count;
     }
-    starts.reserve(edits.size());
+
+    changes.resize(count);
+    if (!count || changes.capacity() > std::bit_ceil(count))
+        changes.shrink_to_fit();
+
     Offset oldEnd = 0;
     Offset newEnd = 0;
-    for (const auto &edit : edits) {
-        starts.push_back(newEnd + edit.range.first - oldEnd);
+    for (auto &edit : changes) {
+        edit.newStart = newEnd + edit.range.first - oldEnd;
         oldEnd = edit.range.last;
-        newEnd = starts.back() + edit.text.size();
+        newEnd = edit.newStart + edit.text.size();
     }
+
+    edits = std::move(changes);
+    return true;
 }
 
 Offset EditBatch::map(Offset position, bool after) const
@@ -47,13 +72,12 @@ Offset EditBatch::map(Offset position, bool after) const
                                  [](Offset at, const CursorEdit &edit) { return at < edit.range.first; });
     if (past == edits.begin())
         return position;
-    Offset index = Offset(past - edits.begin() - 1);
-    const auto &edit = edits[index];
+    const auto &edit = *(past - 1);
     if (position < edit.range.last && edit.range.size() == edit.text.size())
-        return starts[index] + position - edit.range.first;
+        return edit.newStart + position - edit.range.first;
     if (position < edit.range.last || (!after && position == edit.range.first))
-        return starts[index];
-    return starts[index] + edit.text.size() + position - edit.range.last;
+        return edit.newStart;
+    return edit.newStart + edit.text.size() + position - edit.range.last;
 }
 
 const CursorEdit *EditBatch::find(Offset first) const
@@ -70,9 +94,16 @@ bool EditBatch::overlaps(Range range) const
     return it != edits.end() && it->range.first < range.last;
 }
 
-std::vector<Text> ClipboardLines(Text text, Offset count)
+std::vector<Text> ClipboardParts(Text text, Offset count, const Register *clipboard)
 {
     std::vector<Text> lines;
+    if (clipboard && clipboard->text == text && clipboard->cursors.size() == count) {
+        lines.reserve(count);
+        for (const auto &part : clipboard->cursors)
+            lines.push_back(part->text);
+        return lines;
+    }
+
     Offset first = 0;
     for (Offset at = 0; at < text.size(); ++at) {
         if (text[at] != u'\r' && text[at] != u'\n' && text[at] != 0x2028 && text[at] != 0x2029)
@@ -105,7 +136,7 @@ struct Source {
     {
         char16_t unit = 0;
         if (offset < length)
-            host.read(host.context, {offset, offset + 1}, &unit);
+            host.read(host.document, {offset, offset + 1}, &unit);
         return unit;
     }
 };
@@ -129,7 +160,7 @@ struct CursorClipboard {
     Offset count;
     bool loaded = false;
     std::optional<Register> value;
-    std::vector<Text> lines;
+    std::optional<std::vector<Text>> lines;
 
     void load()
     {
@@ -137,9 +168,7 @@ struct CursorClipboard {
             return;
         loaded = true;
         if (host.readClipboard)
-            value = host.readClipboard(host.context);
-        if (value && value->cursors.size() != count)
-            lines = ClipboardLines(value->text, count);
+            value = host.readClipboard(host.document);
     }
 
     std::optional<Register> read(Offset index)
@@ -149,37 +178,39 @@ struct CursorClipboard {
             return {};
         if (value->cursors.size() == count)
             return *value->cursors[index];
-        if (lines.empty())
+        if (!lines)
+            lines = ClipboardParts(value->text, count);
+        if (lines->empty())
             return value;
         Register part;
-        part.text = lines[index];
+        part.text = (*lines)[index];
         return part;
     }
+};
+
+struct PlannedEdit {
+    Range source;
+    Range result;
 };
 
 // A command usually replaces one small range. Unchanged text and its line index
 // stay in the editor, so planning a cursor never copies the rest of the file.
 struct Preview {
     const Source &source;
-    std::vector<Piece> pieces;
-    Offset length;
-    Offset rows;
+    std::vector<Piece> &pieces;
+    std::vector<Range> &flashes;
+    CursorClipboard &clipboard;
     ClusterInText clusterInText;
     FindInText findInText;
-    CursorClipboard &clipboard;
     Offset cursorIndex;
-    std::optional<std::u16string> writtenClipboard;
-    std::vector<Range> flashes;
-    Kind flashKind = Kind::Character;
     bool primary;
-
-    Preview(const Source &base, bool active, ClusterInText cluster, FindInText find,
-            CursorClipboard &input, Offset index)
-        : source(base), length(base.length), rows(base.rows), clusterInText(cluster),
-          findInText(find), clipboard(input), cursorIndex(index), primary(active) {}
+    Offset length = source.length;
+    Offset rows = source.rows;
+    std::optional<std::u16string> writtenClipboard{};
+    Kind flashKind = Kind::Character;
+    bool changed = false;
 
     const Host &host() const { return source.host; }
-    bool changed = false;
 
     char16_t at(const Piece &piece, Offset offset) const
     {
@@ -198,8 +229,8 @@ struct Preview {
             char16_t next = i + 1 < pieces.size() ? at(pieces[i + 1], 0) : 0;
             if (piece.original()) {
                 Offset end = piece.source + piece.length;
-                piece.sourceRow = host().lineAt(host().context, piece.source);
-                piece.breaks = host().lineAt(host().context, end) - piece.sourceRow;
+                piece.sourceRow = host().lineAt(host().document, piece.source);
+                piece.breaks = host().lineAt(host().document, end) - piece.sourceRow;
                 if (at(piece, piece.length - 1) == u'\r') {
                     piece.breaks += Offset(source.at(end) == u'\n');
                     piece.breaks -= Offset(next == u'\n');
@@ -269,7 +300,7 @@ struct Preview {
     void read(Range range, char16_t *output) const
     {
         if (!changed) {
-            host().read(host().context, range, output);
+            host().read(host().document, range, output);
             return;
         }
         for (const auto &piece : pieces) {
@@ -280,7 +311,7 @@ struct Preview {
             Offset count = last - first;
             Offset start = first - piece.start;
             if (piece.original())
-                host().read(host().context, {piece.source + start, piece.source + start + count}, output);
+                host().read(host().document, {piece.source + start, piece.source + start + count}, output);
             else
                 std::copy_n(piece.text.data() + start, count, output);
             output += count;
@@ -298,13 +329,13 @@ struct Preview {
     Offset lineAt(Offset position) const
     {
         if (!changed)
-            return host().lineAt(host().context, position);
+            return host().lineAt(host().document, position);
         for (const auto &piece : pieces) {
             if (position >= piece.end())
                 continue;
             Offset at = position - piece.start;
             Offset relative = piece.original() ?
-                host().lineAt(host().context, piece.source + at) - piece.sourceRow :
+                host().lineAt(host().document, piece.source + at) - piece.sourceRow :
                 Offset(std::upper_bound(piece.lineStarts.begin(), piece.lineStarts.end(), at) - piece.lineStarts.begin());
             return piece.row + relative;
         }
@@ -314,7 +345,7 @@ struct Preview {
     Offset lineStart(Offset row) const
     {
         if (!changed)
-            return host().lineStart(host().context, row);
+            return host().lineStart(host().document, row);
         if (!row)
             return 0;
         for (const auto &piece : pieces) {
@@ -324,9 +355,9 @@ struct Preview {
             if (!piece.original())
                 return piece.start + piece.lineStarts[relative - 1];
             Offset end = piece.source + piece.length;
-            if (piece.sourceRow + relative > host().lineAt(host().context, end))
+            if (piece.sourceRow + relative > host().lineAt(host().document, end))
                 return piece.end(); // The piece ends with a newly separated CR.
-            return piece.start + host().lineStart(host().context, piece.sourceRow + relative) - piece.source;
+            return piece.start + host().lineStart(host().document, piece.sourceRow + relative) - piece.source;
         }
         return length;
     }
@@ -334,12 +365,12 @@ struct Preview {
     Range cluster(Offset position) const
     {
         if (!changed)
-            return host().cluster(host().context, position);
+            return host().cluster(host().document, position);
         for (const auto &piece : pieces) {
             if (!piece.original() || position < piece.start || position >= piece.end())
                 continue;
             Offset at = piece.source + position - piece.start;
-            Range original = host().cluster(host().context, at);
+            Range original = host().cluster(host().document, at);
             if (original.first > piece.source && original.last < piece.source + piece.length)
                 return {piece.start + original.first - piece.source, piece.start + original.last - piece.source};
             break;
@@ -362,27 +393,32 @@ struct Preview {
         return position == length ? source.length : NoOffset;
     }
 
-    std::vector<CursorEdit> edits() const
+    void appendEdits(std::vector<CursorEdit> &changes, std::vector<PlannedEdit> &positions)
     {
-        std::vector<CursorEdit> result;
         if (!changed)
-            return result;
+            return;
+
         Offset start = 0;
         std::u16string inserted;
-        for (const auto &piece : pieces) {
+        auto append = [&](Offset sourceEnd, Offset resultEnd) {
+            positions.push_back({{start, sourceEnd}, {resultEnd - inserted.size(), resultEnd}});
+            changes.push_back({{start, sourceEnd}, std::move(inserted)});
+            inserted.clear();
+        };
+        for (auto &piece : pieces) {
             if (piece.original()) {
-                if (piece.source > start || !inserted.empty()) {
-                    result.push_back({{start, piece.source}, std::move(inserted)});
-                    inserted.clear();
-                }
+                if (piece.source > start || !inserted.empty())
+                    append(piece.source, piece.start);
                 start = piece.source + piece.length;
+            } else if (inserted.empty()) {
+                inserted = std::move(piece.text);
             } else {
                 inserted.append(piece.text);
             }
         }
+
         if (start < source.length || !inserted.empty())
-            result.push_back({{start, source.length}, std::move(inserted)});
-        return result;
+            append(source.length, length);
     }
 
     Host callbacks();
@@ -390,111 +426,84 @@ struct Preview {
 
 Host Preview::callbacks()
 {
-    return {
-        .context = this,
-        .length = [](void *p) { return static_cast<Preview *>(p)->length; },
-        .lineCount = [](void *p) { return static_cast<Preview *>(p)->rows; },
-        .lineAt = [](void *p, Offset at) { return static_cast<Preview *>(p)->lineAt(at); },
-        .lineStart = [](void *p, Offset row) { return static_cast<Preview *>(p)->lineStart(row); },
-        .read = [](void *p, Range range, char16_t *output) { static_cast<Preview *>(p)->read(range, output); },
-        .cluster = source.host.cluster && clusterInText ? +[](void *p, Offset at) {
-            return static_cast<Preview *>(p)->cluster(at);
-        } : nullptr,
-        .structural = [](void *p, Offset at) {
-            auto &preview = *static_cast<Preview *>(p);
-            auto &host = preview.host();
-            Offset original = preview.originalPosition(at);
-            return original == NoOffset || !host.structural || host.structural(host.context, original);
-        },
-        .replace = [](void *p, Range r, Text text) { static_cast<Preview *>(p)->replace(r, text); },
-        .recordUndo = nullptr,
-        .undo = nullptr,
-        .flash = [](void *p, const std::vector<Range> &ranges, Kind kind) {
-            auto &preview = *static_cast<Preview *>(p);
-            preview.flashKind = kind;
-            preview.flashes.insert(preview.flashes.end(), ranges.begin(), ranges.end());
-        },
-        .readClipboard = [](void *p) {
-            auto &preview = *static_cast<Preview *>(p);
-            return preview.clipboard.read(preview.cursorIndex);
-        },
-        .writeClipboard = [](void *p, Text text) { static_cast<Preview *>(p)->writtenClipboard.emplace(text); },
-        .find = [](void *p, Text pattern, Range scope, bool backwards, bool ignoreCase, bool captures) {
-            auto &preview = *static_cast<Preview *>(p);
-            auto &host = preview.host();
-            if (!preview.changed && host.find)
-                return host.find(host.context, pattern, scope, backwards, ignoreCase, captures);
-            if (preview.findInText)
-                return preview.findInText(preview.read({0, preview.length}), pattern, scope, backwards, ignoreCase, captures);
-            return std::optional<Match>{};
-        },
-        .viewport = [](void *p) {
-            auto &preview = *static_cast<Preview *>(p);
-            auto &host = preview.host();
-            return host.viewport ? host.viewport(host.context) : Range{0, preview.rows};
-        },
-        .scroll = primary && source.host.scroll ? +[](void *p, Offset row) {
-            auto &host = static_cast<Preview *>(p)->host();
-            host.scroll(host.context, row);
-        } : nullptr,
-        .action = primary && source.host.action ? +[](void *p, Action action, Text text, bool force) {
-            auto &host = static_cast<Preview *>(p)->host();
-            host.action(host.context, action, text, force);
-        } : nullptr,
-        .planInsert = source.host.planInsert ? +[](void *p, Key key, Offset at, unsigned tab,
-                                                 unsigned indent, bool spaces, bool automatic) {
-            auto &preview = *static_cast<Preview *>(p);
-            auto &host = preview.host();
-            if (preview.changed)
-                return std::optional<InsertEdit>{};
-            return host.planInsert(host.context, key, at, tab, indent, spaces, automatic);
-        } : nullptr,
-        .finishInsertEdit = source.host.finishInsertEdit ? +[](void *p) {
-            auto &host = static_cast<Preview *>(p)->host();
-            host.finishInsertEdit(host.context);
-        } : nullptr,
-        .indentAfter = source.host.indentAfter ? +[](void *p, Offset at, unsigned tab, unsigned indent, bool spaces) {
-            auto &preview = *static_cast<Preview *>(p);
-            auto &host = preview.host();
-            Offset original = preview.originalPosition(at);
-            return original == NoOffset ? std::u16string() : host.indentAfter(host.context, original, tab, indent, spaces);
-        } : nullptr,
-        .fileName = source.host.fileName ? +[](void *p) {
-            auto &host = static_cast<Preview *>(p)->host();
-            return host.fileName(host.context);
-        } : nullptr,
-        .fileMark = source.host.fileMark ? +[](void *p, char32_t key) {
-            auto &host = static_cast<Preview *>(p)->host();
-            return host.fileMark(host.context, key);
-        } : nullptr,
-        .setFileMark = primary && source.host.setFileMark ? +[](void *p, char32_t key, Offset at) {
-            auto &host = static_cast<Preview *>(p)->host();
-            host.setFileMark(host.context, key, at);
-        } : nullptr,
-        .comments = source.host.comments ? +[](void *p) {
-            auto &host = static_cast<Preview *>(p)->host();
-            return host.comments(host.context);
-        } : nullptr,
-        .definition = source.host.definition ? +[](void *p, Offset at) {
-            auto &host = static_cast<Preview *>(p)->host();
-            return host.definition(host.context, at);
-        } : nullptr,
-        .fold = primary && source.host.fold ? +[](void *p, char32_t key, Offset at) {
-            auto &host = static_cast<Preview *>(p)->host();
-            return host.fold(host.context, key, at);
-        } : nullptr,
-        .stepRow = source.host.stepRow ? +[](void *p, Offset row, bool down, Offset count) {
-            auto &preview = *static_cast<Preview *>(p);
-            auto &host = preview.host();
-            return preview.changed ? (down ? row + count : row - std::min(row, count)) :
-                                     host.stepRow(host.context, row, down, count);
-        } : nullptr,
-        .hiddenRows = source.host.hiddenRows ? +[](void *p, Range visible) {
-            auto &host = static_cast<Preview *>(p)->host();
-            return host.hiddenRows(host.context, visible);
-        } : nullptr,
-        .batch = true,
+    Host callbacks = source.host;
+    callbacks.document = this;
+    if (!primary) {
+        callbacks.scroll = nullptr;
+        callbacks.action = nullptr;
+        callbacks.setFileMark = nullptr;
+        callbacks.fold = nullptr;
+    }
+
+    callbacks.length = [](void *p) { return static_cast<Preview *>(p)->length; };
+    callbacks.lineCount = [](void *p) { return static_cast<Preview *>(p)->rows; };
+    callbacks.lineAt = [](void *p, Offset at) { return static_cast<Preview *>(p)->lineAt(at); };
+    callbacks.lineStart = [](void *p, Offset row) { return static_cast<Preview *>(p)->lineStart(row); };
+    callbacks.read = [](void *p, Range range, char16_t *output) { static_cast<Preview *>(p)->read(range, output); };
+    callbacks.cluster = source.host.cluster && clusterInText ? +[](void *p, Offset at) {
+        return static_cast<Preview *>(p)->cluster(at);
+    } : nullptr;
+    callbacks.structural = [](void *p, Offset at) {
+        auto &preview = *static_cast<Preview *>(p);
+        auto &host = preview.host();
+        Offset original = preview.originalPosition(at);
+        return original == NoOffset || !host.structural || host.structural(host.document, original);
     };
+    callbacks.replace = [](void *p, Range r, Text text) { static_cast<Preview *>(p)->replace(r, text); };
+    callbacks.recordUndo = nullptr;
+    callbacks.undo = nullptr;
+    callbacks.flash = [](void *p, const std::vector<Range> &ranges, Kind kind) {
+        auto &preview = *static_cast<Preview *>(p);
+        preview.flashKind = kind;
+        preview.flashes.insert(preview.flashes.end(), ranges.begin(), ranges.end());
+    };
+    callbacks.readClipboard = [](void *p) {
+        auto &preview = *static_cast<Preview *>(p);
+        return preview.clipboard.read(preview.cursorIndex);
+    };
+    callbacks.writeClipboard = [](void *p, Text text) { static_cast<Preview *>(p)->writtenClipboard.emplace(text); };
+    callbacks.find = [](void *p, Text pattern, Range scope, bool backwards, bool ignoreCase, bool captures) {
+        auto &preview = *static_cast<Preview *>(p);
+        auto &host = preview.host();
+        if (!preview.changed && host.find)
+            return host.find(host.document, pattern, scope, backwards, ignoreCase, captures);
+        if (preview.findInText)
+            return preview.findInText(preview.read({0, preview.length}), pattern, scope, backwards, ignoreCase, captures);
+        return std::optional<Match>{};
+    };
+    callbacks.viewport = [](void *p) {
+        auto &preview = *static_cast<Preview *>(p);
+        auto &host = preview.host();
+        return host.viewport ? host.viewport(host.document) : Range{0, preview.rows};
+    };
+    callbacks.planInsert = source.host.planInsert ? +[](void *p, Key key, Offset at, unsigned tab,
+                                             unsigned indent, bool spaces, bool automatic) {
+        auto &preview = *static_cast<Preview *>(p);
+        auto &host = preview.host();
+        if (preview.changed)
+            return std::optional<InsertEdit>{};
+        return host.planInsert(host.document, key, at, tab, indent, spaces, automatic);
+    } : nullptr;
+    callbacks.indentAfter = source.host.indentAfter ? +[](void *p, Offset at, unsigned tab, unsigned indent, bool spaces) {
+        auto &preview = *static_cast<Preview *>(p);
+        auto &host = preview.host();
+        Offset original = preview.originalPosition(at);
+        return original == NoOffset ? std::u16string() : host.indentAfter(host.document, original, tab, indent, spaces);
+    } : nullptr;
+    callbacks.stepRow = source.host.stepRow ? +[](void *p, Offset row, bool down, Offset count) {
+        auto &preview = *static_cast<Preview *>(p);
+        auto &host = preview.host();
+        return preview.changed ? (down ? row + count : row - std::min(row, count)) :
+                                 host.stepRow(host.document, row, down, count);
+    } : nullptr;
+    callbacks.batch = true;
+    callbacks.inlayAt = source.host.inlayAt ? +[](void *p, Offset at) {
+        auto &preview = *static_cast<Preview *>(p);
+        const auto &host = preview.host();
+        return !preview.changed && host.inlayAt(host.document, at);
+    } : nullptr;
+    callbacks.writeCursorClipboard = nullptr;
+    return callbacks;
 }
 
 template<typename Map>
@@ -503,27 +512,15 @@ static void Translate(State &state, Map map)
     state.cursor = map(state.cursor);
     state.anchor = map(state.anchor);
     state.commandStart = map(state.commandStart);
-    state.lastInsert = map(state.lastInsert);
-    state.lastAnchor = map(state.lastAnchor);
-    state.lastVisualCursor = map(state.lastVisualCursor);
     state.searchPreview = map(state.searchPreview);
-    state.exNextLine = map(state.exNextLine);
-    state.exEnd = map(state.exEnd);
     state.insertStart = map(state.insertStart);
     state.blockReturn = map(state.blockReturn);
+    MapHistory(state, map);
     auto range = [&](Range &r) { r = {map(r.first), map(r.last)}; };
     if (!state.automaticIndent.empty())
         range(state.automaticIndent);
     for (auto &edit : state.replacements)
         edit.at = map(edit.at);
-    for (auto &mark : state.marks)
-        mark = map(mark);
-    for (auto &jump : state.jumps)
-        jump = map(jump);
-    for (auto &change : state.changes)
-        change = map(change);
-    for (auto &selection : state.occurrences)
-        range(selection);
     for (auto &caret : state.insertMirrors)
         caret = map(caret);
     for (auto &surround : state.surrounds) {
@@ -536,41 +533,38 @@ static void Translate(State &state, Map map)
     }
 }
 
-void MoveCursorOffsets(State &state, const EditBatch &batch, bool after)
+void MoveCursorOffsets(State &state, const EditMap &edit, bool after)
 {
-    Translate(state, [&](Offset position) { return batch.map(position, after); });
+    if (edit.batch)
+        Translate(state, [&](Offset position) { return edit.batch->map(position, after); });
+    else
+        Translate(state, [&](Offset position) { return OffsetAfterEdit(position, edit.range, edit.inserted); });
+
+    state.beforeInlay = false;
     state.lineUndo.reset();
 }
 
-void MoveCursorOffsets(State &state, Range range, Offset length)
-{
-    Translate(state, [&](Offset position) {
-        if (position == NoOffset || position < range.first)
-            return position;
-        return position < range.last ? range.first : position - range.size() + length;
-    });
-    state.lineUndo.reset();
-}
-
-static Offset Rebase(Offset position, const EditBatch &local, const EditBatch &all)
+static Offset Rebase(Offset position, std::span<const PlannedEdit> local, const EditBatch &all)
 {
     if (position == NoOffset)
         return position;
-    auto past = std::upper_bound(local.starts.begin(), local.starts.end(), position);
-    if (past == local.starts.begin())
+    auto past = std::upper_bound(local.begin(), local.end(), position,
+                                 [](Offset at, const PlannedEdit &edit) { return at < edit.result.first; });
+    if (past == local.begin())
         return all.map(position);
-    Offset index = Offset(past - local.starts.begin() - 1);
-    const auto &edit = local.edits[index];
-    Offset relative = position - local.starts[index];
-    if (relative <= edit.text.size()) {
-        const auto *shared = all.find(edit.range.first);
+
+    const auto &edit = *(past - 1);
+    if (position <= edit.result.last) {
+        Offset relative = position - edit.result.first;
+        const auto *shared = all.find(edit.source.first);
         if (shared)
-            return all.starts[shared - all.edits.data()] + std::min(relative, shared->text.size());
-        if (edit.range.size() == edit.text.size())
-            return all.map(edit.range.first + relative);
-        return all.map(edit.range.first, false);
+            return shared->newStart + std::min(relative, shared->text.size());
+        if (edit.source.size() == edit.result.size())
+            return all.map(edit.source.first + relative);
+        return all.map(edit.source.first, false);
     }
-    return all.map(edit.range.last + relative - edit.text.size());
+
+    return all.map(edit.source.last + position - edit.result.last);
 }
 
 static void AppendClipboard(std::u16string &text, Text piece)
@@ -584,40 +578,40 @@ CursorRun FeedCursors(std::span<State *> states, State &primary, const Host &hos
                       Registers &registers, Key key, Text text, bool smart,
                       ClusterInText cluster, FindInText find)
 {
-    Source source{host, host.length(host.context), host.lineCount(host.context)};
+    Source source{host, host.length(host.document), host.lineCount(host.document)};
     Registers local = registers;
     auto saved = registers.slots;
     auto primarySlots = saved;
     std::array<std::vector<std::shared_ptr<const Register>>, 128> written;
-    std::vector<EditBatch> planned;
-    planned.reserve(states.size());
+    std::vector<Offset> cursorEnds(states.size() + 1);
+    std::vector<PlannedEdit> positions;
     std::vector<CursorEdit> changes;
-    changes.reserve(states.size());
     std::vector<Range> flashes;
     Kind flashKind = Kind::Character;
     std::u16string clipboardOutput;
     bool wroteClipboard = false;
 
     CursorClipboard clipboard{host, states.size(), false, {}, {}};
-    auto pasteParts = key == Key::Paste ? ClipboardLines(text, states.size()) : std::vector<Text>{};
+    std::vector<Text> pasteParts;
     if (key == Key::Paste) {
         clipboard.load();
-        if (clipboard.value && clipboard.value->text == text && clipboard.value->cursors.size() == states.size()) {
-            pasteParts.clear();
-            for (const auto &part : clipboard.value->cursors)
-                pasteParts.push_back(part->text);
-        }
+        pasteParts = ClipboardParts(text, states.size(), clipboard.value ? &*clipboard.value : nullptr);
     }
 
+    std::vector<Piece> pieces;
+    std::array<const Register *, saved.size()> inputSlots;
     for (Offset i = 0; i < states.size(); ++i) {
         State &state = *states[i];
         bool active = &state == &primary;
         for (Offset slot = 0; slot < saved.size(); ++slot) {
             const auto &value = saved[slot];
             local.slots[slot] = value && value->cursors.size() == states.size() ? value->cursors[i] : value;
+            inputSlots[slot] = local.slots[slot].get();
         }
-        const auto inputSlots = local.slots;
-        Preview preview(source, active, cluster, find, clipboard, i);
+
+        pieces.clear();
+        size_t firstFlash = flashes.size();
+        Preview preview{source, pieces, flashes, clipboard, cluster, find, i, active};
         Host callbacks = preview.callbacks();
         if (key == Key::None)
             FlushMappings(state, callbacks, local);
@@ -626,7 +620,7 @@ CursorRun FeedCursors(std::span<State *> states, State &primary, const Host &hos
         if (active)
             primarySlots = local.slots;
         for (Offset slot = 0; slot < saved.size(); ++slot) {
-            if (local.slots[slot] != inputSlots[slot]) {
+            if (local.slots[slot].get() != inputSlots[slot]) {
                 if (written[slot].empty())
                     written[slot].resize(states.size());
                 written[slot][i] = local.slots[slot];
@@ -636,11 +630,15 @@ CursorRun FeedCursors(std::span<State *> states, State &primary, const Host &hos
             wroteClipboard = true;
             AppendClipboard(clipboardOutput, *preview.writtenClipboard);
         }
-        flashKind = preview.flashes.empty() ? flashKind : preview.flashKind;
-        flashes.insert(flashes.end(), preview.flashes.begin(), preview.flashes.end());
-        auto edits = preview.edits();
-        changes.insert(changes.end(), edits.begin(), edits.end());
-        planned.emplace_back(std::move(edits));
+        if (flashes.size() != firstFlash)
+            flashKind = preview.flashKind;
+        if (preview.changed && !changes.capacity()) {
+            positions.reserve(states.size());
+            changes.reserve(states.size());
+        }
+
+        preview.appendEdits(changes, positions);
+        cursorEnds[i + 1] = positions.size();
     }
     for (Offset slot = 0; slot < saved.size(); ++slot) {
         auto &values = written[slot];
@@ -672,13 +670,14 @@ CursorRun FeedCursors(std::span<State *> states, State &primary, const Host &hos
         if (host.writeCursorClipboard && value && value->text == clipboardOutput)
             host.writeCursorClipboard(host.context, *value);
         else if (host.writeClipboard)
-            host.writeClipboard(host.context, clipboardOutput);
+            host.writeClipboard(host.document, clipboardOutput);
     }
 
     EditBatch all(std::move(changes));
     if (!all.edits.empty()) {
         for (Offset i = 0; i < states.size(); ++i) {
-            Translate(*states[i], [&](Offset position) { return Rebase(position, planned[i], all); });
+            auto local = std::span<const PlannedEdit>(positions).subspan(cursorEnds[i], cursorEnds[i + 1] - cursorEnds[i]);
+            Translate(*states[i], [&](Offset position) { return Rebase(position, local, all); });
         }
     }
     return {std::move(all), std::move(flashes), flashKind};

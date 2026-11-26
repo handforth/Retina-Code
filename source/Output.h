@@ -17,4 +17,5 @@
 - (void)clear;
 - (void)appendMessages:(const std::vector<RunMessage> &)messages source:(SourceDocument *)source;
 - (void)showDiagnostics:(const std::vector<RunMessage> &)messages source:(SourceDocument *)source;
+- (void)revealDiagnostic:(const RunLocation &)location source:(SourceDocument *)source;
 @end

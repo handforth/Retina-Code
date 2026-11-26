@@ -1,10 +1,31 @@
 #import "Chrome.h"
 #import "Editor.h"
+#import "Preferences.h"
+#import "Rendering.h"
 
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <vector>
+
+static bool IsDarkAppearance(NSAppearance *appearance)
+{
+    static NSArray<NSAppearanceName> *names = @[NSAppearanceNameAqua, NSAppearanceNameDarkAqua];
+    return [[appearance bestMatchFromAppearancesWithNames:names] isEqualToString:NSAppearanceNameDarkAqua];
+}
+
+void DrawWindowBarGradient(NSRect bounds, NSAppearance *appearance)
+{
+    if (IsDarkAppearance(appearance)) {
+        static NSGradient *gradient = [[NSGradient alloc] initWithStartingColor:SRGBColor(rgb(54, 55, 58))
+                                                                 endingColor:SRGBColor(rgb(41, 42, 45))];
+        [gradient drawInRect:bounds angle:-90];
+    } else {
+        static NSGradient *gradient = [[NSGradient alloc] initWithStartingColor:SRGBColor(rgb(242, 242, 243))
+                                                                 endingColor:SRGBColor(rgb(225, 225, 228))];
+        [gradient drawInRect:bounds angle:-90];
+    }
+}
 
 bool DockIsSide(DockSide side) { return side == DockSide::Left || side == DockSide::Right; }
 
@@ -566,16 +587,19 @@ enum class CommandPointerState { Idle, Hover, Pressed };
 
 @end
 
-DockFrames LayoutDock(NSRect body, DockSide side, BOOL open, CGFloat extent)
+static constexpr CGFloat dockDividerHitPadding = 2;
+
+DockFrames LayoutDock(NSRect body, DockSide side, DockPage page, CGFloat extent, CGFloat minimumEditorWidth)
 {
     constexpr CGFloat railWidth = 24;
-    constexpr CGFloat grip = 5;
     bool vertical = DockIsSide(side);
     CGFloat rail = std::min(railWidth, vertical ? NSWidth(body) : NSHeight(body));
     CGFloat span = vertical ? NSWidth(body) : NSHeight(body);
-    CGFloat minimumEditor = vertical ? 200 : 104;
-    CGFloat maximum = std::max<CGFloat>(0, span - rail - grip - minimumEditor);
-    CGFloat size = open ? std::clamp(std::round(extent), std::min<CGFloat>(74, maximum), maximum) : 0;
+    CGFloat minimumEditor = vertical ? minimumEditorWidth : 104;
+    CGFloat dividerThickness = page == DockPage::Debug ? 1 : 5;
+    CGFloat maximum = std::max<CGFloat>(0, span - rail - dividerThickness - minimumEditor);
+    CGFloat size = page == DockPage::Hidden ? 0 : std::clamp(std::round(extent), std::min<CGFloat>(74, maximum), maximum);
+    CGFloat divider = size ? dividerThickness : 0;
     CGFloat x = NSMinX(body), y = NSMinY(body), w = NSWidth(body), h = NSHeight(body);
     CGFloat tabInset = std::min<CGFloat>(6, vertical ? h : w);
     CGFloat tabLength = std::min<CGFloat>(74, (vertical ? h : w) - tabInset);
@@ -585,31 +609,37 @@ DockFrames LayoutDock(NSRect body, DockSide side, BOOL open, CGFloat extent)
         frames.rail = NSMakeRect(x, y, w, rail);
         frames.tab = NSMakeRect(x + tabInset, y, tabLength, rail);
         frames.output = NSMakeRect(x, y + rail, w, size);
-        frames.divider = NSMakeRect(x, NSMaxY(frames.output), w, grip);
-        frames.editor.origin.y += rail + size + (size ? grip : 0);
+        frames.divider = NSMakeRect(x, NSMaxY(frames.output), w, divider);
+        frames.editor.origin.y += rail + size + divider;
         frames.editor.size.height = std::max<CGFloat>(0, NSMaxY(body) - NSMinY(frames.editor));
     } else if (side == DockSide::Top) {
         frames.rail = NSMakeRect(x, y + h - rail, w, rail);
         frames.tab = NSMakeRect(x + tabInset, NSMinY(frames.rail), tabLength, rail);
         frames.output = NSMakeRect(x, NSMinY(frames.rail) - size, w, size);
-        frames.divider = NSMakeRect(x, NSMinY(frames.output) - grip, w, grip);
-        frames.editor.size.height = std::max<CGFloat>(0, h - rail - size - (size ? grip : 0));
+        frames.divider = NSMakeRect(x, NSMinY(frames.output) - divider, w, divider);
+        frames.editor.size.height = std::max<CGFloat>(0, h - rail - size - divider);
     } else if (side == DockSide::Left) {
         frames.rail = NSMakeRect(x, y, rail, h);
         frames.tab = NSMakeRect(x, y + h - tabInset - tabLength, rail, tabLength);
         frames.output = NSMakeRect(x + rail, y, size, h);
-        frames.divider = NSMakeRect(NSMaxX(frames.output), y, grip, h);
-        frames.editor.origin.x += rail + size + (size ? grip : 0);
+        frames.divider = NSMakeRect(NSMaxX(frames.output), y, divider, h);
+        frames.editor.origin.x += rail + size + divider;
         frames.editor.size.width = std::max<CGFloat>(0, NSMaxX(body) - NSMinX(frames.editor));
     } else {
         frames.rail = NSMakeRect(x + w - rail, y, rail, h);
         frames.tab = NSMakeRect(NSMinX(frames.rail), y + h - tabInset - tabLength, rail, tabLength);
         frames.output = NSMakeRect(NSMinX(frames.rail) - size, y, size, h);
-        frames.divider = NSMakeRect(NSMinX(frames.output) - grip, y, grip, h);
-        frames.editor.size.width = std::max<CGFloat>(0, w - rail - size - (size ? grip : 0));
+        frames.divider = NSMakeRect(NSMinX(frames.output) - divider, y, divider, h);
+        frames.editor.size.width = std::max<CGFloat>(0, w - rail - size - divider);
     }
-    if (!size)
+
+    // Leave room to grab the divider without widening the visible seam.
+    if (size) {
+        frames.divider = NSInsetRect(frames.divider, vertical ? -dockDividerHitPadding : 0,
+                                   vertical ? 0 : -dockDividerHitPadding);
+    } else {
         frames.divider = NSZeroRect;
+    }
     return frames;
 }
 
@@ -624,6 +654,43 @@ std::optional<DockSide> DockSideAtPoint(NSRect body, NSPoint point)
     auto nearest = std::min_element(distances.begin(), distances.end());
     CGFloat reach = std::clamp(std::min(NSWidth(body), NSHeight(body)) / 4, 52.0, 130.0);
     return *nearest <= reach ? std::optional(DockSide(nearest - distances.begin())) : std::nullopt;
+}
+
+bool SplitDockFirst(DockSide side)
+{
+    return side == DockSide::Left || side == DockSide::Top;
+}
+
+NSRect SplitDockRect(NSRect body, DockSide side)
+{
+    NSRectEdge edge;
+    switch (side) {
+    case DockSide::Left: edge = NSMinXEdge; break;
+    case DockSide::Right: edge = NSMaxXEdge; break;
+    case DockSide::Top: edge = NSMaxYEdge; break;
+    case DockSide::Bottom: edge = NSMinYEdge; break;
+    }
+    NSRect pane, rest;
+    CGFloat extent = DockIsSide(side) ? NSWidth(body) : NSHeight(body);
+    NSDivideRect(body, &pane, &rest, std::floor(extent / 2), edge);
+    return pane;
+}
+
+void ArrangeEditorSplit(NSSplitView *split, NSView *primary, NSView *secondary, DockSide side, CGFloat fraction)
+{
+    split.vertical = DockIsSide(side);
+    NSView *first = SplitDockFirst(side) ? secondary : primary;
+    NSView *last = first == primary ? secondary : primary;
+    if (split.arrangedSubviews.firstObject != first || split.arrangedSubviews.lastObject != last) {
+        for (NSView *view in split.arrangedSubviews)
+            [view removeFromSuperview];
+        [split addArrangedSubview:first];
+        [split addArrangedSubview:last];
+    }
+
+    [split adjustSubviews];
+    CGFloat extent = split.isVertical ? NSWidth(split.bounds) : NSHeight(split.bounds);
+    [split setPosition:extent * fraction ofDividerAtIndex:0];
 }
 
 @implementation DockRail
@@ -696,13 +763,9 @@ std::optional<DockSide> DockSideAtPoint(NSRect body, NSPoint point)
 
 - (void)drawRect:(NSRect)dirty
 {
-    NSRect bounds = self.bounds;
-    [NSColor.windowBackgroundColor setFill];
-    NSRectFill(NSIntersectionRect(dirty, bounds));
-    NSRect line = self.vertical ? NSMakeRect(NSMidX(bounds) - 0.5, 0, 1, NSHeight(bounds)) :
-                                  NSMakeRect(0, NSMidY(bounds) - 0.5, NSWidth(bounds), 1);
-    [NSColor.separatorColor setFill];
-    NSRectFill(NSIntersectionRect(dirty, line));
+    NSRect strip = NSInsetRect(self.bounds, self.vertical ? dockDividerHitPadding : 0, self.vertical ? 0 : dockDividerHitPadding);
+    [[NSColor.systemGrayColor colorWithAlphaComponent:0.30] setFill];
+    NSRectFillUsingOperation(NSIntersectionRect(dirty, strip), NSCompositingOperationSourceOver);
 }
 
 - (void)mouseDown:(NSEvent *)event
@@ -727,8 +790,29 @@ std::optional<DockSide> DockSideAtPoint(NSRect body, NSPoint point)
 
 - (NSView *)hitTest:(NSPoint)point { (void)point; return nil; }
 
+- (void)viewDidChangeEffectiveAppearance
+{
+    [super viewDidChangeEffectiveAppearance];
+    self.needsDisplay = YES;
+}
+
 - (void)drawRect:(NSRect)dirty
 {
+    if (self.style == DropPreviewStyle::Insertion) {
+        NSColor *ink = IsDarkAppearance(self.window.effectiveAppearance) ? NSColor.whiteColor : NSColor.blackColor;
+        [ink setFill];
+        NSRectFill(NSIntersectionRect(dirty, self.bounds));
+        return;
+    }
+
+    if (self.style == DropPreviewStyle::Outline) {
+        CGFloat stroke = 5 / std::max<CGFloat>(self.window.backingScaleFactor, 1);
+        NSColor *ink = SelectedTheme()->dark ? NSColor.whiteColor : NSColor.blackColor;
+        [ink setFill];
+        NSFrameRectWithWidthUsingOperation(self.bounds, stroke, NSCompositingOperationSourceOver);
+        return;
+    }
+
     [[NSColor.controlAccentColor colorWithAlphaComponent:0.16] setFill];
     NSRectFillUsingOperation(NSIntersectionRect(dirty, self.bounds), NSCompositingOperationSourceOver);
     [NSColor.controlAccentColor setStroke];
@@ -737,23 +821,31 @@ std::optional<DockSide> DockSideAtPoint(NSRect body, NSPoint point)
 
 @end
 
-@class ProjectTab;
+NSRect TabInsertionMarker(NSWindow *window, NSRect viewport, CGFloat x)
+{
+    NSRect backing = NSIntegralRectWithOptions([window convertRectToBacking:viewport], NSAlignAllEdgesInward);
+    if (NSIsEmptyRect(backing))
+        return NSZeroRect;
 
-@interface ProjectTabBar ()
-- (void)dragTab:(ProjectTab *)tab toPoint:(NSPoint)point;
-@end
+    CGFloat edge = [window convertPointToBacking:NSMakePoint(x, NSMinY(viewport))].x;
+    CGFloat width = std::min(5.0, NSWidth(backing));
+    backing.origin.x = std::clamp(std::round(edge - width / 2), NSMinX(backing), NSMaxX(backing) - width);
+    backing.size.width = width;
+    return [window convertRectFromBacking:backing];
+}
 
 @interface ProjectTab : NSView
 @property(nonatomic, weak) SourceDocument *document;
 @property(nonatomic, weak) ProjectTabBar *bar;
 @property(nonatomic) BOOL selected;
 @property(nonatomic, readonly) CGFloat tabWidth;
+@property(nonatomic, readonly) NSButton *closeButton;
 - (instancetype)initWithDocument:(SourceDocument *)document bar:(ProjectTabBar *)bar;
 - (void)update;
 @end
 
 @implementation ProjectTab {
-    DockTab *_label;
+    NSButton *_label;
     NSButton *_close;
     CGFloat _tabWidth;
 }
@@ -765,18 +857,13 @@ std::optional<DockSide> DockSideAtPoint(NSRect body, NSPoint point)
         return nil;
     _document = document;
     _bar = bar;
-    _label = [[DockTab alloc] initWithFrame:NSZeroRect];
+    _label = [[NSButton alloc] initWithFrame:NSZeroRect];
     _label.bordered = NO;
     _label.alignment = NSTextAlignmentLeft;
     _label.font = [NSFont systemFontOfSize:12];
     _label.lineBreakMode = NSLineBreakByTruncatingMiddle;
     _label.target = self;
     _label.action = @selector(select:);
-    __weak ProjectTab *tab = self;
-    _label.track = ^(NSPoint point, BOOL finished) {
-        if (finished)
-            [tab finishDrag:point];
-    };
     [self addSubview:_label];
 
     _close = [[NSButton alloc] initWithFrame:NSZeroRect];
@@ -856,10 +943,7 @@ std::optional<DockSide> DockSideAtPoint(NSRect body, NSPoint point)
         action(self.document);
 }
 
-- (void)finishDrag:(NSPoint)point
-{
-    [self.bar dragTab:self toPoint:point];
-}
+- (NSButton *)closeButton { return _close; }
 
 @end
 
@@ -933,6 +1017,23 @@ std::optional<DockSide> DockSideAtPoint(NSRect body, NSPoint point)
     self.needsLayout = YES;
 }
 
+- (SourceDocument *)documentAtWindowPoint:(NSPoint)point tabView:(NSView **)tabView
+{
+    if (self.hidden || !NSPointInRect([self convertPoint:point fromView:nil], self.bounds))
+        return nil;
+
+    NSView *hit = [self hitTest:[self.superview convertPoint:point fromView:nil]];
+    for (NSView *view = hit; view && view != self; view = view.superview) {
+        if ([view isKindOfClass:ProjectTab.class]) {
+            ProjectTab *tab = (ProjectTab *)view;
+            if (tabView)
+                *tabView = [hit isDescendantOf:tab.closeButton] ? nil : tab;
+            return tab.document;
+        }
+    }
+    return nil;
+}
+
 - (void)layout
 {
     [super layout];
@@ -963,24 +1064,36 @@ std::optional<DockSide> DockSideAtPoint(NSRect body, NSPoint point)
     NSRectFillUsingOperation(NSIntersectionRect(dirty, rule), NSCompositingOperationSourceOver);
 }
 
-- (void)dragTab:(ProjectTab *)tab toPoint:(NSPoint)point
+- (TabInsertion)insertionAtWindowPoint:(NSPoint)point
 {
-    if (!self.moveDocument || !tab.document || !NSPointInRect([self convertPoint:point fromView:nil], self.bounds))
-        return;
+    if (self.hidden || !NSPointInRect([self convertPoint:point fromView:nil], self.bounds))
+        return {};
+
+    NSRect viewport = [_scroll convertRect:_scroll.bounds toView:nil];
+    if (!NSPointInRect(point, viewport))
+        return {};
+
     CGFloat x = [_contents convertPoint:point fromView:nil].x;
-    NSUInteger from = [_tabs indexOfObjectIdenticalTo:tab];
-    NSUInteger to = 0;
-    while (to < _tabs.count && x >= NSMidX(_tabs[to].frame))
-        ++to;
-    if (to > from)
-        --to;
-    if (from != NSNotFound && from != to)
-        self.moveDocument(tab.document, to);
+    CGFloat edge = NSMinX(_contents.bounds);
+    NSUInteger index = 0;
+    for (ProjectTab *tab in _tabs) {
+        if (x < NSMidX(tab.frame)) {
+            edge = NSMinX(tab.frame);
+            break;
+        }
+        edge = NSMaxX(tab.frame);
+        ++index;
+    }
+
+    CGFloat position = [_contents convertPoint:NSMakePoint(edge, 0) toView:nil].x;
+    return {index, TabInsertionMarker(self.window, viewport, position)};
 }
 
 - (IBAction)newTab:(id)sender
 {
     (void)sender;
+    if (self.activateGroup)
+        self.activateGroup();
     [NSApp sendAction:@selector(newWindowForTab:) to:NSApp.delegate from:self.window];
 }
 

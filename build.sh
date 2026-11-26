@@ -26,8 +26,13 @@ xcrun --sdk macosx clang++ \
     "$source_dir/VimView.mm" "$source_dir/Vim.cpp" "$source_dir/VimMulti.cpp" "$source_dir/Preferences.mm" "$source_dir/Typing.mm" \
     "$source_dir/Output.mm" "$source_dir/Runner.mm" "$source_dir/Chrome.mm" "$source_dir/Workspace.mm" \
     "$source_dir/FolderSearch.mm" "$source_dir/Starters.mm" "$source_dir/Debugger.mm" "$source_dir/DebugPane.mm" \
+    "$source_dir/ChildProcess.cpp" "$source_dir/RunText.cpp" "$source_dir/DebugTransport.cpp" \
+    "$source_dir/LanguageServerBridge.mm" "$source_dir/LanguageServer.cpp" "$source_dir/LanguageTools.cpp" \
+    "$source_dir/LSPProcess.cpp" "$source_dir/EditorHover.mm" \
     -o "$macos/Retina Code"
 cp "$project_dir/resources/Info.plist" "$app/Contents/Info.plist"
 cp "$project_dir/THEME_CREDITS.txt" "$resources/THEME_CREDITS.txt"
+cp "$source_dir/LispDebug.lisp" "$resources/LispDebug.lisp"
+cp "$source_dir/AliveLSP.ros" "$resources/AliveLSP.ros"
 codesign --force --sign - "$app"
 printf '%s\n' "$app"

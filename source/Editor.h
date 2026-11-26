@@ -2,15 +2,17 @@
 
 #import <AppKit/AppKit.h>
 
-NSView *CreateEditorPreview();
+NSView *CreateEditorPreview(bool compact = false);
 NSView *CommandPaletteHost(NSWindow *window);
 void PreviewEditorTheme(NSView *host, NSInteger index);
 NSArray<NSString *> *EditorLanguageNames();
+NSArray<NSMenuItem *> *LanguageFeatureCommands();
 
 @class FolderWorkspace, SourceDocument;
 FolderWorkspace *WorkspaceForEditorWindow(NSWindow *window);
 NSArray<NSMenuItem *> *FileIndentationCommands(SourceDocument *document);
 NSArray<SourceDocument *> *EditorWindowTabs(NSWindow *window);
+SourceDocument *FocusedEditorDocument(NSWindow *window);
 NSWindow *RestoreWorkspaceWindow(FolderWorkspace *workspace, NSArray<SourceDocument *> *tabs, SourceDocument *selected);
 BOOL EditorWindowShowsTabBar(NSWindow *window);
 BOOL EditorWindowOutputShown(NSWindow *window);
@@ -25,9 +27,11 @@ namespace Vim { struct EditBatch; }
 using CloseReviewCompletion = void (^)(NSSet<SourceDocument *> *discarded);
 void ReviewDocumentsForClosing(NSArray<SourceDocument *> *documents, CloseReviewCompletion completion);
 using SourceOpenCompletion = void (^)(NSDocument *, BOOL, NSError *);
+void OpenSourceTab(NSURL *url, NSWindow *window, SourceOpenCompletion completion);
 
 @protocol SourceFileOpening <NSObject>
-- (void)openSourceURL:(NSURL *)url inWindow:(NSWindow *)window completionHandler:(SourceOpenCompletion)completion;
+- (void)openSourceURL:(NSURL *)url inWindow:(NSWindow *)window asTab:(BOOL)asTab
+    completionHandler:(SourceOpenCompletion)completion;
 @end
 
 @interface SourceDocument : NSDocument
@@ -38,12 +42,15 @@ using SourceOpenCompletion = void (^)(NSDocument *, BOOL, NSError *);
 @property(nonatomic, readonly) NSInteger languageMode;
 @property(nonatomic, readonly) BOOL automaticLanguageMode;
 - (NSString *)sourceText;
+- (NSArray<NSMenuItem *> *)languagePaletteCommands;
 - (BOOL)applyFolderSearchEdits:(Vim::EditBatch)batch error:(NSError **)error;
+- (BOOL)applySourceEdits:(Vim::EditBatch)batch undoName:(NSString *)name error:(NSError **)error;
+- (NSUInteger)languageVersion;
 - (BOOL)joinTabsInWindow:(NSWindow *)window;
+- (BOOL)joinNavigationTabInWindow:(NSWindow *)window;
 - (BOOL)takeWindowFromUnusedDocument:(SourceDocument *)document;
 - (void)setFileURLFromExplorer:(NSURL *)url;
 - (void)loadExample;
-- (NSDictionary *)sessionState;
 - (NSDictionary *)sessionStateDiscardingChanges:(BOOL)discard;
 - (BOOL)needsCloseReview;
 - (BOOL)canApplySessionDraft:(NSDictionary *)state;
@@ -52,8 +59,8 @@ using SourceOpenCompletion = void (^)(NSDocument *, BOOL, NSError *);
 - (void)markSessionDraftEdited;
 - (IBAction)runDocument:(id)sender;
 - (IBAction)debugCommand:(NSMenuItem *)sender;
-- (IBAction)toggleDocumentOutput:(id)sender;
 - (IBAction)toggleExplorer:(id)sender;
+- (IBAction)closeEditorSplit:(id)sender;
 - (IBAction)selectTheme:(NSMenuItem *)sender;
 - (IBAction)selectSmoothing:(NSMenuItem *)sender;
 - (IBAction)selectFont:(NSMenuItem *)sender;

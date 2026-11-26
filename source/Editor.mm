@@ -2,7 +2,9 @@
 #import "Workspace.h"
 #import "Chrome.h"
 #import "DebugPane.h"
+#import "EditorHover.h"
 #import "FolderSearch.h"
+#import "LanguageServer.h"
 #import "Output.h"
 #import "Preferences.h"
 #import "Rendering.h"
@@ -19,9 +21,11 @@
 #include <array>
 #include <cmath>
 #include <cstring>
+#include <functional>
 #include <iterator>
 #include <map>
 #include <memory>
+#include <tuple>
 #include <sys/stat.h>
 
 static constexpr CGFloat editorPadding = 4;
@@ -29,8 +33,9 @@ static constexpr CGFloat editorLineSpacing = 3;
 static constexpr CGFloat gutterInset = 9;
 static constexpr CGFloat breakpointLane = 18;
 static constexpr CGFloat statusHeight = 23;
+static constexpr CGFloat minimumExplorerWidth = 140;
 static constexpr CGFloat containerLimit = 10000000;
-static constexpr NSUInteger largeDocumentLength = 256 * 1024;
+static constexpr NSUInteger largeDocumentLength = 64 * 1024;
 
 static Indentation DefaultIndentation(IndentationSettings settings)
 {
@@ -48,11 +53,15 @@ NSArray<NSString *> *EditorLanguageNames()
     return names;
 }
 
-static void OpenRelatedFile(NSURL *url, NSWindow *window, SourceOpenCompletion completion)
+void OpenSourceTab(NSURL *url, NSWindow *window, SourceOpenCompletion completion)
 {
+    if (!window) {
+        completion(nil, NO, nil);
+        return;
+    }
     NSDocumentController *controller = NSDocumentController.sharedDocumentController;
-    if ([controller respondsToSelector:@selector(openSourceURL:inWindow:completionHandler:)]) {
-        [(id<SourceFileOpening>)controller openSourceURL:url inWindow:window completionHandler:completion];
+    if ([controller respondsToSelector:@selector(openSourceURL:inWindow:asTab:completionHandler:)]) {
+        [(id<SourceFileOpening>)controller openSourceURL:url inWindow:window asTab:YES completionHandler:completion];
     } else {
         [controller openDocumentWithContentsOfURL:url display:YES completionHandler:completion];
     }
@@ -116,6 +125,19 @@ struct LineStart {
     std::shared_ptr<const LexState> state;
 };
 
+template<class Row>
+static void ReplaceIndexRows(std::vector<Row> &rows, size_t first, size_t past, std::span<Row> changed)
+{
+    size_t common = std::min(past - first, changed.size());
+    auto start = rows.begin() + first;
+    std::move(changed.begin(), changed.begin() + common, start);
+    if (changed.size() < past - first) {
+        rows.erase(start + common, rows.begin() + past);
+    } else if (changed.size() > common) {
+        rows.insert(rows.begin() + past, std::make_move_iterator(changed.begin() + common), std::make_move_iterator(changed.end()));
+    }
+}
+
 enum class HighlightPass { Edit, Document, Appearance };
 
 static const LexState defaultLexState;
@@ -142,13 +164,105 @@ static const LexState &IncomingState(const LineStart &line)
     return line.state ? *line.state : defaultLexState;
 }
 
-@interface EditorTextStorage : NSTextStorage
+static constexpr CGFloat inlayInset = 3;
+static constexpr CGFloat inlayGap = 2;
+static constexpr NSTimeInterval inlayDebounce = 0.18;
+static constexpr NSTimeInterval inlayRefreshDelay = 0.03;
+static constexpr NSTimeInterval inlayRetryDelay = 0.4;
+static constexpr NSTimeInterval inlayStartupWindow = 8;
+
+struct InlayLabel {
+    NSUInteger at;
+    CGFloat textWidth;
+    CGFloat left, right;
+    id line; // Shaped Core Text line, shared by identical labels in this reply.
+    bool startsWithColon = false;
+
+    CGFloat width() const { return textWidth + inlayInset * 2 + left + right; }
+};
+
+static id ShapeInlayLine(NSString *text, NSDictionary *attributes, CGFloat &width)
+{
+    NSAttributedString *styled = [[NSAttributedString alloc] initWithString:text attributes:attributes];
+    CTLineRef line = CTLineCreateWithAttributedString((__bridge CFAttributedStringRef)styled);
+    width = std::ceil(CTLineGetTypographicBounds(line, nullptr, nullptr, nullptr));
+    return (__bridge_transfer id)line;
+}
+
+static NSRange InlayLayoutRange(std::span<const InlayGap> gaps, NSUInteger textLength)
+{
+    if (gaps.empty())
+        return {};
+    NSUInteger start = gaps.front().lineStart;
+    NSUInteger end = std::min(textLength, gaps.back().lineEnd + 1);
+    return NSMakeRange(start, end - start);
+}
+
+static void InvalidateInlayLayout(NSLayoutManager *layout, NSRange range)
+{
+    if (!range.length)
+        return;
+    [layout invalidateGlyphsForCharacterRange:range changeInLength:0 actualCharacterRange:nullptr];
+    [layout invalidateLayoutForCharacterRange:range actualCharacterRange:nullptr];
+    [layout invalidateDisplayForCharacterRange:range];
+}
+
+static void RemoveInlayKerns(NSMutableAttributedString *contents, std::span<const InlayGap> gaps)
+{
+    for (const auto &gap : gaps) {
+        if (gap.kind == InlayGapKind::Glyph)
+            [contents removeAttribute:NSKernAttributeName range:NSMakeRange(gap.glyphStart, gap.at - gap.glyphStart)];
+    }
+}
+
+static size_t BuildInlayGaps(NSMutableAttributedString *contents, std::span<const InlayLabel> labels, std::span<InlayGap> gaps)
+{
+    NSString *text = contents.string;
+    NSUInteger lineStart = NSNotFound, lineEnd = 0;
+    CGFloat preceding = 0;
+    size_t count = 0;
+    for (size_t i = 0; i < labels.size();) {
+        NSUInteger at = labels[i].at;
+        CGFloat width = 0;
+        do {
+            width += labels[i++].width();
+        } while (i < labels.size() && labels[i].at == at);
+
+        if (lineStart == NSNotFound || at > lineEnd) {
+            [text getLineStart:&lineStart end:nullptr contentsEnd:&lineEnd forRange:NSMakeRange(at, 0)];
+            preceding = 0;
+        }
+
+        InlayGap gap{at, lineStart, lineEnd, at, width, preceding, InlayGapKind::Leading};
+        if (at != lineStart) {
+            gap.glyphStart = [text rangeOfComposedCharacterSequenceAtIndex:at - 1].location;
+            if ([text characterAtIndex:at - 1] == '\t') {
+                gap.kind = InlayGapKind::Tab;
+            } else {
+                gap.kind = InlayGapKind::Glyph;
+                [contents addAttribute:NSKernAttributeName value:@(width) range:NSMakeRange(gap.glyphStart, at - gap.glyphStart)];
+            }
+            preceding += width;
+        }
+        gaps[count++] = gap;
+    }
+    return count;
+}
+
+@interface EditorTextStorage : NSTextStorage <EditorInlaySpacing>
+@property(nonatomic, copy) void (^beforeCharacterEdit)(NSRange, NSString *);
+- (std::span<const InlayLabel>)inlayLabels;
+- (void)replaceInlayLabels:(std::vector<InlayLabel>)labels;
 - (void)applyAttributes:(NSDictionary<NSAttributedStringKey, id> *)attributes
                removing:(NSAttributedStringKey)key inRange:(NSRange)range;
+- (void)styleTokens:(NSDictionary<NSAttributedStringKey, id> *)attributes inRange:(NSRange)range;
 @end
 
 @implementation EditorTextStorage {
     NSMutableAttributedString *_contents;
+    std::vector<InlayLabel> _inlayLabels;
+    std::vector<InlayGap> _inlayGaps;
+    BOOL _introducedInlays;
 }
 
 - (instancetype)init
@@ -160,6 +274,143 @@ static const LexState &IncomingState(const LineStart &line)
 }
 
 - (NSString *)string { return _contents.string; }
+
+- (std::span<const InlayLabel>)inlayLabels { return _inlayLabels; }
+- (std::span<const InlayGap>)inlayGaps { return _inlayGaps; }
+
+- (void)replaceInlayLabels:(std::vector<InlayLabel>)labels
+{
+    if (_inlayLabels.empty() && labels.empty())
+        return;
+
+    NSString *text = _contents.string;
+    NSRange old = InlayLayoutRange(_inlayGaps, text.length);
+    RemoveInlayKerns(_contents, _inlayGaps);
+    _inlayLabels = std::move(labels);
+    if (_inlayLabels.empty()) {
+        std::vector<InlayGap>().swap(_inlayGaps);
+    } else {
+        _introducedInlays = YES;
+        _inlayGaps.resize(_inlayLabels.size());
+        _inlayGaps.resize(BuildInlayGaps(_contents, _inlayLabels, _inlayGaps));
+    }
+
+    NSRange current = InlayLayoutRange(_inlayGaps, text.length);
+    if (NSIntersectionRange(old, current).length) {
+        current = NSUnionRange(old, current);
+        old = {};
+    }
+    for (CodeLayoutManager *layout in self.layoutManagers) {
+        [layout setInlaySpacingSource:_inlayGaps.empty() ? nil : self];
+        InvalidateInlayLayout(layout, old);
+        InvalidateInlayLayout(layout, current);
+        VimTextView *view = (VimTextView *)layout.textContainers.firstObject.textView;
+        [view refreshVimCaretGeometry];
+        [view updateInsertionPointStateAndRestartTimer:NO];
+        [view setNeedsDisplayInRect:view.visibleRect];
+    }
+}
+
+- (void)replaceContents:(NSRange)range text:(NSString *)text attributed:(NSAttributedString *)styled
+{
+    if (styled) {
+        [_contents replaceCharactersInRange:range withAttributedString:styled];
+        if (_introducedInlays && text.length)
+            [_contents removeAttribute:NSKernAttributeName range:NSMakeRange(range.location, text.length)];
+    } else {
+        [_contents replaceCharactersInRange:range withString:text];
+    }
+}
+
+- (void)editRange:(NSRange)range text:(NSString *)text attributed:(NSAttributedString *)styled
+{
+    if (_beforeCharacterEdit)
+        _beforeCharacterEdit(range, text);
+    NSUInteger oldEnd = NSMaxRange(range);
+    NSInteger delta = NSInteger(text.length) - NSInteger(range.length);
+    bool changedKerns = false;
+    if (!_inlayGaps.empty()) {
+        NSString *source = _contents.string;
+        NSUInteger start, end;
+        [source getLineStart:&start end:nullptr contentsEnd:nullptr forRange:NSMakeRange(range.location, 0)];
+        [source getLineStart:nullptr end:&end contentsEnd:nullptr forRange:NSMakeRange(oldEnd, 0)];
+        end += end == source.length;
+
+        auto firstGap = std::ranges::lower_bound(_inlayGaps, start, {}, &InlayGap::at);
+        auto pastGap = std::ranges::lower_bound(firstGap, _inlayGaps.end(), end, {}, &InlayGap::at);
+        auto firstLabel = std::ranges::lower_bound(_inlayLabels, start, {}, &InlayLabel::at);
+        auto pastLabel = std::ranges::lower_bound(firstLabel, _inlayLabels.end(), end, {}, &InlayLabel::at);
+        changedKerns = firstGap != pastGap;
+        RemoveInlayKerns(_contents, {firstGap, pastGap});
+
+        if (firstLabel != pastLabel) {
+            auto space = [](unichar ch) { return ch == ' ' || ch == '\t'; };
+            NSUInteger first = 0;
+            while (first < text.length && space([text characterAtIndex:first]))
+                ++first;
+            bool explicitType = first < text.length && [text characterAtIndex:first] == ':';
+            NSUInteger annotation = range.location;
+            if (explicitType) {
+                while (annotation > start && space([source characterAtIndex:annotation - 1]))
+                    --annotation;
+            }
+            bool splitLine = !range.length && [text rangeOfCharacterFromSet:NSCharacterSet.newlineCharacterSet].location != NSNotFound;
+            auto kept = firstLabel;
+            for (auto label = firstLabel; label != pastLabel; ++label) {
+                NSUInteger at = label->at;
+                if (at > range.location && at < oldEnd)
+                    continue;
+                if (explicitType && label->startsWithColon && at >= annotation && at <= range.location)
+                    continue;
+                // A separator leaves a type hint attached to the name on its left.
+                bool stays = at == range.location && (splitLine || (label->startsWithColon && first == text.length));
+                if (at >= oldEnd && !stays)
+                    at += delta;
+                label->at = at;
+                if (kept != label)
+                    *kept = std::move(*label);
+                ++kept;
+            }
+
+            // The new anchors use the same labels while the server checks the edit.
+            [self replaceContents:range text:text attributed:styled];
+            NSUInteger length = _contents.length;
+            if (!length) {
+                kept = firstLabel;
+            } else if ([NSCharacterSet.newlineCharacterSet characterIsMember:[_contents.string characterAtIndex:length - 1]]) {
+                while (kept != firstLabel && (kept - 1)->at == length)
+                    --kept;
+            }
+            size_t count = BuildInlayGaps(_contents, {firstLabel, kept}, {firstGap, pastGap});
+            pastGap = _inlayGaps.erase(firstGap + count, pastGap);
+            pastLabel = _inlayLabels.erase(kept, pastLabel);
+        } else {
+            [self replaceContents:range text:text attributed:styled];
+        }
+
+        if (delta) {
+            for (auto gap = pastGap; gap != _inlayGaps.end(); ++gap) {
+                gap->at += delta;
+                gap->lineStart += delta;
+                gap->lineEnd += delta;
+                gap->glyphStart += delta;
+            }
+            for (auto label = pastLabel; label != _inlayLabels.end(); ++label)
+                label->at += delta;
+        }
+        if (_inlayGaps.empty()) {
+            for (CodeLayoutManager *layout in self.layoutManagers)
+                [layout setInlaySpacingSource:nil];
+        }
+    } else {
+        [self replaceContents:range text:text attributed:styled];
+    }
+
+    NSTextStorageEditActions actions = NSTextStorageEditedCharacters;
+    if (styled || changedKerns)
+        actions |= NSTextStorageEditedAttributes;
+    [self edited:actions range:range changeInLength:delta];
+}
 
 - (void)fixAttributesInRange:(NSRange)range
 {
@@ -196,21 +447,26 @@ static const LexState &IncomingState(const LineStart &line)
 
 - (void)replaceCharactersInRange:(NSRange)range withString:(NSString *)text
 {
-    NSInteger delta = NSInteger(text.length) - NSInteger(range.length);
-    [_contents replaceCharactersInRange:range withString:text];
-    [self edited:NSTextStorageEditedCharacters range:range changeInLength:delta];
+    [self editRange:range text:text attributed:nil];
 }
 
 - (void)replaceCharactersInRange:(NSRange)range withAttributedString:(NSAttributedString *)text
 {
-    NSInteger delta = NSInteger(text.length) - NSInteger(range.length);
-    [_contents replaceCharactersInRange:range withAttributedString:text];
-    [self edited:NSTextStorageEditedCharacters | NSTextStorageEditedAttributes range:range changeInLength:delta];
+    [self editRange:range text:text.string attributed:text];
 }
 
 - (void)setAttributes:(NSDictionary<NSAttributedStringKey, id> *)attributes range:(NSRange)range
 {
     [_contents setAttributes:attributes range:range];
+    if (!_inlayGaps.empty() && range.length) {
+        auto first = std::ranges::upper_bound(_inlayGaps, range.location, {}, &InlayGap::at);
+        for (auto gap = first; gap != _inlayGaps.end() && gap->glyphStart < NSMaxRange(range); ++gap) {
+            if (gap->kind != InlayGapKind::Glyph)
+                continue;
+            NSRange kern = NSMakeRange(gap->glyphStart, gap->at - gap->glyphStart);
+            [_contents addAttribute:NSKernAttributeName value:@(gap->width) range:NSIntersectionRange(range, kern)];
+        }
+    }
     [self edited:NSTextStorageEditedAttributes range:range changeInLength:0];
 }
 
@@ -280,14 +536,196 @@ static const LexState &IncomingState(const LineStart &line)
     [self edited:NSTextStorageEditedAttributes range:range changeInLength:0];
 }
 
+- (void)styleTokens:(NSDictionary<NSAttributedStringKey, id> *)attributes inRange:(NSRange)range
+{
+    // The base style already marked this range as edited.
+    [_contents addAttributes:attributes range:range];
+}
+
 @end
 
 struct BuildError {
     NSRange range;
     NSString *message = nil;
+    bool warning = false;
+    NSString *label = nil;
+    RunLocation location{};
+    bool fromOutput = false;
+    bool unusedWarning = false;
 };
 
+static std::optional<LSPPosition> LSPReadPosition(id value)
+{
+    NSDictionary *position = LSPDict(value);
+    NSNumber *line = LSPNumber(position[@"line"]);
+    NSNumber *column = LSPNumber(position[@"character"]);
+    if (!line || !column || line.unsignedLongLongValue > INT32_MAX || column.unsignedLongLongValue > INT32_MAX)
+        return {};
+    return LSPPosition{line.unsignedIntegerValue, column.unsignedIntegerValue};
+}
+
+static NSCharacterSet *NonLSPLineBreaks()
+{
+    static NSCharacterSet *const characters = [NSCharacterSet characterSetWithCharactersInString:@"\u0085\u2028\u2029"];
+    return characters;
+}
+
+struct LSPTextLines {
+    std::vector<NSRange> lines;
+
+    explicit LSPTextLines(NSString *text)
+    {
+        CFStringInlineBuffer buffer;
+        CFStringInitInlineBuffer((__bridge CFStringRef)text, &buffer, CFRangeMake(0, text.length));
+        NSUInteger start = 0, length = text.length;
+        for (NSUInteger i = 0; i < length; ++i) {
+            unichar ch = CFStringGetCharacterFromInlineBuffer(&buffer, i);
+            if (ch != '\r' && ch != '\n')
+                continue;
+            lines.push_back(NSMakeRange(start, i - start));
+            if (ch == '\r' && i + 1 < length && CFStringGetCharacterFromInlineBuffer(&buffer, i + 1) == '\n')
+                ++i;
+            start = i + 1;
+        }
+        lines.push_back(NSMakeRange(start, length - start));
+    }
+
+    NSUInteger offset(LSPPosition position) const
+    {
+        if (position.line >= lines.size())
+            return NSNotFound;
+        NSRange line = lines[position.line];
+        return line.location + std::min(position.character, line.length);
+    }
+
+    LSPPosition position(NSUInteger offset) const
+    {
+        auto line = std::upper_bound(lines.begin(), lines.end(), offset,
+            [](NSUInteger character, NSRange range) { return character < range.location; }) - 1;
+        return {NSUInteger(line - lines.begin()), std::min(offset - line->location, line->length)};
+    }
+};
+
+static NSRange LSPReadRange(id value, auto offsetAt)
+{
+    NSDictionary *range = LSPDict(value);
+    auto first = LSPReadPosition(range[@"start"]), last = LSPReadPosition(range[@"end"]);
+    if (!first || !last)
+        return NSMakeRange(NSNotFound, 0);
+    NSUInteger start = offsetAt(*first), end = offsetAt(*last);
+    return start != NSNotFound && end != NSNotFound && start <= end ? NSMakeRange(start, end - start) : NSMakeRange(NSNotFound, 0);
+}
+
+static std::u16string LSPText(NSString *text)
+{
+    std::u16string result(text.length, 0);
+    if (text.length)
+        [text getCharacters:reinterpret_cast<unichar *>(result.data()) range:NSMakeRange(0, text.length)];
+    return result;
+}
+
+static bool AddLSPTextEdits(id values, auto rangeInText, std::vector<Vim::CursorEdit> &edits)
+{
+    NSArray *items = LSPArray(values);
+    if (!items || items.count > 50000)
+        return false;
+    edits.reserve(edits.size() + items.count);
+    for (id item in items) {
+        NSDictionary *edit = LSPDict(item);
+        NSString *text = LSPString(edit[@"newText"]);
+        NSRange range = rangeInText(edit[@"range"]);
+        if (!text || range.location == NSNotFound)
+            return false;
+        edits.push_back({{range.location, NSMaxRange(range)}, LSPText(text)});
+    }
+    return true;
+}
+
+static NSURL *LSPFile(id uri)
+{
+    NSString *text = LSPString(uri);
+    return text.length ? CanonicalFileURL([NSURL URLWithString:text]) : nil;
+}
+
+static NSString *ApplyWorkspaceLanguageEdit(id value, NSURL *root, NSString *name)
+{
+    NSDictionary *workspaceEdit = LSPDict(value);
+    if (!workspaceEdit)
+        return @"The language server returned an invalid edit.";
+    NSMutableArray<NSDictionary *> *files = [NSMutableArray array];
+    NSArray *changes = LSPArray(workspaceEdit[@"documentChanges"]);
+    if (changes) {
+        for (id item in changes) {
+            NSDictionary *change = LSPDict(item);
+            if (!LSPDict(change[@"textDocument"]) || !LSPArray(change[@"edits"]))
+                return @"This edit includes a file operation.";
+            [files addObject:change];
+        }
+    } else {
+        NSDictionary *plain = LSPDict(workspaceEdit[@"changes"]);
+        for (NSString *uri in plain)
+            [files addObject:@{@"textDocument":@{@"uri":uri}, @"edits":plain[uri]}];
+    }
+    struct PlannedEdit {
+        SourceDocument *document;
+        Vim::EditBatch batch;
+    };
+    std::vector<PlannedEdit> plans;
+    NSMutableSet<NSString *> *paths = [NSMutableSet set];
+    NSDocumentController *documents = NSDocumentController.sharedDocumentController;
+    for (NSDictionary *file in files) {
+        NSDictionary *identifier = file[@"textDocument"];
+        NSURL *url = LSPFile(identifier[@"uri"]);
+        if (!url || !PathIsInFolder(url.path, root.path))
+            return @"The edit refers to a file outside the workspace.";
+        if ([paths containsObject:url.path])
+            return @"The language server returned overlapping file edits.";
+        [paths addObject:url.path];
+        NSDocument *open = [documents documentForURL:url];
+        if (!open) {
+            for (NSDocument *candidate in documents.documents) {
+                if ([CanonicalFileURL(candidate.fileURL).path isEqualToString:url.path]) {
+                    open = candidate;
+                    break;
+                }
+            }
+        }
+        if (open && ![open isKindOfClass:SourceDocument.class])
+            return @"An affected file is open in a different document type.";
+        NSNumber *version = LSPNumber(identifier[@"version"]);
+        SourceDocument *document = (SourceDocument *)open;
+        if (version && (!document || document.languageVersion != version.unsignedIntegerValue))
+            return @"A file changed before the language server could edit it.";
+        if (!document) {
+            NSError *error = nil;
+            document = [[SourceDocument alloc] initWithContentsOfURL:url ofType:@"public.source-code" error:&error];
+            if (!document)
+                return error.localizedDescription ? error.localizedDescription : @"An affected file could not be opened.";
+        }
+        LSPTextLines index(document.sourceText);
+        std::vector<Vim::CursorEdit> edits;
+        if (!AddLSPTextEdits(file[@"edits"], [&](id bounds) {
+                return LSPReadRange(bounds, [&](LSPPosition position) { return index.offset(position); });
+            }, edits))
+            return @"The language server returned an invalid text range.";
+        Vim::EditBatch batch;
+        if (!batch.assign(std::move(edits), Vim::EditOrder::Server))
+            return @"The language server returned overlapping text edits.";
+        plans.push_back({document, std::move(batch)});
+    }
+    for (auto &plan : plans) {
+        NSError *error = nil;
+        if (![plan.document applySourceEdits:std::move(plan.batch) undoName:name error:&error])
+            return error.localizedDescription ? error.localizedDescription : @"An affected file could not be edited.";
+    }
+    return nil;
+}
+
 @class SyntaxBuffer;
+
+@interface SourceDocument (LanguageLocations)
+- (void)revealLanguagePosition:(LSPPosition)position;
+@end
 
 @interface CodeView : VimTextView
 @property(nonatomic) const Theme *theme;
@@ -299,15 +737,29 @@ struct BuildError {
 - (void)showDebugLine:(NSUInteger)line exception:(NSString *)exception;
 @property(nonatomic, weak) SyntaxBuffer *syntax;
 @property(nonatomic, readonly) NSFont *editorFont;
+@property(nonatomic, copy) void (^revealError)(const BuildError &);
+@property(nonatomic, readonly) BOOL hoverHasFocus;
+@property(nonatomic, readonly) BOOL hasHoveredError;
 - (void)applyAppearance;
 - (void)applyAppearanceWithTheme:(const ThemeRef &)palette;
+- (void)applyAppearanceWithTheme:(const ThemeRef &)palette font:(NSFont *)font hintFont:(NSFont *)hintFont;
 - (void)loadText:(NSString *)text;
 - (void)prepareDocumentAppearance:(NSString *)text;
 - (void)refreshBracketMatch;
 - (void)refreshWordSelection;
 - (void)dismissCompletion;
+- (void)dismissServerCompletion;
+- (void)completionViewportChanged;
 - (BOOL)validateCompletion;
-- (void)refreshBuildErrorToolTips;
+- (void)diagnosticsChanged;
+- (void)enumerateBuildErrorsInRect:(NSRect)area usingBlock:(void (^)(const BuildError &, NSRect))block;
+- (BOOL)viewErrorAtCursor;
+- (void)updateLanguageTracking;
+- (void)updateLanguageHoverModifiers:(NSEventModifierFlags)flags atWindowPoint:(NSPoint)point;
+- (void)updateLanguageHoverAtWindowPoint:(NSPoint)point modifiers:(NSEventModifierFlags)modifiers;
+- (void)dismissLanguageInformation;
+- (void)presentLanguageError:(NSString *)message;
+- (IBAction)languageCommand:(NSMenuItem *)sender;
 @end
 
 @interface SyntaxBuffer : NSObject <NSTextStorageDelegate>
@@ -316,6 +768,7 @@ struct BuildError {
 @property(nonatomic, readonly) Indentation indentation;
 @property(nonatomic, readonly) BOOL hasFileIndentation;
 @property(nonatomic) Language language;
+@property(nonatomic) LSPDocument *languageDocument;
 - (NSUInteger)lineForOffset:(NSUInteger)offset;
 - (NSUInteger)offsetForLine:(NSUInteger)line;
 - (NSUInteger)lineCount;
@@ -339,13 +792,34 @@ struct BuildError {
 - (void)setFileIndentation:(Indentation)indentation;
 - (void)resetFileIndentation;
 - (const std::vector<BuildError> &)buildErrors;
+- (void)refreshBuildErrorViews;
 - (void)addBuildErrors:(const std::vector<BuildError> &)errors;
+- (void)replaceCheckErrors:(const std::vector<BuildError> &)errors;
 - (void)clearBuildErrors;
+- (const std::vector<BuildError> &)languageErrors;
+- (void)setLanguageErrors:(std::vector<BuildError>)errors;
+- (LSPPosition)languagePosition:(NSUInteger)offset;
+- (NSUInteger)languageOffset:(LSPPosition)position;
+- (NSRange)languageRange:(id)range;
+- (void)scheduleInlayHints;
+- (void)scheduleInlayHintsAfter:(NSTimeInterval)delay;
+- (void)refreshInlayHintsAfter:(NSTimeInterval)delay;
+- (void)resetInlayHints;
+- (void)suspendInlayHintsIfHidden;
 @end
+
+static NSRange LineContents(NSString *text, NSUInteger start)
+{
+    NSUInteger end = start;
+    if (start < text.length)
+        [text getLineStart:nullptr end:nullptr contentsEnd:&end forRange:NSMakeRange(start, 0)];
+    return NSMakeRange(start, end - start);
+}
 
 @implementation SyntaxBuffer {
     ThemeRef _theme;
     NSArray<NSColor *> *_colors;
+    std::array<NSDictionary *, size_t(Ink::Count) * 2> _tokenStyles;
     NSArray<NSColor *> *_bracketColors;
     std::vector<uint32_t> _bracketStarts;
     std::vector<BracketNode> _bracketNodes;
@@ -353,6 +827,14 @@ struct BuildError {
     NSFont *_italicFont;
     std::vector<TypedPair> _typedPairs;
     std::vector<BuildError> _buildErrors;
+    std::vector<BuildError> _languageErrors;
+    std::optional<LSPTextChange> _languageEdit;
+    BOOL _languageReplacing;
+    BOOL _languageHasOtherLineBreaks;
+    NSTimer *_inlayTimer;
+    NSInteger _inlayRequest;
+    NSRange _inlayRows;
+    NSTimeInterval _inlayRetryUntil; // Negative until the first visible request.
     std::vector<LineStart> _lines;
     std::vector<NameCounts::iterator> _lineNames;
     NameCounts _names;
@@ -516,6 +998,21 @@ struct BuildError {
 - (void)forgetTypedPairs
 {
     _typedPairs.clear();
+}
+
+- (NSDictionary *)tokenStyle:(Ink)ink nonCode:(bool)nonCode
+{
+    NSMutableDictionary *style = [NSMutableDictionary dictionaryWithCapacity:3];
+    if (_language != Language::Plain && _theme->ink[size_t(ink)] != _theme->ink[size_t(Ink::Text)])
+        style[NSForegroundColorAttributeName] = _colors[size_t(ink)];
+    if (nonCode) {
+        Ink role = ink == Ink::Comment || ink == Ink::Escape ? ink : Ink::String;
+        style[EditorNonCodeAttribute] = @(NSInteger(role));
+    }
+    if (_language != Language::Plain && _italicFont &&
+        ((ink == Ink::Type && _theme->italicTypes) || (ink == Ink::Comment && _theme->italicComments)))
+        style[NSFontAttributeName] = _italicFont;
+    return [style copy];
 }
 
 - (uint32_t)colorBracketsInLine:(std::u16string_view)line tokens:(const std::vector<Token> &)tokens
@@ -691,16 +1188,12 @@ struct BuildError {
                     ++name->second;
                     names.push_back(name);
                 }
-                if (!plain && _theme->ink[ink] != _theme->ink[size_t(Ink::Text)])
-                    [_storage addAttribute:NSForegroundColorAttributeName value:_colors[ink] range:range];
-                if (token.nonCode || token.ink == Ink::Comment || token.ink == Ink::String || token.ink == Ink::Escape) {
-                    Ink role = token.ink == Ink::Comment || token.ink == Ink::Escape ? token.ink : Ink::String;
-                    [_storage addAttribute:EditorNonCodeAttribute value:@(NSInteger(role)) range:range];
-                }
-                if (!plain && _italicFont &&
-                    ((token.ink == Ink::Type && _theme->italicTypes) ||
-                     (token.ink == Ink::Comment && _theme->italicComments)))
-                    [_storage addAttribute:NSFontAttributeName value:_italicFont range:range];
+                bool nonCode = token.nonCode || token.ink == Ink::Comment || token.ink == Ink::String || token.ink == Ink::Escape;
+                auto &style = _tokenStyles[ink * 2 + nonCode];
+                if (!style)
+                    style = [self tokenStyle:token.ink nonCode:nonCode];
+                if (style.count)
+                    [_storage styleTokens:style inRange:range];
             }
             if (colorize)
                 bracketStack = [self colorBracketsInLine:line tokens:tokens offset:offset stack:bracketStack local:localBrackets];
@@ -730,12 +1223,7 @@ struct BuildError {
                 _names.erase(name);
         }
         size_t replaced = pastName - firstName;
-        size_t common = std::min(replaced, names.size());
-        std::copy_n(names.begin(), common, _lineNames.begin() + firstName);
-        if (names.size() < replaced)
-            _lineNames.erase(_lineNames.begin() + firstName + common, _lineNames.begin() + pastName);
-        else if (names.size() > replaced)
-            _lineNames.insert(_lineNames.begin() + pastName, names.begin() + common, names.end());
+        ReplaceIndexRows(_lineNames, firstName, pastName, std::span(names));
         if (_lineNames.size() < _lineNames.capacity() / 4)
             _lineNames.shrink_to_fit();
         for (auto &line : updated)
@@ -746,18 +1234,9 @@ struct BuildError {
                 _lines[i].firstName = _lines[i].firstName - replaced + names.size();
             }
         }
-        if (updated.size() == resume - firstLine) {
-            std::move(updated.begin(), updated.end(), _lines.begin() + firstLine);
-            if (colorize)
-                std::copy(updatedBracketStarts.begin(), updatedBracketStarts.end(), _bracketStarts.begin() + firstLine);
-        } else {
-            auto insertion = _lines.erase(_lines.begin() + firstLine, _lines.begin() + resume);
-            _lines.insert(insertion, std::make_move_iterator(updated.begin()), std::make_move_iterator(updated.end()));
-            if (colorize) {
-                auto start = _bracketStarts.erase(_bracketStarts.begin() + firstLine, _bracketStarts.begin() + resume);
-                _bracketStarts.insert(start, updatedBracketStarts.begin(), updatedBracketStarts.end());
-            }
-        }
+        ReplaceIndexRows(_lines, firstLine, resume, std::span(updated));
+        if (colorize)
+            ReplaceIndexRows(_bracketStarts, firstLine, resume, std::span(updatedBracketStarts));
     }
 }
 
@@ -775,13 +1254,14 @@ struct BuildError {
 }
 
 - (const std::vector<BuildError> &)buildErrors { return _buildErrors; }
+- (const std::vector<BuildError> &)languageErrors { return _languageErrors; }
 
 - (void)refreshBuildErrorViews
 {
     for (NSLayoutManager *layout in _storage.layoutManagers) {
         NSTextView *view = layout.textContainers.firstObject.textView;
         if ([view isKindOfClass:CodeView.class])
-            [(CodeView *)view refreshBuildErrorToolTips];
+            [(CodeView *)view diagnosticsChanged];
         [view setNeedsDisplayInRect:view.visibleRect];
     }
 }
@@ -801,12 +1281,12 @@ struct BuildError {
     _buildErrors.erase(end, _buildErrors.end());
     if (_buildErrors.size() > outputScrollbackLines)
         _buildErrors.resize(outputScrollbackLines);
-    NSUInteger tooltipCharacters = outputScrollbackCharacters;
+    NSUInteger messageCharacters = outputScrollbackCharacters;
     for (auto &error : _buildErrors) {
-        if (error.message.length > tooltipCharacters)
+        if (error.message.length > messageCharacters)
             error.message = nil;
         else
-            tooltipCharacters -= error.message.length;
+            messageCharacters -= error.message.length;
     }
     [self refreshBuildErrorViews];
 }
@@ -817,6 +1297,281 @@ struct BuildError {
         _buildErrors.clear();
         [self refreshBuildErrorViews];
     }
+}
+
+- (void)replaceCheckErrors:(const std::vector<BuildError> &)errors
+{
+    size_t removed = std::erase_if(_buildErrors, [](const BuildError &error) { return !error.fromOutput; });
+    if (!errors.empty())
+        [self addBuildErrors:errors];
+    else if (removed)
+        [self refreshBuildErrorViews];
+}
+
+- (void)setLanguageErrors:(std::vector<BuildError>)errors
+{
+    if (errors.empty() && _languageErrors.empty())
+        return;
+    std::stable_sort(errors.begin(), errors.end(), [](const BuildError &first, const BuildError &second) {
+        return first.range.location < second.range.location;
+    });
+    _languageErrors = std::move(errors);
+    [self refreshBuildErrorViews];
+}
+
+- (void)setLanguageDocument:(LSPDocument *)document
+{
+    [self resetInlayHints];
+    _languageDocument = document;
+    _inlayRetryUntil = document ? -1 : 0;
+    _languageEdit.reset();
+    _languageReplacing = NO;
+    _languageHasOtherLineBreaks = document && [_storage.string rangeOfCharacterFromSet:NonLSPLineBreaks()].location != NSNotFound;
+    if (document) {
+        __weak SyntaxBuffer *buffer = self;
+        _storage.beforeCharacterEdit = ^(NSRange range, NSString *text) { [buffer recordLanguageEdit:range text:text]; };
+    } else {
+        _storage.beforeCharacterEdit = nil;
+    }
+}
+
+- (void)cancelInlayRequest
+{
+    if (_inlayRequest)
+        [_languageDocument cancelRequest:std::exchange(_inlayRequest, 0)];
+    _inlayRows = {};
+}
+
+- (void)resetInlayHints
+{
+    [_inlayTimer invalidate];
+    _inlayTimer = nil;
+    [self cancelInlayRequest];
+    [_storage replaceInlayLabels:{}];
+}
+
+- (void)suspendInlayHintsIfHidden
+{
+    if (!_inlayRows.length && !_inlayTimer && [_storage inlayLabels].empty())
+        return;
+    for (NSLayoutManager *layout in _storage.layoutManagers) {
+        if (layout.textContainers.firstObject.textView.window)
+            return;
+    }
+    [self resetInlayHints];
+}
+
+- (void)refreshInlayHintsAfter:(NSTimeInterval)delay
+{
+    [_inlayTimer invalidate];
+    _inlayTimer = nil;
+    [self cancelInlayRequest];
+    [self scheduleInlayHintsAfter:delay];
+}
+
+- (void)scheduleInlayHints
+{
+    [self scheduleInlayHintsAfter:inlayDebounce];
+}
+
+- (void)scheduleInlayHintsAfter:(NSTimeInterval)delay
+{
+    if (!ShowInlayHints() || _inlayTimer || !_storage.length ||
+        ![_languageDocument supports:@"inlayHintProvider"])
+        return;
+    __weak SyntaxBuffer *buffer = self;
+    _inlayTimer = [NSTimer timerWithTimeInterval:delay repeats:NO block:^(NSTimer *) {
+        SyntaxBuffer *target = buffer;
+        if (target) {
+            target->_inlayTimer = nil;
+            [target requestInlayViewport];
+        }
+    }];
+    [NSRunLoop.mainRunLoop addTimer:_inlayTimer forMode:NSRunLoopCommonModes];
+}
+
+- (void)requestInlayViewport
+{
+    if (!ShowInlayHints() || !_storage.length || ![_languageDocument supports:@"inlayHintProvider"])
+        return;
+
+    constexpr NSUInteger maxRows = 256;
+    constexpr NSUInteger margin = 24;
+    NSRange visible{};
+    bool focused = false;
+    [self finishHighlighting];
+    for (NSLayoutManager *layout in _storage.layoutManagers) {
+        CodeView *view = (CodeView *)layout.textContainers.firstObject.textView;
+        if (!view.window.isKeyWindow || view.isHiddenOrHasHiddenAncestor || NSIsEmptyRect(view.visibleRect))
+            continue;
+        auto characters = [view vimCharactersInViewport:view.visibleRect];
+        NSUInteger first = [self lineForOffset:characters.first];
+        NSUInteger last = [self lineForOffset:characters.last];
+        NSRange rows = NSMakeRange(first, std::min(last - first + 1, maxRows));
+        NSRange both = visible.length ? NSUnionRange(visible, rows) : rows;
+        bool active = view.window.firstResponder == view;
+        if (both.length <= maxRows)
+            visible = both;
+        else if (active || !focused)
+            visible = rows;
+        focused |= active;
+    }
+    if (!visible.length || NSEqualRanges(NSIntersectionRange(visible, _inlayRows), visible))
+        return;
+
+    [self cancelInlayRequest];
+    NSUInteger before = std::min({visible.location, margin, (maxRows - visible.length) / 2});
+    NSUInteger after = std::min({NSUInteger(_lines.size()) - NSMaxRange(visible), margin,
+                                 maxRows - visible.length - before});
+    NSRange rows = NSMakeRange(visible.location - before, visible.length + before + after);
+    NSUInteger past = NSMaxRange(rows);
+    LSPPosition start = [self languagePosition:_lines[rows.location].offset];
+    LSPPosition end = [self languagePosition:past < _lines.size() ? _lines[past].offset : _storage.length];
+    NSUInteger version = _textVersion;
+    if (_inlayRetryUntil < 0)
+        _inlayRetryUntil = NSProcessInfo.processInfo.systemUptime + inlayStartupWindow;
+
+    __weak SyntaxBuffer *buffer = self;
+    _inlayRequest = [_languageDocument requestInlayHintsFrom:start to:end reply:^(lsp::InlayHints hints, BOOL succeeded) {
+        SyntaxBuffer *target = buffer;
+        if (!target || version != target->_textVersion)
+            return;
+        target->_inlayRequest = 0;
+        if (succeeded) {
+            [target placeInlayHints:hints inRows:rows];
+            if (!hints.items.empty())
+                target->_inlayRetryUntil = 0;
+        } else {
+            target->_inlayRows = {};
+        }
+
+        // Startup analysis can leave hints empty or invalidate an in-flight request.
+        if (target->_inlayRetryUntil && NSProcessInfo.processInfo.systemUptime + inlayRetryDelay < target->_inlayRetryUntil) {
+            target->_inlayRows = {};
+            [target scheduleInlayHintsAfter:inlayRetryDelay];
+        }
+    }];
+    if (_inlayRequest)
+        _inlayRows = rows;
+}
+
+- (void)placeInlayHints:(lsp::InlayHints &)hints inRows:(NSRange)rows
+{
+    if (hints.items.empty() || !_font || !_storage.length) {
+        [_storage replaceInlayLabels:{}];
+        return;
+    }
+
+    NSFont *font = InlayFont(_font);
+    NSDictionary *attributes = @{NSFontAttributeName:font, (id)kCTForegroundColorFromContextAttributeName:@YES};
+
+    NSString *text = _storage.string;
+    std::optional<LSPTextLines> otherLineBreaks;
+    if (_languageHasOtherLineBreaks)
+        otherLineBreaks.emplace(text);
+    struct Shape {
+        std::string_view label;
+        id line = nil;
+        CGFloat width = 0;
+    };
+    std::array<Shape, 64> shapes{};
+    std::ranges::sort(hints.items, [](const auto &first, const auto &second) {
+        return std::tie(first.line, first.character, first.labelOffset) <
+               std::tie(second.line, second.character, second.labelOffset);
+    });
+    std::vector<InlayLabel> labels;
+    labels.reserve(hints.items.size());
+    NSUInteger row = NSNotFound, start = 0, end = 0;
+    for (const auto &hint : hints.items) {
+        if (hint.line != row) {
+            row = hint.line;
+            if (row >= (otherLineBreaks ? otherLineBreaks->lines.size() : _lines.size()))
+                break;
+
+            NSRange line = otherLineBreaks ? otherLineBreaks->lines[row] : LineContents(text, _lines[row].offset);
+            start = line.location;
+            end = NSMaxRange(line);
+        }
+        NSUInteger at = start + hint.character;
+        if (start >= text.length || at > end || !NSLocationInRange([self lineForOffset:at], rows))
+            continue;
+        if (at < text.length && at != [text rangeOfComposedCharacterSequenceAtIndex:at].location)
+            continue;
+
+        @autoreleasepool {
+            auto label = std::string_view(hints.labels).substr(hint.labelOffset, hint.labelLength);
+            auto &shape = shapes[std::hash<std::string_view>{}(label) % shapes.size()];
+            if (shape.label != label) {
+                NSString *string = [[NSString alloc] initWithBytes:label.data() length:label.size() encoding:NSUTF8StringEncoding];
+                if (!string)
+                    continue;
+
+                CGFloat width;
+                id line = ShapeInlayLine(string, attributes, width);
+                shape = {label, line, width};
+            }
+            labels.push_back({at, shape.width, hint.paddingLeft ? inlayGap : 0,
+                              hint.paddingRight ? inlayGap : 0, shape.line, label.starts_with(':')});
+        }
+    }
+    [_storage replaceInlayLabels:std::move(labels)];
+}
+
+- (LSPPosition)languagePosition:(NSUInteger)offset
+{
+    [self finishHighlighting];
+    NSString *text = _storage.string;
+    offset = std::min(offset, text.length);
+    if (_languageHasOtherLineBreaks)
+        return LSPTextLines(text).position(offset);
+    NSUInteger line = [self lineForOffset:offset];
+    return {line, offset - _lines[line].offset};
+}
+
+- (NSUInteger)languageOffset:(LSPPosition)position
+{
+    [self finishHighlighting];
+    NSString *text = _storage.string;
+    if (_languageHasOtherLineBreaks)
+        return LSPTextLines(text).offset(position);
+    if (position.line >= _lines.size())
+        return NSNotFound;
+    NSRange line = LineContents(text, _lines[position.line].offset);
+    return line.location + std::min(position.character, line.length);
+}
+
+- (NSRange)languageRange:(id)range
+{
+    if (_languageHasOtherLineBreaks) {
+        LSPTextLines lines(_storage.string);
+        return LSPReadRange(range, [&](LSPPosition position) { return lines.offset(position); });
+    }
+    return LSPReadRange(range, [&](LSPPosition position) { return [self languageOffset:position]; });
+}
+
+- (void)recordLanguageEdit:(NSRange)range text:(NSString *)replacement
+{
+    for (NSLayoutManager *layout in _storage.layoutManagers) {
+        NSTextView *view = layout.textContainers.firstObject.textView;
+        if ([view isKindOfClass:CodeView.class])
+            [(CodeView *)view dismissLanguageInformation];
+    }
+    NSString *text = _storage.string;
+    auto splitsNewline = [&](NSUInteger offset) {
+        return offset && offset < text.length && [text characterAtIndex:offset] == '\n' &&
+            [text characterAtIndex:offset - 1] == '\r';
+    };
+    if (_languageDocument.sendingChanges && !_languageReplacing && !_pending && !_lines.empty() &&
+        !_languageHasOtherLineBreaks && !splitsNewline(range.location) && !splitsNewline(NSMaxRange(range))) {
+        NSUInteger first = [self lineForOffset:range.location], last = [self lineForOffset:NSMaxRange(range)];
+        _languageEdit = LSPTextChange{{first, range.location - _lines[first].offset},
+                                      {last, NSMaxRange(range) - _lines[last].offset}, [replacement copy]};
+    } else {
+        _languageEdit.reset();
+    }
+    _languageReplacing = YES;
+    if (!_languageHasOtherLineBreaks && [replacement rangeOfCharacterFromSet:NonLSPLineBreaks()].location != NSNotFound)
+        _languageHasOtherLineBreaks = YES;
 }
 
 - (void)finishHighlighting
@@ -855,7 +1610,9 @@ struct BuildError {
     _theme = theme;
     if (!paletteChanged && !italicChanged && !bracketsChanged && _font == font && !restyle)
         return;
+    _tokenStyles.fill(nil);
     NSFont *previousItalicFont = _italicFont;
+    BOOL inlayFontChanged = ![_font isEqual:font];
     _font = font;
     NSFont *italic = (theme->italicTypes || theme->italicComments) && font ?
                      [NSFontManager.sharedFontManager convertFont:font toHaveTrait:NSItalicFontMask] : nil;
@@ -887,11 +1644,17 @@ struct BuildError {
     } else if (restoreFont && font) {
         [_storage applyAttributes:@{NSFontAttributeName:font} removing:nil inRange:NSMakeRange(0, _storage.length)];
     }
+    if (inlayFontChanged && ShowInlayHints()) {
+        [self resetInlayHints];
+        [self scheduleInlayHints];
+    }
 }
 
 - (void)setLanguage:(Language)language
 {
     if (_language != language) {
+        if (_language == Language::Plain || language == Language::Plain)
+            _tokenStyles.fill(nil);
         _language = language;
         ++_textVersion;
         [self clearBuildErrors];
@@ -907,6 +1670,12 @@ struct BuildError {
         return;
     ++_textVersion;
     [self clearBuildErrors];
+    if (_languageDocument) {
+        [_languageDocument changed:std::exchange(_languageEdit, std::nullopt)];
+        if (ShowInlayHints())
+            [self refreshInlayHintsAfter:inlayDebounce];
+    }
+    _languageReplacing = NO;
     NSUInteger oldLength = NSUInteger(NSInteger(range.length) - delta);
     NSRange previous = NSMakeRange(range.location, oldLength);
     // The line index still describes the old text at the start of an edit.
@@ -928,29 +1697,13 @@ struct BuildError {
         ShiftDebugBreakpoints(_breakpointPath, firstAffected, oldLines, newLines);
     }
     const auto *batch = [VimTextView cursorBatchForStorage:storage];
-    if (batch) {
-        auto adjust = [&](NSRange &part) {
-            if (batch->overlaps({part.location, NSMaxRange(part)}))
-                return false;
-            part.location = batch->map(part.location);
-            return true;
-        };
-        std::erase_if(_typedPairs, [&](TypedPair &pair) {
-            return !adjust(pair.opening) || !adjust(pair.closing);
-        });
-        [VimTextView vimStorage:storage editedBatch:*batch];
-    } else {
-        AdjustTypedPairs(_typedPairs, previous, range.length);
-        [VimTextView vimStorage:storage edited:previous newLength:range.length];
-    }
+    Vim::EditMap edit{{previous.location, NSMaxRange(previous)}, range.length, batch};
+    AdjustTypedPairs(_typedPairs, edit);
+    [VimTextView vimStorage:storage edited:edit];
     for (NSLayoutManager *layout in storage.layoutManagers) {
         NSTextView *view = layout.textContainers.firstObject.textView;
-        if ([view isKindOfClass:VimTextView.class]) {
-            if (batch)
-                [(VimTextView *)view vimStorageEditedBatch:*batch];
-            else
-                [(VimTextView *)view vimStorageEdited:previous newLength:range.length];
-        }
+        if ([view isKindOfClass:VimTextView.class])
+            [(VimTextView *)view vimStorageEdited:edit];
     }
 
     // Applying color separately keeps TextKit's character edit and caret movement intact.
@@ -966,6 +1719,11 @@ struct BuildError {
 }
 
 @end
+
+static bool LispSymbols(Language language)
+{
+    return language == Language::CommonLisp || language == Language::Clojure;
+}
 
 static bool WordCharacterAt(NSString *text, NSUInteger offset, bool lisp = false)
 {
@@ -1004,11 +1762,7 @@ static NSRange SourceLine(SyntaxBuffer *buffer, NSUInteger line)
 {
     if (!line || line > buffer.lineCount)
         return NSMakeRange(NSNotFound, 0);
-    NSUInteger start = [buffer offsetForLine:line - 1], end = start;
-    NSString *source = buffer.storage.string;
-    if (start < source.length)
-        [source getLineStart:nullptr end:nullptr contentsEnd:&end forRange:NSMakeRange(start, 0)];
-    return NSMakeRange(start, end - start);
+    return LineContents(buffer.storage.string, [buffer offsetForLine:line - 1]);
 }
 
 static NSUInteger SourceColumn(NSString *text, NSRange line, NSUInteger column, bool byteColumns, bool hasBOM)
@@ -1038,19 +1792,30 @@ static NSUInteger SourceColumn(NSString *text, NSRange line, NSUInteger column, 
     return at;
 }
 
+static NSUInteger DiagnosticColumn(NSString *text, NSRange line, NSUInteger column, const RunLocation &location, bool hasBOM)
+{
+    if (location.utf16Columns)
+        return line.location + std::min(line.length, column ? column - 1 : 0);
+
+    return SourceColumn(text, line, column, location.byteColumns, hasBOM);
+}
+
 static NSRange BuildErrorRange(SyntaxBuffer *buffer, const RunLocation &location, BOOL hasBOM)
 {
     NSRange line = SourceLine(buffer, location.line);
+    if (line.location == NSNotFound && location.line == buffer.lineCount + 1)
+        return NSMakeRange(buffer.storage.length, 0);
     if (!line.length)
         return line;
+
     NSString *text = buffer.storage.string;
     if (location.endColumn > location.firstColumn) {
-        NSUInteger start = SourceColumn(text, line, location.firstColumn, location.byteColumns, hasBOM);
-        NSUInteger end = SourceColumn(text, line, location.endColumn, location.byteColumns, hasBOM);
+        NSUInteger start = DiagnosticColumn(text, line, location.firstColumn, location, hasBOM);
+        NSUInteger end = DiagnosticColumn(text, line, location.endColumn, location, hasBOM);
         if (end > start)
             return NSMakeRange(start, end - start);
     }
-    NSUInteger at = SourceColumn(text, line, location.column, location.byteColumns, hasBOM);
+    NSUInteger at = DiagnosticColumn(text, line, location.column, location, hasBOM);
     NSRange token = [text rangeOfComposedCharacterSequenceAtIndex:std::min(at, NSMaxRange(line) - 1)];
     while (NSMaxRange(token) < NSMaxRange(line) && WordCharacterAt(text, token.location) &&
            WordCharacterAt(text, NSMaxRange(token))) {
@@ -1060,20 +1825,449 @@ static NSRange BuildErrorRange(SyntaxBuffer *buffer, const RunLocation &location
     return token;
 }
 
+static bool DiagnosticContains(NSString *text, NSString *fragment)
+{
+    return [text rangeOfString:fragment options:NSCaseInsensitiveSearch].length != 0;
+}
+
+static bool IsHideableUnusedWarning(SyntaxBuffer *buffer, NSUInteger offset, NSString *code, NSString *message)
+{
+    bool unused = DiagnosticContains(code, @"unused") || DiagnosticContains(code, @"dead_code") || DiagnosticContains(code, @"dead-code");
+    if (!unused && message.length) {
+        // The LSP Unnecessary tag also covers unrelated warnings, so use the diagnostic text when the code is generic.
+        static NSRegularExpression *const pattern = [NSRegularExpression regularExpressionWithPattern:@"(?<!['\"`])\\b(?:unused|unreferenced)\\b|\\bnever (?:be )?(?:used|read|referenced|called|constructed|accessed)\\b|\\bnot (?:used|read|referenced|accessed)\\b" options:NSRegularExpressionCaseInsensitive error:nil];
+        unused = [pattern rangeOfFirstMatchInString:message options:0 range:NSMakeRange(0, message.length)].length != 0;
+    }
+    if (!unused)
+        return false;
+
+    if (DiagnosticContains(code, @"import") || DiagnosticContains(code, @"include") || DiagnosticContains(code, @"extern_crate") || DiagnosticContains(code, @"extern-crate") || DiagnosticContains(code, @"using-decl") || [code isEqualToString:@"F401"])
+        return false;
+
+    static NSString *const importPhrases[] = {@"unused import", @"unused include", @"included header", @"imported but", @"imported and", @"import declaration", @"using declaration"};
+    for (NSString *phrase : importPhrases) {
+        if (DiagnosticContains(message, phrase))
+            return false;
+    }
+
+    if (JavaScriptFamily(buffer.language)) {
+        // TypeScript uses the same code and message for unused bindings and individual imports.
+        static NSRegularExpression *const importPrefix = [NSRegularExpression regularExpressionWithPattern:@"(?m)(?:^|;)\\h*import\\b\\s*(?:(?:type\\s+)?(?:[$\\w]+\\s*,\\s*)?\\{[^{};]*|[\\w$*][^\\r\\n;{}]*)?\\z" options:0 error:nil];
+        NSUInteger length = std::min(offset, NSUInteger(2048));
+        NSRange prefix = NSMakeRange(offset - length, length);
+        if ([importPrefix rangeOfFirstMatchInString:buffer.storage.string options:0 range:prefix].length)
+            return false;
+    }
+    return true;
+}
+
 static constexpr CGFloat completionRowHeight = 18;
 static constexpr CGFloat completionInset = 2;
 static constexpr NSUInteger completionLimit = 8;
+static constexpr size_t completionCacheLimit = 256;
+
+enum class CompletionKind { Word, Function, Type, Variable, Field, Module, Keyword, Value };
+enum class CallParameters : uint8_t { Unknown, None, Arguments, Receiver };
+
+struct CompletionItem {
+    NSString *label = nil;
+    NSString *text = nil;
+    NSString *filter = nil;
+    NSString *order = nil;
+    NSDictionary *replaceRange = nil;
+    NSArray *additionalEdits = nil;
+    CompletionKind kind = CompletionKind::Word;
+    NSString *detail = nil;
+    NSString *labelDetail = nil;
+};
+
+struct CompletionEdit {
+    NSRange range;
+    std::u16string text;
+    NSUInteger caret;
+    NSUInteger existingCaret = NSNotFound;
+    NSUInteger newPair = NSNotFound;
+};
+
+static std::u16string_view TrimSignature(std::u16string_view text)
+{
+    size_t first = text.find_first_not_of(u" \t\r\n");
+    if (first == text.npos)
+        return {};
+    return text.substr(first, text.find_last_not_of(u" \t\r\n") - first + 1);
+}
+
+static bool RustReceiverOnly(std::u16string_view parameters)
+{
+    if (parameters.starts_with(u"&"))
+        parameters = TrimSignature(parameters.substr(1));
+    if (parameters.starts_with(u"'")) {
+        size_t end = parameters.find_first_of(u" \t");
+        if (end == parameters.npos)
+            return false;
+        parameters = TrimSignature(parameters.substr(end));
+    }
+    if (parameters.starts_with(u"mut ") || parameters.starts_with(u"mut\t"))
+        parameters = TrimSignature(parameters.substr(3));
+    if (!parameters.starts_with(u"self"))
+        return false;
+    parameters = TrimSignature(parameters.substr(4));
+    if (!parameters.empty() && parameters.back() == u',')
+        parameters = TrimSignature(parameters.substr(0, parameters.size() - 1));
+    if (parameters.empty())
+        return true;
+    if (!parameters.starts_with(u":"))
+        return false;
+    // An explicit receiver type can contain commas of its own.
+    unsigned nesting = 0;
+    for (char16_t character : parameters) {
+        if (character == u',' && !nesting)
+            return false;
+        if (character == u'<' || character == u'(' || character == u'[' || character == u'{')
+            ++nesting;
+        else if (nesting && (character == u'>' || character == u')' || character == u']' || character == u'}'))
+            --nesting;
+    }
+    return true;
+}
+
+static CallParameters ParametersInSignature(NSString *signature, Language language, NSUInteger *argumentStart = nullptr)
+{
+    if (!signature.length || signature.length > 1024)
+        return CallParameters::Unknown;
+    auto text = LSPText(signature);
+    unsigned angles = 0, parentheses = 0;
+    size_t opening = 0;
+    for (size_t i = 0; i < text.size(); ++i) {
+        char16_t character = text[i];
+        if (character == u'(' && (parentheses || !angles)) {
+            if (parentheses++ == 0)
+                opening = i;
+        } else if (character == u')' && parentheses && --parentheses == 0) {
+            if (argumentStart)
+                *argumentStart = opening;
+            auto parameters = TrimSignature(std::u16string_view(text).substr(opening + 1, i - opening - 1));
+            if (parameters.empty() || (CFamily(language) && parameters == u"void"))
+                return CallParameters::None;
+            return language == Language::Rust && RustReceiverOnly(parameters) ? CallParameters::Receiver : CallParameters::Arguments;
+        } else if (!parentheses && character == u'<') {
+            ++angles;
+        } else if (!parentheses && angles && character == u'>' && (i == 0 || text[i - 1] != u'-')) {
+            --angles;
+        }
+    }
+    return CallParameters::Unknown;
+}
+
+static CallParameters CompletionParameters(const CompletionItem &item, Language language)
+{
+    for (NSString *signature : {language == Language::Rust ? item.detail : item.labelDetail,
+                               language == Language::Rust ? item.labelDetail : item.label,
+                               language == Language::Rust ? item.label : item.detail}) {
+        CallParameters result = ParametersInSignature(signature, language);
+        if (result != CallParameters::Unknown)
+            return result;
+    }
+    return CallParameters::Unknown;
+}
+
+static bool CompletionTakesArguments(const CompletionItem &item, Language language, bool boundReceiver)
+{
+    CallParameters parameters = CompletionParameters(item, language);
+    return parameters != CallParameters::None && (parameters != CallParameters::Receiver || !boundReceiver);
+}
+
+static NSString *CompletionDisplayLabel(const CompletionItem &item, Language language, bool boundReceiver)
+{
+    if (item.kind != CompletionKind::Function)
+        return item.label;
+
+    NSCharacterSet *whitespace = NSCharacterSet.whitespaceAndNewlineCharacterSet;
+    NSString *name = [item.label stringByTrimmingCharactersInSet:whitespace];
+    if (CFamily(language) && [name hasPrefix:@"operator"] && (name.length == 8 || !IsASCIIIdentifierPart([name characterAtIndex:8])))
+        return name;
+    if ([name containsString:@"("]) {
+        NSUInteger opening = NSNotFound;
+        ParametersInSignature(name, language, &opening);
+        if (opening == NSNotFound || opening == 0)
+            return name;
+        name = [[name substringToIndex:opening] stringByTrimmingCharactersInSet:whitespace];
+    }
+
+    boundReceiver |= language == Language::Rust && [item.text hasPrefix:@"self."];
+    return [name stringByAppendingString:CompletionTakesArguments(item, language, boundReceiver) ? @"(...)" : @"()"];
+}
+
+static bool CallHasReceiver(NSString *source, NSUInteger before)
+{
+    while (before) {
+        unichar previous = [source characterAtIndex:before - 1];
+        if (previous != ' ' && previous != '\t')
+            return previous == '.';
+        --before;
+    }
+    return false;
+}
+
+static NSUInteger SkipCallSpaces(NSString *source, NSUInteger offset, bool acrossLines = false)
+{
+    while (offset < source.length) {
+        unichar character = [source characterAtIndex:offset];
+        if (character != ' ' && character != '\t' && !(acrossLines && (character == '\r' || character == '\n')))
+            break;
+        ++offset;
+    }
+    return offset;
+}
+
+static bool ImportStatementAt(NSString *source, NSUInteger offset, Language language)
+{
+    NSUInteger start;
+    [source getLineStart:&start end:nullptr contentsEnd:nullptr forRange:NSMakeRange(offset, 0)];
+    start = SkipCallSpaces(source, start);
+    NSUInteger end = start;
+    while (end < offset && WordCharacterAt(source, end))
+        ++end;
+    if (end == start || end == offset)
+        return false;
+    NSRange word = NSMakeRange(start, end - start);
+    if ((CFamily(language) || language == Language::CSharp) &&
+        [source compare:@"using" options:NSLiteralSearch range:word] == NSOrderedSame)
+        return true;
+    if (language == Language::Python && [source compare:@"from" options:NSLiteralSearch range:word] == NSOrderedSame)
+        return true;
+    if ([source compare:@"import" options:NSLiteralSearch range:word] != NSOrderedSame)
+        return false;
+    NSUInteger next = SkipCallSpaces(source, end);
+    return next == source.length || [source characterAtIndex:next] != '(';
+}
+
+static NSUInteger CallTypeArgumentsEnd(NSString *source, NSUInteger offset, Language language)
+{
+    NSUInteger start = offset;
+    unichar open = '<', close = '>';
+    switch (language) {
+    case Language::Rust:
+        if (source.length - start < 3 || [source compare:@"::<" options:NSLiteralSearch range:NSMakeRange(start, 3)] != NSOrderedSame)
+            return offset;
+        start += 2;
+        break;
+
+    case Language::Go:
+        open = '[';
+        close = ']';
+        break;
+
+    case Language::Cpp: case Language::ObjectiveCpp: case Language::TypeScript: case Language::TSX:
+    case Language::CSharp: case Language::Kotlin: case Language::Dart: case Language::Swift:
+        break;
+
+    default:
+        return offset;
+    }
+
+    if (start >= source.length || [source characterAtIndex:start] != open)
+        return offset;
+
+    unsigned depth = 1;
+    for (NSUInteger end = start + 1; end < source.length; ++end) {
+        unichar character = [source characterAtIndex:end];
+        if (character == '\n' || character == '\r' || character == ';')
+            break;
+
+        if (character == open) {
+            ++depth;
+        } else if (character == close && (close != '>' || [source characterAtIndex:end - 1] != '-')) {
+            if (--depth == 0)
+                return end + 1;
+        }
+    }
+
+    return offset;
+}
+
+static NSUInteger LastCallOpening(std::u16string_view text)
+{
+    unsigned depth = 0;
+    for (size_t i = text.size(); i > 0; --i) {
+        if (text[i - 1] == u')')
+            ++depth;
+        else if (text[i - 1] == u'(' && depth && --depth == 0)
+            return i - 1;
+    }
+    return NSNotFound;
+}
+
+static CompletionKind CompletionKindForLSP(NSInteger kind)
+{
+    switch (kind) {
+        case 2: case 3: case 4: return CompletionKind::Function;
+        case 7: case 8: case 13: case 22: case 25: return CompletionKind::Type;
+        case 6: return CompletionKind::Variable;
+        case 5: case 10: return CompletionKind::Field;
+        case 9: return CompletionKind::Module;
+        case 14: return CompletionKind::Keyword;
+        case 12: case 20: case 21: return CompletionKind::Value;
+        default: return CompletionKind::Word;
+    }
+}
+
+enum class LanguageCommand { Definition, References, Hover, Signature, Rename, Format, CodeActions, Symbols, Completion, QuickFix };
+
+struct LanguageFeature {
+    NSString *title;
+    NSString *capability;
+    NSString *method;
+};
+
+static const LanguageFeature languageFeatures[] = {
+    {@"Go to Definition", @"definitionProvider", @"textDocument/definition"},
+    {@"Find References", @"referencesProvider", @"textDocument/references"},
+    {@"Show Documentation", @"hoverProvider", @"textDocument/hover"},
+    {@"Show Signature", @"signatureHelpProvider", @"textDocument/signatureHelp"},
+    {@"Rename Symbol…", @"renameProvider", @"textDocument/rename"},
+    {@"Format Document", @"documentFormattingProvider", @"textDocument/formatting"},
+    {@"Code Actions…", @"codeActionProvider", @"textDocument/codeAction"},
+    {@"Go to Symbol…", @"documentSymbolProvider", @"textDocument/documentSymbol"},
+    {@"Show Completions", @"completionProvider", @"textDocument/completion"},
+    {@"Quick Fix…", @"codeActionProvider", @"textDocument/codeAction"},
+};
+
+static bool SupportsLanguageFeature(LSPDocument *document, LanguageCommand command)
+{
+    return [document supports:languageFeatures[size_t(command)].capability] ||
+           (command == LanguageCommand::Format && [document supports:@"documentRangeFormattingProvider"]);
+}
+
+static NSDictionary *LanguageActionParams(SyntaxBuffer *buffer, NSRange selection, BOOL quickFix, BOOL automatic)
+{
+    LSPDocument *document = buffer.languageDocument;
+    LSPPosition start = [buffer languagePosition:selection.location];
+    LSPPosition end = [buffer languagePosition:NSMaxRange(selection)];
+    LSPPosition requestStart = start;
+    auto before = [](LSPPosition a, LSPPosition b) {
+        return a.line < b.line || (a.line == b.line && a.character < b.character);
+    };
+    NSMutableArray *diagnostics = [NSMutableArray array];
+    for (NSDictionary *diagnostic in document.diagnostics) {
+        NSDictionary *range = LSPDict(diagnostic[@"range"]);
+        auto first = LSPReadPosition(range[@"start"]), last = LSPReadPosition(range[@"end"]);
+        if (!first || !last || before(*last, start) || before(end, *first))
+            continue;
+        [diagnostics addObject:diagnostic];
+        // A caret immediately after a diagnostic still belongs to that diagnostic.
+        if (quickFix && !selection.length && !before(start, *last) && before(*first, requestStart))
+            requestStart = *first;
+    }
+    NSMutableDictionary *context = [@{@"diagnostics":diagnostics, @"triggerKind":@(automatic ? 2 : 1)} mutableCopy];
+    if (quickFix)
+        context[@"only"] = @[@"quickfix"];
+    return @{@"textDocument":@{@"uri":document.file.absoluteString}, @"context":context,
+             @"range":@{@"start":LSPPositionValue(requestStart), @"end":LSPPositionValue(end)}};
+}
+
+static NSDictionary *LanguageActionCommand(NSDictionary *action)
+{
+    return LSPString(action[@"command"]).length ? action : LSPDict(action[@"command"]);
+}
+
+static NSArray<NSDictionary *> *UsableLanguageActions(id result, LSPDocument *document, BOOL quickFix)
+{
+    NSMutableArray<NSDictionary *> *actions = [NSMutableArray array];
+    BOOL resolves = document.resolvesCodeActions;
+    for (id value in LSPArray(result)) {
+        NSDictionary *action = LSPDict(value);
+        if (!LSPString(action[@"title"]).length || LSPDict(action[@"disabled"]))
+            continue;
+        NSString *kind = LSPString(action[@"kind"]);
+        if (quickFix && kind.length && ![kind isEqualToString:@"quickfix"] && ![kind hasPrefix:@"quickfix."])
+            continue;
+        if (!resolves && !LSPDict(action[@"edit"]) && !LSPString(LanguageActionCommand(action)[@"command"]).length)
+            continue;
+        [actions addObject:action];
+        if (actions.count == 80)
+            break;
+    }
+    return actions;
+}
+
+static bool DefinitionModifier(NSEventModifierFlags flags)
+{
+    constexpr NSEventModifierFlags modifiers = NSEventModifierFlagCommand | NSEventModifierFlagOption |
+        NSEventModifierFlagShift | NSEventModifierFlagControl;
+    return (flags & modifiers) == NSEventModifierFlagCommand;
+}
+
+static id LocationURI(NSDictionary *location)
+{
+    return location[@"targetUri"] ? location[@"targetUri"] : location[@"uri"];
+}
+
+static id LocationRange(NSDictionary *location)
+{
+    return location[@"targetSelectionRange"] ? location[@"targetSelectionRange"] : location[@"range"];
+}
+
+static bool HasDefinitionLocation(id result)
+{
+    NSArray *locations = LSPArray(result);
+    if (!locations && LSPDict(result))
+        locations = @[result];
+    for (id item in locations) {
+        NSDictionary *location = LSPDict(item);
+        NSString *uri = LSPString(LocationURI(location));
+        if (uri.length && [NSURL URLWithString:uri].isFileURL && LSPReadPosition(LSPDict(LocationRange(location))[@"start"]))
+            return true;
+    }
+    return false;
+}
+
+static NSMenuItem *MakeLanguageCommand(LanguageCommand command)
+{
+    const LanguageFeature &feature = languageFeatures[size_t(command)];
+    unichar key = 0;
+    NSEventModifierFlags modifiers = 0;
+    if (command == LanguageCommand::Definition || command == LanguageCommand::References) {
+        key = NSF12FunctionKey;
+        modifiers = command == LanguageCommand::References ? NSEventModifierFlagShift : 0;
+    } else if (command == LanguageCommand::Rename) {
+        key = NSF2FunctionKey;
+    } else if (command == LanguageCommand::Signature) {
+        key = ' ';
+        modifiers = NSEventModifierFlagControl | NSEventModifierFlagShift;
+    } else if (command == LanguageCommand::QuickFix) {
+        key = '.';
+        modifiers = NSEventModifierFlagCommand;
+    }
+    NSString *equivalent = key ? [NSString stringWithCharacters:&key length:1] : @"";
+    NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:feature.title action:@selector(languageCommand:) keyEquivalent:equivalent];
+    item.keyEquivalentModifierMask = modifiers;
+    item.tag = NSInteger(command);
+    return item;
+}
+
+NSArray<NSMenuItem *> *LanguageFeatureCommands()
+{
+    NSMutableArray<NSMenuItem *> *commands = [NSMutableArray arrayWithCapacity:std::size(languageFeatures)];
+    for (size_t index = 0; index < std::size(languageFeatures); ++index)
+        [commands addObject:MakeLanguageCommand(LanguageCommand(index))];
+    return commands;
+}
 
 @interface CompletionList : NSView
-@property(nonatomic, readonly) NSArray<NSString *> *items;
 @property(nonatomic) NSUInteger selectedRow;
 @property(nonatomic, copy) void (^accept)(void);
-- (NSSize)setItems:(NSArray<NSString *> *)items theme:(const ThemeRef &)theme;
+- (const std::vector<CompletionItem> &)items;
+- (NSSize)setItems:(std::span<const CompletionItem>)items theme:(const ThemeRef &)theme language:(Language)language boundReceiver:(BOOL)boundReceiver;
+- (void)clear;
 @end
 
 @implementation CompletionList {
     ThemeRef _theme;
     NSTextFieldCell *_label;
+    NSTextFieldCell *_kind;
+    std::vector<CompletionItem> _items;
+    std::array<NSString *, completionLimit> _displayLabels;
 }
 
 - (instancetype)initWithFrame:(NSRect)frame
@@ -1086,6 +2280,11 @@ static constexpr NSUInteger completionLimit = 8;
         _label.drawsBackground = NO;
         _label.bordered = NO;
         _label.lineBreakMode = NSLineBreakByTruncatingTail;
+        _kind = [[NSTextFieldCell alloc] initTextCell:@""];
+        _kind.font = [NSFont boldSystemFontOfSize:11];
+        _kind.alignment = NSTextAlignmentCenter;
+        _kind.drawsBackground = NO;
+        _kind.bordered = NO;
         self.accessibilityLabel = @"Completions";
     }
     return self;
@@ -1094,22 +2293,43 @@ static constexpr NSUInteger completionLimit = 8;
 - (BOOL)isFlipped { return YES; }
 - (BOOL)isOpaque { return YES; }
 
-- (NSSize)setItems:(NSArray<NSString *> *)items theme:(const ThemeRef &)theme
+- (const std::vector<CompletionItem> &)items { return _items; }
+
+- (void)clear
 {
-    _items = items;
+    self.hidden = YES;
+    _items.clear();
+    _displayLabels.fill(nil);
+}
+
+- (NSSize)setItems:(std::span<const CompletionItem>)items theme:(const ThemeRef &)theme language:(Language)language boundReceiver:(BOOL)boundReceiver
+{
+    NSString *selected = !self.hidden && _selectedRow < _items.size() ? _items[_selectedRow].label : nil;
+    _items.assign(items.begin(), items.end());
     _theme = theme;
-    self.selectedRow = 0;
+    auto row = std::find_if(_items.begin(), _items.end(), [&](const CompletionItem &item) {
+        return [item.label isEqualToString:selected];
+    });
+    self.selectedRow = row == _items.end() ? 0 : NSUInteger(row - _items.begin());
     CGFloat width = 140;
     NSDictionary *attributes = @{NSFontAttributeName:_label.font};
-    for (NSString *item in items)
-        width = std::max(width, std::ceil([item sizeWithAttributes:attributes].width) + 18);
-    return NSMakeSize(std::min(width, 300.0), items.count * completionRowHeight + 2 * completionInset);
+    for (NSUInteger i = 0; i < _displayLabels.size(); ++i) {
+        NSString *label = i < _items.size() ? CompletionDisplayLabel(_items[i], language, boundReceiver) : nil;
+        _displayLabels[i] = label;
+        if (label)
+            width = std::max(width, std::ceil([label sizeWithAttributes:attributes].width) + 30);
+    }
+    return NSMakeSize(std::min(width, 300.0), _items.size() * completionRowHeight + 2 * completionInset);
 }
 
 - (void)setSelectedRow:(NSUInteger)row
 {
+    if (_selectedRow != row) {
+        for (NSUInteger changed : {_selectedRow, row})
+            [self setNeedsDisplayInRect:NSMakeRect(0, completionInset + changed * completionRowHeight,
+                                                 NSWidth(self.bounds), completionRowHeight)];
+    }
     _selectedRow = row;
-    [self setNeedsDisplay:YES];
 }
 
 - (void)drawRect:(NSRect)dirty
@@ -1119,25 +2339,40 @@ static constexpr NSUInteger completionLimit = 8;
     NSRectFill(self.bounds);
     [SRGBColor(accents.completionPaper) setFill];
     NSRectFill(NSInsetRect(self.bounds, 1, 1));
-    for (NSUInteger i = 0; i < _items.count; ++i) {
+    static NSString *const symbols[] = {@"·", @"ƒ", @"T", @"x", @"▪", @"▣", @"K", @"#"};
+    static constexpr Ink inks[] = {Ink::Text, Ink::Function, Ink::Type, Ink::Name, Ink::Name,
+                                   Ink::Type, Ink::Keyword, Ink::Constant};
+    for (NSUInteger i = 0; i < _items.size(); ++i) {
         NSRect row = NSMakeRect(completionInset, completionInset + i * completionRowHeight,
                                 NSWidth(self.bounds) - 2 * completionInset, completionRowHeight);
         if (!NSIntersectsRect(dirty, row))
             continue;
-        if (i == _selectedRow) {
+        bool selected = i == _selectedRow;
+        if (selected) {
             [SRGBColor(accents.completionSelection) setFill];
             NSRectFill(row);
         }
-        _label.stringValue = _items[i];
-        _label.textColor = SRGBColor(i == _selectedRow ? accents.completionSelectedText : _theme->ink[size_t(Ink::Text)]);
-        [_label drawInteriorWithFrame:NSInsetRect(row, 5, 0) inView:self];
+        const auto &item = _items[i];
+        size_t kind = size_t(item.kind);
+        Col32 base = selected ? accents.completionSelection : accents.completionPaper;
+        Col32 ink = selected ? accents.completionSelectedText : _theme->ink[size_t(inks[kind])];
+        NSRect badge = NSMakeRect(NSMinX(row) + 5, NSMinY(row) + 2, 14, NSHeight(row) - 4);
+        [SRGBColor(BlendColor(base, ink, 14)) setFill];
+        NSRectFill(badge);
+        _kind.stringValue = symbols[kind];
+        _kind.textColor = SRGBColor(ink);
+        [_kind drawInteriorWithFrame:badge inView:self];
+        _label.stringValue = _displayLabels[i];
+        _label.textColor = SRGBColor(selected ? accents.completionSelectedText : _theme->ink[size_t(Ink::Text)]);
+        [_label drawInteriorWithFrame:NSMakeRect(NSMinX(row) + 24, NSMinY(row), NSWidth(row) - 28, NSHeight(row))
+                              inView:self];
     }
 }
 
 - (void)mouseDown:(NSEvent *)event
 {
     CGFloat y = [self convertPoint:event.locationInWindow fromView:nil].y - completionInset;
-    if (y >= 0 && y < _items.count * completionRowHeight) {
+    if (y >= 0 && y < _items.size() * completionRowHeight) {
         self.selectedRow = NSUInteger(y / completionRowHeight);
         if (self.accept)
             self.accept();
@@ -1147,9 +2382,12 @@ static constexpr NSUInteger completionLimit = 8;
 @end
 
 @implementation CodeView {
+    BOOL _preparingViewport;
+    BOOL _fittingDocument;
     ThemeRef _palette;
     NSFont *_editorFont;
     NSUInteger _fontTabStop;
+    CGFloat _minimumLineHeight;
     std::optional<TypingEdit> _vimTypingEdit;
     BOOL _pasting;
     BracketMatch _brackets;
@@ -1161,10 +2399,32 @@ static constexpr NSUInteger completionLimit = 8;
     CompletionList *_completion;
     NSRange _completionPrefix;
     NSUInteger _completionVersion;
+    BOOL _completionActive;
+    BOOL _editingCompletionPrefix;
+    BOOL _completionIncomplete;
+    BOOL _completionTriggered;
+    std::vector<CompletionItem> _serverCompletions;
+    NSTimer *_languageCompletionTimer;
+    __weak LSPDocument *_completionDocument;
+    NSInteger _languageCompletionRequest;
+    NSUInteger _completionGeneration;
+    NSTrackingArea *_languageTracking;
+    NSTimer *_languageHoverTimer;
+    NSTimer *_hoverLeaveTimer;
+    EditorHover *_languageInformation;
+    std::optional<BuildError> _hoveredError;
+    NSArray<NSDictionary *> *_hoverQuickFixes;
+    BOOL _commandHover;
+    NSRange _languageHoverRange;
+    NSRect _languageHoverHighlight;
+    NSUInteger _languageInformationGeneration;
+    NSInteger _languageInformationRequest;
+    NSInteger _definitionRequest;
+    __weak LSPDocument *_informationDocument;
+    NSUInteger _languageActionsGeneration;
     NSRange _wordSelection;
     NSString *_selectedWord;
     NSUInteger _wordVersion;
-    std::vector<NSToolTipTag> _buildErrorToolTips;
 }
 
 - (NSUInteger)vimDocumentLineCount { return self.syntax.lineCount; }
@@ -1217,12 +2477,13 @@ static constexpr NSUInteger completionLimit = 8;
     if (edits.empty())
         return;
     [self dismissCompletion];
-    [self applyDocumentEdits:Vim::EditBatch(std::move(edits)) undoName:@"Toggle Line Comment"
-            insertionAdvance:[](Vim::Text inserted) {
+    auto advance = [](Vim::Text inserted) {
         // Keep the selection with the code and put an empty block caret between its markers.
         auto space = inserted.find(u' ');
         return space == 0 || space == Vim::Text::npos ? Vim::Offset(0) : space + 1;
-    }];
+    };
+    [self applyDocumentEdits:Vim::EditBatch(std::move(edits)) undoName:@"Toggle Line Comment"
+                    options:{.insertionAdvance = advance}];
 }
 
 - (BOOL)validateMenuItem:(NSMenuItem *)item
@@ -1336,11 +2597,11 @@ static bool IdentifierAt(NSString *text, NSUInteger offset)
                 folds.push_back({[self.syntax offsetForLine:suite.row], NSMakeRange(first, end - first)});
         };
         for (NSUInteger row = 0; row < rows; ++row) {
-            NSUInteger start = [self.syntax offsetForLine:row];
+            NSRange line = LineContents(text, [self.syntax offsetForLine:row]);
+            NSUInteger start = line.location, end = NSMaxRange(line);
             if (start >= text.length)
                 break;
-            NSUInteger end;
-            [text getLineStart:nullptr end:nullptr contentsEnd:&end forRange:NSMakeRange(start, 0)];
+
             NSUInteger first = start, indent = 0;
             while (first < end) {
                 unichar unit = [text characterAtIndex:first];
@@ -1405,7 +2666,7 @@ static bool IdentifierAt(NSString *text, NSUInteger offset)
 {
     [(CodeLayoutManager *)self.layoutManager setEditorFolds:std::move(folds)];
     [self sizeToFit];
-    [self refreshBuildErrorToolTips];
+    [self dismissLanguageInformation];
     [self setNeedsDisplayInRect:self.visibleRect];
 }
 
@@ -1562,7 +2823,7 @@ static bool IdentifierAt(NSString *text, NSUInteger offset)
     if (!range.length || NSMaxRange(range) > source.length)
         return NO;
     NSString *prefix = [source substringWithRange:range];
-    bool lisp = self.syntax.language == Language::CommonLisp;
+    bool lisp = LispSymbols(self.syntax.language);
     return [self insertionLocationsMatch:^BOOL(NSUInteger at) {
         if (at < range.length || at > source.length || (at < source.length && WordCharacterAt(source, at, lisp)))
             return NO;
@@ -1572,14 +2833,29 @@ static bool IdentifierAt(NSString *text, NSUInteger offset)
     }];
 }
 
-- (void)dismissCompletion
+- (void)cancelCompletionRequest
 {
-    _completion.hidden = YES;
+    [_languageCompletionTimer invalidate];
+    _languageCompletionTimer = nil;
+    if (_languageCompletionRequest)
+        [_completionDocument cancelRequest:_languageCompletionRequest];
+    _languageCompletionRequest = 0;
+    ++_completionGeneration;
 }
 
-- (BOOL)validateCompletion
+- (void)dismissCompletion
 {
-    if (!_completion || _completion.hidden)
+    [self cancelCompletionRequest];
+    [_completion clear];
+    _serverCompletions.clear();
+    _completionActive = NO;
+    _completionIncomplete = NO;
+    _completionTriggered = NO;
+}
+
+- (BOOL)completionAtCaret
+{
+    if (!_completionActive || _editingCompletionPrefix)
         return NO;
     if (_completionVersion != self.syntax.textVersion || ![self allowsCompletion] ||
         !NSEqualRanges(self.selectedRange, NSMakeRange(NSMaxRange(_completionPrefix), 0)) ||
@@ -1590,12 +2866,125 @@ static bool IdentifierAt(NSString *text, NSUInteger offset)
     return YES;
 }
 
+- (BOOL)validateCompletion
+{
+    return [self completionAtCaret] && _completion && !_completion.hidden;
+}
+
+- (void)completionViewportChanged
+{
+    if (!_editingCompletionPrefix)
+        [self dismissCompletion];
+}
+
+- (void)dismissServerCompletion
+{
+    if (_completionTriggered || !_serverCompletions.empty() || _languageCompletionTimer || _languageCompletionRequest)
+        [self dismissCompletion];
+}
+
+- (void)completeCall:(const CompletionItem &)item edit:(CompletionEdit &)edit
+{
+    Language language = self.syntax.language;
+    if (LispSymbols(language))
+        return;
+
+    NSString *source = self.string;
+    NSUInteger at = self.selectedRange.location;
+    if (at && ![self.syntax codeAtOffset:at - 1])
+        return;
+    if (language == Language::Rust ? [self.syntax contextAtOffset:at].names.rustImport :
+        ImportStatementAt(source, at, language))
+        return;
+
+    auto inserted = TrimSignature(edit.text);
+    if (inserted.empty() || inserted.find_first_of(u"\r\n") != inserted.npos)
+        return;
+    if (CFamily(language) && inserted.starts_with(u"operator") &&
+        (inserted.size() == 8 || !IsASCIIIdentifierPart(inserted[8])))
+        return;
+    NSUInteger call = inserted.back() == u')' ? LastCallOpening(inserted) : NSNotFound;
+    if (call != NSNotFound)
+        call += inserted.data() - edit.text.data();
+    else if (!IsASCIIIdentifierPart(inserted.back()) && inserted.back() < 0x80 && inserted.back() != u'>')
+        return;
+
+    bool boundReceiver = CallHasReceiver(source, edit.range.location) || inserted.starts_with(u"self.");
+    bool takesArguments = CompletionTakesArguments(item, language, boundReceiver);
+
+    NSUInteger nameEnd = at;
+    while (nameEnd < source.length && WordCharacterAt(source, nameEnd))
+        ++nameEnd;
+    bool acrossLines = language == Language::Rust || CFamily(language);
+    NSUInteger afterName = SkipCallSpaces(source, nameEnd, acrossLines);
+    NSUInteger typeEnd = CallTypeArgumentsEnd(source, afterName, language);
+    NSUInteger opening = SkipCallSpaces(source, typeEnd, acrossLines);
+    if (opening < source.length && [source characterAtIndex:opening] == '(') {
+        // Preserve an existing argument list, including any arguments already typed.
+        edit.range.length = nameEnd - edit.range.location;
+        if (call != NSNotFound)
+            edit.text.resize(call);
+        NSUInteger closing = takesArguments ? NSNotFound :
+            BracketsAtSelection(self.textStorage, NSMakeRange(opening, 1), false).mate;
+        edit.existingCaret = closing == NSNotFound ? opening + 1 : closing + 1;
+        return;
+    }
+    if (typeEnd != afterName)
+        return;
+    edit.range.length = std::max(nameEnd, NSMaxRange(edit.range)) - edit.range.location;
+    NSUInteger afterCall = inserted.data() - edit.text.data() + inserted.size();
+    if (call == NSNotFound) {
+        call = afterCall;
+        edit.text.insert(call, u"()");
+        edit.newPair = call;
+        afterCall += 2;
+    } else if (call + 1 < edit.text.size() && edit.text[call + 1] == u')') {
+        edit.newPair = call;
+    }
+    edit.caret = takesArguments ? call + 1 : afterCall;
+}
+
 - (BOOL)acceptCompletion
 {
     if (![self validateCompletion])
         return NO;
-    NSString *word = _completion.items[_completion.selectedRow];
-    NSString *suffix = [word substringFromIndex:_completionPrefix.length];
+    CompletionItem item = [_completion items][_completion.selectedRow];
+    if (item.text) {
+        NSRange range = item.replaceRange ? [self.syntax languageRange:item.replaceRange] : _completionPrefix;
+        NSUInteger at = self.selectedRange.location;
+        if (range.location == NSNotFound || range.location > at || NSMaxRange(range) < at) {
+            [self dismissCompletion];
+            return NO;
+        }
+        CompletionEdit edit{range, LSPText(item.text), item.text.length};
+        if (item.kind == CompletionKind::Function)
+            [self completeCall:item edit:edit];
+        std::vector<Vim::CursorEdit> edits{{{edit.range.location, NSMaxRange(edit.range)}, std::move(edit.text)}};
+        if (item.additionalEdits && !AddLSPTextEdits(item.additionalEdits,
+                [&](id bounds) { return [self.syntax languageRange:bounds]; }, edits)) {
+            [self dismissCompletion];
+            return NO;
+        }
+        Vim::EditBatch batch;
+        bool valid = batch.assign(std::move(edits), Vim::EditOrder::Server);
+        [self dismissCompletion];
+        if (!valid)
+            return NO;
+
+        NSUInteger start = batch.map(edit.range.location, false);
+        NSUInteger caret = edit.existingCaret == NSNotFound ? start + edit.caret : batch.map(edit.existingCaret, false);
+        if (![self applyDocumentEdits:std::move(batch) undoName:@"Complete" options:{.caretAfter = caret}])
+            return NO;
+        if (edit.newPair != NSNotFound) {
+            NSUInteger opening = start + edit.newPair;
+            TypingEdit pair{};
+            pair.pair = TypedPair{NSMakeRange(opening, 1), NSMakeRange(opening + 1, 1)};
+            [self.syntax didType:pair];
+        }
+        return YES;
+    }
+
+    NSString *suffix = [item.label substringFromIndex:_completionPrefix.length];
     [self dismissCompletion];
     if (self.vimEnabled) {
         [self applyVimKey:Vim::Key::Text text:suffix];
@@ -1607,69 +2996,992 @@ static bool IdentifierAt(NSString *text, NSUInteger offset)
     return YES;
 }
 
-- (void)showCompletionsWithMinimumPrefix:(NSUInteger)minimum
+- (BOOL)presentCompletions:(std::span<const CompletionItem>)items
 {
-    [self dismissCompletion];
     NSScrollView *scroll = self.enclosingScrollView;
     NSView *host = scroll.superview;
-    if (!host || !self.theme || self.window.firstResponder != self || ![self allowsCompletion])
-        return;
-
-    NSString *text = self.string;
-    NSRange caret = self.selectedRange;
-    NSUInteger end = caret.location;
-    Language language = self.syntax.language;
-    bool lisp = language == Language::CommonLisp;
-    if (caret.length || end == 0 || end > text.length ||
-        (end < text.length && WordCharacterAt(text, end, lisp)))
-        return;
-    NSUInteger start = end;
-    while (start > 0 && WordCharacterAt(text, start - 1, lisp))
-        --start;
-    if (end - start < minimum)
-        return;
-    unichar first = [text characterAtIndex:start];
-    if (!lisp && first < 0x80 && !IsASCIIIdentifierStart(first))
-        return;
-    [self.syntax finishHighlighting];
-    if (![self.syntax codeAtOffset:end - 1])
-        return;
+    if (items.empty() || !host || !self.theme || self.window.firstResponder != self)
+        return NO;
 
     NSRect visible = NSInsetRect(self.visibleRect, 2, 2);
-    NSRect anchor = [self vimCaretAt:start];
+    NSRect anchor = [self vimCaretAt:_completionPrefix.location];
     CGFloat below = NSMaxY(visible) - NSMaxY(anchor) - 1;
     CGFloat above = NSMinY(anchor) - NSMinY(visible) - 1;
     CGFloat available = std::max(below, above) - 2 * completionInset;
     if (available < completionRowHeight || NSWidth(visible) < 48 ||
         NSMaxY(anchor) <= NSMinY(visible) || NSMinY(anchor) >= NSMaxY(visible))
-        return;
-    NSUInteger limit = std::min(completionLimit, NSUInteger(available / completionRowHeight));
-    NSRange range = NSMakeRange(start, end - start);
-    if (![self cursorsShareCompletionPrefix:range])
-        return;
-    std::u16string prefix(range.length, 0);
-    [text getCharacters:reinterpret_cast<unichar *>(prefix.data()) range:range];
-    if (language == Language::HTML || language == Language::Markdown || language == Language::PHP)
-        language = LanguageInContext(language, [self.syntax contextAtOffset:end]);
-    NSArray<NSString *> *items = [self.syntax completionsForPrefix:prefix limit:limit language:language];
-    if (!items.count)
-        return;
+        return NO;
+    NSUInteger limit = std::min(items.size(), NSUInteger(available / completionRowHeight));
 
+    [self dismissLanguageInformation];
     if (!_completion) {
         _completion = [[CompletionList alloc] initWithFrame:NSZeroRect];
         __weak CodeView *view = self;
         _completion.accept = ^{ [view acceptCompletion]; };
     }
-    NSSize size = [_completion setItems:items theme:_palette];
+    Language language = self.syntax.language;
+    bool boundReceiver = language == Language::Rust && CallHasReceiver(self.string, _completionPrefix.location);
+    NSSize size = [_completion setItems:items.first(limit) theme:_palette language:language boundReceiver:boundReceiver];
     size.width = std::min(size.width, NSWidth(visible));
     CGFloat x = std::clamp(NSMinX(anchor), NSMinX(visible), NSMaxX(visible) - size.width);
     CGFloat y = below >= size.height ? NSMaxY(anchor) + 1 : NSMinY(anchor) - size.height - 1;
     _completion.frame = [self convertRect:NSMakeRect(x, y, size.width, size.height) toView:host];
-    _completionPrefix = range;
-    _completionVersion = self.syntax.textVersion;
     if (_completion.superview != host)
         [host addSubview:_completion positioned:NSWindowAbove relativeTo:scroll];
     _completion.hidden = NO;
+    [_completion setNeedsDisplay:YES];
+    return YES;
+}
+
+- (BOOL)presentServerCompletions:(NSString *)prefix refining:(BOOL)refining
+{
+    std::array<CompletionItem, completionLimit> matches;
+    size_t count = 0;
+    for (const auto &item : _serverCompletions) {
+        // Reuse edits confined to the typed prefix while the server refreshes the list.
+        if (refining && (item.replaceRange || item.additionalEdits.count))
+            continue;
+        if (prefix.length && [item.filter rangeOfString:prefix options:NSAnchoredSearch | NSCaseInsensitiveSearch].location == NSNotFound)
+            continue;
+        matches[count++] = item;
+        if (count == matches.size())
+            break;
+    }
+    return [self presentCompletions:std::span(matches).first(count)];
+}
+
+- (BOOL)presentWordCompletions:(NSString *)prefix language:(Language)language
+{
+    if (_completionTriggered)
+        return NO;
+    NSUInteger end = NSMaxRange(_completionPrefix);
+    BOOL lisp = LispSymbols(language);
+    if (!prefix.length || (end < self.string.length && WordCharacterAt(self.string, end, lisp)) ||
+        ![self.syntax codeAtOffset:end - 1] || ![self cursorsShareCompletionPrefix:_completionPrefix])
+        return NO;
+    if (language == Language::HTML || language == Language::Markdown || language == Language::PHP)
+        language = LanguageInContext(language, [self.syntax contextAtOffset:end]);
+    NSArray<NSString *> *words = [self.syntax completionsForPrefix:LSPText(prefix) limit:completionLimit language:language];
+    std::array<CompletionItem, completionLimit> items;
+    std::vector<Token> tokens;
+    size_t count = 0;
+    for (NSString *word in words) {
+        LexState state;
+        TokenizeLine(LSPText(word), language, state, tokens);
+        CompletionKind kind = CompletionKind::Word;
+        if (tokens.size() == 1) {
+            switch (tokens.front().ink) {
+                case Ink::Type: kind = CompletionKind::Type; break;
+                case Ink::Keyword: case Ink::Control: kind = CompletionKind::Keyword; break;
+                case Ink::Constant: kind = CompletionKind::Value; break;
+                default: break;
+            }
+        }
+        items[count].label = word;
+        items[count++].kind = kind;
+    }
+    return [self presentCompletions:std::span(items).first(count)];
+}
+
+- (void)useLanguageCompletions:(id)result
+{
+    NSDictionary *list = LSPDict(result);
+    NSArray *items = LSPArray(result);
+    if (!items)
+        items = LSPArray(list[@"items"]);
+    _completionIncomplete = [LSPNumber(list[@"isIncomplete"]) boolValue];
+    _serverCompletions.clear();
+    _serverCompletions.reserve(std::min(completionCacheLimit, items.count));
+    LSPPosition start = [self.syntax languagePosition:_completionPrefix.location];
+    LSPPosition end = [self.syntax languagePosition:NSMaxRange(_completionPrefix)];
+    for (id value in items) {
+        NSDictionary *item = LSPDict(value);
+        NSString *label = LSPString(item[@"label"]);
+        if (!label.length || label.length > 256 || [LSPNumber(item[@"insertTextFormat"]) integerValue] == 2)
+            continue;
+        NSDictionary *edit = LSPDict(item[@"textEdit"]);
+        NSString *text = LSPString(edit[@"newText"]);
+        if (!text)
+            text = LSPString(item[@"insertText"]);
+        if (!text)
+            text = label;
+        if (text.length > 4096)
+            continue;
+        NSDictionary *bounds = LSPDict(edit[@"range"] ? edit[@"range"] : edit[@"replace"]);
+        if (edit && !bounds)
+            continue;
+        auto first = LSPReadPosition(bounds[@"start"]), last = LSPReadPosition(bounds[@"end"]);
+        if (first && last && first->line == start.line && first->character == start.character &&
+            last->line == end.line && last->character == end.character)
+            bounds = nil;
+        NSString *filter = LSPString(item[@"filterText"]);
+        NSString *order = LSPString(item[@"sortText"]);
+        CompletionKind kind = CompletionKindForLSP([LSPNumber(item[@"kind"]) integerValue]);
+        NSString *detail = kind == CompletionKind::Function ? LSPString(item[@"detail"]) : nil;
+        NSString *labelDetail = kind == CompletionKind::Function ? LSPString(LSPDict(item[@"labelDetails"])[@"detail"]) : nil;
+        _serverCompletions.push_back({label, text, filter.length ? filter : label, order.length ? order : label,
+            bounds, LSPArray(item[@"additionalTextEdits"]), kind, detail.length <= 1024 ? detail : nil,
+            labelDetail.length <= 1024 ? labelDetail : nil});
+        if (_serverCompletions.size() == completionCacheLimit)
+            break;
+    }
+    std::stable_sort(_serverCompletions.begin(), _serverCompletions.end(), [](const CompletionItem &a, const CompletionItem &b) {
+        return [a.order compare:b.order options:NSLiteralSearch] == NSOrderedAscending;
+    });
+    NSString *prefix = [self.string substringWithRange:_completionPrefix];
+    if (![self presentServerCompletions:prefix refining:NO] && _completion &&
+        ![_completion items].empty() && [_completion items].front().text &&
+        ![self presentWordCompletions:prefix language:self.syntax.language])
+        [_completion clear];
+}
+
+- (void)showCompletionsWithMinimumPrefix:(NSUInteger)minimum trigger:(NSString *)trigger continuing:(BOOL)continuing
+{
+    if (!self.enclosingScrollView.superview || !self.theme || self.window.firstResponder != self || ![self allowsCompletion]) {
+        [self dismissCompletion];
+        return;
+    }
+    LSPDocument *document = self.syntax.languageDocument;
+    BOOL languageCompletion = self.cursorCount == 1 && [document supports:@"completionProvider"];
+    NSString *text = self.string;
+    NSRange caret = self.selectedRange;
+    NSUInteger end = caret.location;
+    if (caret.length || end > text.length) {
+        [self dismissCompletion];
+        return;
+    }
+    Language language = self.syntax.language;
+    bool lisp = LispSymbols(language);
+    NSUInteger start = end;
+    while (start && WordCharacterAt(text, start - 1, lisp))
+        --start;
+    NSRange range = NSMakeRange(start, end - start);
+    continuing = continuing && _completionActive && range.location == _completionPrefix.location;
+    if (!continuing)
+        [self dismissCompletion];
+    else
+        [self cancelCompletionRequest];
+
+    if (range.length < minimum && !(languageCompletion && (trigger || continuing || minimum == 1))) {
+        [self dismissCompletion];
+        return;
+    }
+    if (range.length) {
+        unichar first = [text characterAtIndex:start];
+        if (!lisp && first < 0x80 && !IsASCIIIdentifierStart(first)) {
+            [self dismissCompletion];
+            return;
+        }
+    }
+
+    [self.syntax finishHighlighting];
+    _completionPrefix = range;
+    _completionVersion = self.syntax.textVersion;
+    _completionActive = YES;
+    _completionTriggered = languageCompletion && (trigger || _completionTriggered);
+    NSString *prefix = [text substringWithRange:range];
+    if (!(continuing && languageCompletion && [self presentServerCompletions:prefix refining:YES]) &&
+        !(range.length >= minimum && [self presentWordCompletions:prefix language:language]))
+        [_completion clear];
+    if (!languageCompletion) {
+        if (!_completion || _completion.hidden)
+            _completionActive = NO;
+        return;
+    }
+
+    NSUInteger generation = _completionGeneration;
+    NSUInteger version = _completionVersion;
+    BOOL retrigger = continuing && _completionIncomplete;
+    __weak CodeView *view = self;
+    __weak LSPDocument *openDocument = document;
+    _languageCompletionTimer = [NSTimer scheduledTimerWithTimeInterval:0.025 repeats:NO block:^(NSTimer *) {
+        CodeView *editor = view;
+        if (!editor || editor->_completionGeneration != generation)
+            return;
+        editor->_languageCompletionTimer = nil;
+        LSPDocument *file = openDocument;
+        if (!file || editor.syntax.languageDocument != file || ![editor completionAtCaret])
+            return;
+        NSDictionary *context = trigger ? @{@"triggerKind":@2, @"triggerCharacter":trigger} : @{@"triggerKind":@(retrigger ? 3 : 1)};
+        NSDictionary *params = @{@"textDocument":@{@"uri":file.file.absoluteString},
+            @"position":LSPPositionValue([editor.syntax languagePosition:end]), @"context":context};
+        editor->_completionDocument = file;
+        editor->_languageCompletionRequest = [file request:@"textDocument/completion" params:params reply:^(id result, NSString *error) {
+            CodeView *target = view;
+            if (!target || target->_completionGeneration != generation)
+                return;
+            target->_languageCompletionRequest = 0;
+            if (!error && target.window.firstResponder == target && target.syntax.textVersion == version &&
+                [target completionAtCaret])
+                [target useLanguageCompletions:result];
+        }];
+    }];
+}
+
+- (void)showCompletionsWithMinimumPrefix:(NSUInteger)minimum
+{
+    [self showCompletionsWithMinimumPrefix:minimum trigger:nil continuing:NO];
+}
+
+- (BOOL)hoverHasFocus
+{
+    return [_languageInformation containsResponder:self.window.firstResponder];
+}
+
+- (BOOL)hasHoveredError
+{
+    return _hoveredError.has_value() && _languageInformation && !_languageInformation.hidden;
+}
+
+- (void)cancelLanguageInformationRequests
+{
+    [_languageHoverTimer invalidate];
+    _languageHoverTimer = nil;
+    if (_languageInformationRequest)
+        [_informationDocument cancelRequest:_languageInformationRequest];
+    if (_definitionRequest)
+        [_informationDocument cancelRequest:_definitionRequest];
+    _languageInformationRequest = 0;
+    _definitionRequest = 0;
+    ++_languageInformationGeneration;
+}
+
+- (void)dismissLanguageInformation
+{
+    [self cancelLanguageInformationRequests];
+    [_hoverLeaveTimer invalidate];
+    _hoverLeaveTimer = nil;
+    if (_languageHoverRange.length)
+        [(CodeLayoutManager *)self.layoutManager setDefinitionLinkRange:NSMakeRange(0, 0)];
+    if (!NSIsEmptyRect(_languageHoverHighlight)) {
+        [self setNeedsDisplayInRect:_languageHoverHighlight];
+        _languageHoverHighlight = NSZeroRect;
+    }
+    _languageHoverRange = NSMakeRange(0, 0);
+    _hoveredError.reset();
+    _hoverQuickFixes = nil;
+    _commandHover = NO;
+    if (self.hoverHasFocus)
+        [self.window makeFirstResponder:self];
+    [_languageInformation clear];
+}
+
+- (void)scheduleLanguageInformationDismissal
+{
+    if (!_languageInformation || _languageInformation.hidden) {
+        [self dismissLanguageInformation];
+        return;
+    }
+    if (_hoverLeaveTimer)
+        return;
+    __weak CodeView *view = self;
+    _hoverLeaveTimer = [NSTimer scheduledTimerWithTimeInterval:0.17 repeats:NO block:^(NSTimer *) {
+        CodeView *editor = view;
+        if (!editor)
+            return;
+        editor->_hoverLeaveTimer = nil;
+        NSPoint point = [editor->_languageInformation convertPoint:editor.window.mouseLocationOutsideOfEventStream fromView:nil];
+        if (!editor.hoverHasFocus && !NSPointInRect(point, editor->_languageInformation.bounds))
+            [editor dismissLanguageInformation];
+    }];
+}
+
+- (void)showLanguageInformation:(id)markup signature:(NSString *)signature error:(const BuildError *)error
+                            at:(NSUInteger)offset
+{
+    NSScrollView *scroll = self.enclosingScrollView;
+    NSView *host = scroll.superview;
+    if ((!markup && !signature.length && !error) || !host || !self.theme || !self.window.isKeyWindow ||
+        self.window.attachedSheet || (_completion && !_completion.hidden))
+        return;
+    NSRect visible = NSInsetRect(self.visibleRect, 4, 4);
+    NSRect anchor = [self vimCaretAt:std::min(offset, self.string.length)];
+    if (NSMaxY(anchor) < NSMinY(visible) || NSMinY(anchor) > NSMaxY(visible))
+        return;
+    CGFloat below = NSMaxY(visible) - NSMaxY(anchor) - 2;
+    CGFloat above = NSMinY(anchor) - NSMinY(visible) - 2;
+    NSSize limit = NSMakeSize(std::min(580.0, NSWidth(visible)), std::min(306.0, std::max(above, below)));
+    if (limit.width < 75 || limit.height < 54)
+        return;
+    if (!_languageInformation) {
+        _languageInformation = [[EditorHover alloc] initWithFrame:NSZeroRect];
+        _languageInformation.hidden = YES;
+        __weak CodeView *view = self;
+        _languageInformation.pointerExited = ^{ [view scheduleLanguageInformationDismissal]; };
+        _languageInformation.viewError = ^{ [view viewErrorAtCursor]; };
+        _languageInformation.quickFix = ^{ [view showHoveredQuickFixes]; };
+        _languageInformation.cancel = ^{ [view dismissLanguageInformation]; };
+    }
+    CGFloat fontSize = std::clamp(self.editorFont.pointSize, 11.0, 14.0);
+    NSFont *font = [NSFont fontWithName:self.editorFont.fontName size:fontSize];
+    if (!font)
+        font = [NSFont monospacedSystemFontOfSize:fontSize weight:NSFontWeightRegular];
+    NSSize size = error
+        ? [_languageInformation showMessage:error->message diagnosticLabel:error->label showsQuickFix:_hoverQuickFixes.count != 0
+                                      font:font theme:*self.theme limit:limit]
+        : [_languageInformation showDocumentation:markup signature:signature language:self.syntax.language
+                                              font:font theme:*self.theme limit:limit];
+    if (size.height == 0)
+        return;
+    CGFloat x = std::clamp(NSMinX(anchor), NSMinX(visible), NSMaxX(visible) - size.width);
+    CGFloat y = size.height <= below ? NSMaxY(anchor) + 2 : NSMinY(anchor) - size.height - 2;
+    _languageInformation.frame = [self convertRect:NSMakeRect(x, y, size.width, size.height) toView:host];
+    if (_languageInformation.superview != host)
+        [host addSubview:_languageInformation positioned:NSWindowAbove relativeTo:scroll];
+    _languageInformation.hidden = NO;
+
+    NSRange span = error ? error->range : _languageHoverRange;
+    if (span.length && NSMaxRange(span) <= self.string.length) {
+        NSLayoutManager *layout = self.layoutManager;
+        NSRange glyphs = [layout glyphRangeForCharacterRange:span actualCharacterRange:nullptr];
+        NSRect rect = [layout boundingRectForGlyphRange:glyphs inTextContainer:self.textContainer];
+        NSPoint origin = self.textContainerOrigin;
+        _languageHoverHighlight = NSIntersectionRect(self.visibleRect, NSOffsetRect(rect, origin.x, origin.y));
+        [self setNeedsDisplayInRect:_languageHoverHighlight];
+    }
+}
+
+- (void)showLanguageInformation:(NSString *)message at:(NSUInteger)offset
+{
+    [self showLanguageInformation:@{@"kind":@"plaintext", @"value":message} signature:nil error:nullptr at:offset];
+}
+
+- (NSMutableDictionary *)languageParamsAt:(NSUInteger)offset
+{
+    LSPDocument *document = self.syntax.languageDocument;
+    return [@{@"textDocument":@{@"uri":document.file.absoluteString},
+              @"position":LSPPositionValue([self.syntax languagePosition:offset])} mutableCopy];
+}
+
+- (void)requestLanguageInformation:(LanguageCommand)kind at:(NSUInteger)offset
+{
+    LSPDocument *document = self.syntax.languageDocument;
+    const LanguageFeature &feature = languageFeatures[size_t(kind)];
+    if (![document supports:feature.capability] || !self.window.isKeyWindow || self.window.attachedSheet)
+        return;
+    BOOL definition = kind == LanguageCommand::Definition;
+    NSUInteger generation = _languageInformationGeneration;
+    __weak CodeView *view = self;
+    _informationDocument = document;
+    NSInteger request = [document request:feature.method params:[self languageParamsAt:offset] reply:^(id result, NSString *error) {
+        CodeView *editor = view;
+        if (!editor || editor->_languageInformationGeneration != generation)
+            return;
+        if (definition) {
+            editor->_definitionRequest = 0;
+            if (!error && editor->_commandHover && HasDefinitionLocation(result))
+                [(CodeLayoutManager *)editor.layoutManager setDefinitionLinkRange:editor->_languageHoverRange];
+            return;
+        }
+        editor->_languageInformationRequest = 0;
+        if (error)
+            return;
+        NSDictionary *response = LSPDict(result);
+        if (kind == LanguageCommand::Hover) {
+            [editor showLanguageInformation:response[@"contents"] signature:nil error:nullptr at:offset];
+        } else {
+            NSArray *signatures = LSPArray(response[@"signatures"]);
+            if (signatures.count) {
+                NSUInteger active = std::min([LSPNumber(response[@"activeSignature"]) unsignedIntegerValue], signatures.count - 1);
+                NSDictionary *signature = LSPDict(signatures[active]);
+                [editor showLanguageInformation:signature[@"documentation"] signature:LSPString(signature[@"label"])
+                                          error:nullptr at:offset];
+            }
+        }
+    }];
+    if (definition)
+        _definitionRequest = request;
+    else
+        _languageInformationRequest = request;
+}
+
+- (void)requestHoveredQuickFixes
+{
+    LSPDocument *document = self.syntax.languageDocument;
+    if (!self.hasHoveredError || ![document supports:@"codeActionProvider"])
+        return;
+    NSUInteger generation = _languageInformationGeneration;
+    _informationDocument = document;
+    NSDictionary *params = LanguageActionParams(self.syntax, _hoveredError->range, YES, YES);
+    __weak CodeView *view = self;
+    _languageInformationRequest = [document request:@"textDocument/codeAction" params:params reply:^(id result, NSString *error) {
+        CodeView *editor = view;
+        if (!editor || editor->_languageInformationGeneration != generation)
+            return;
+        editor->_languageInformationRequest = 0;
+        if (error || !editor.hasHoveredError || !editor.window.isKeyWindow)
+            return;
+        LSPDocument *file = editor->_informationDocument;
+        if (!file || editor.syntax.languageDocument != file)
+            return;
+        NSArray *actions = UsableLanguageActions(result, file, YES);
+        if (!actions.count)
+            return;
+        editor->_hoverQuickFixes = actions;
+        const BuildError &mark = *editor->_hoveredError;
+        [editor showLanguageInformation:nil signature:nil error:&mark at:mark.range.location];
+    }];
+}
+
+- (void)updateLanguageTracking
+{
+    SyntaxBuffer *buffer = self.syntax;
+    LSPDocument *document = buffer.languageDocument;
+    BOOL track = self.window && buffer && (!buffer.buildErrors.empty() || !buffer.languageErrors.empty() ||
+        [document supports:@"definitionProvider"] || [document supports:@"hoverProvider"]);
+    if (track && !_languageTracking) {
+        NSTrackingAreaOptions options = NSTrackingMouseMoved | NSTrackingMouseEnteredAndExited |
+            NSTrackingInVisibleRect | NSTrackingActiveInKeyWindow;
+        _languageTracking = [[NSTrackingArea alloc] initWithRect:NSZeroRect options:options owner:self userInfo:nil];
+        [self addTrackingArea:_languageTracking];
+    } else if (!track && _languageTracking) {
+        [self removeTrackingArea:_languageTracking];
+        _languageTracking = nil;
+        [self dismissLanguageInformation];
+    }
+}
+
+- (NSRange)languageWordAtWindowPoint:(NSPoint)point
+{
+    point = [self convertPoint:point fromView:nil];
+    NSString *text = self.string;
+    if (!text.length || !NSPointInRect(point, self.visibleRect))
+        return NSMakeRange(0, 0);
+
+    NSPoint origin = self.textContainerOrigin;
+    NSPoint local = NSMakePoint(point.x - origin.x, point.y - origin.y);
+    NSLayoutManager *layout = self.layoutManager;
+    NSTextContainer *container = self.textContainer;
+    NSUInteger glyph = [layout glyphIndexForPoint:local inTextContainer:container];
+    if (glyph == NSNotFound || ![layout isValidGlyphIndex:glyph] ||
+        !NSPointInRect(local, [layout boundingRectForGlyphRange:NSMakeRange(glyph, 1) inTextContainer:container]))
+        return NSMakeRange(0, 0);
+
+    NSUInteger offset = [layout characterIndexForGlyphAtIndex:glyph];
+    if (NSLocationInRange(offset, _languageHoverRange))
+        return _languageHoverRange;
+    bool lisp = LispSymbols(self.syntax.language);
+    if (offset >= text.length || !WordCharacterAt(text, offset, lisp))
+        return NSMakeRange(0, 0);
+    NSUInteger first = offset, end = offset + 1;
+    while (first && WordCharacterAt(text, first - 1, lisp))
+        --first;
+    while (end < text.length && WordCharacterAt(text, end, lisp))
+        ++end;
+    return NSMakeRange(first, end - first);
+}
+
+- (void)updateLanguageHoverAtWindowPoint:(NSPoint)point modifiers:(NSEventModifierFlags)flags
+{
+    if (!_languageTracking)
+        return;
+    NSWindow *window = self.window;
+    if (!window.isKeyWindow || window.attachedSheet || (_completion && !_completion.hidden)) {
+        [self dismissLanguageInformation];
+        return;
+    }
+    BOOL open = _languageInformation && !_languageInformation.hidden;
+    BOOL command = DefinitionModifier(flags);
+    BOOL pressedCommand = command && !_commandHover;
+    if (_commandHover && !command) {
+        if (_definitionRequest)
+            [_informationDocument cancelRequest:_definitionRequest];
+        _definitionRequest = 0;
+        [(CodeLayoutManager *)self.layoutManager setDefinitionLinkRange:NSMakeRange(0, 0)];
+    }
+    _commandHover = command;
+    if (open && (self.hoverHasFocus ||
+                 NSPointInRect([_languageInformation convertPoint:point fromView:nil], _languageInformation.bounds))) {
+        [_hoverLeaveTimer invalidate];
+        _hoverLeaveTimer = nil;
+        return;
+    }
+
+    LSPDocument *document = self.syntax.languageDocument;
+    BOOL documentation = [document supports:@"hoverProvider"];
+    BOOL definition = command && [document supports:@"definitionProvider"];
+    NSRange word = documentation || definition
+        ? [self languageWordAtWindowPoint:point] : NSMakeRange(0, 0);
+    __block std::optional<BuildError> error;
+    NSPoint local = [self convertPoint:point fromView:nil];
+    if ((!word.length || !definition) && NSPointInRect(local, self.visibleRect)) {
+        NSRect hit = NSMakeRect(local.x - 1, local.y - 1, 2, 2);
+        [self enumerateBuildErrorsInRect:hit usingBlock:^(const BuildError &mark, NSRect) {
+            if (mark.message.length && (!error || (error->warning && !mark.warning) ||
+                (error->warning == mark.warning && mark.range.length <= error->range.length)))
+                error = mark;
+        }];
+    }
+    if (!error && !word.length) {
+        if (_languageHoverRange.length || _hoveredError) {
+            if (_languageHoverTimer || _definitionRequest || (_languageInformationRequest && (!open || !_hoveredError)))
+                [self cancelLanguageInformationRequests];
+            [self scheduleLanguageInformationDismissal];
+        }
+        return;
+    }
+
+    [_hoverLeaveTimer invalidate];
+    _hoverLeaveTimer = nil;
+    if (error && _hoveredError && error->message == _hoveredError->message &&
+        NSEqualRanges(error->range, _hoveredError->range) && (open || _languageHoverTimer))
+        return;
+    if (!error && word.length && NSEqualRanges(word, _languageHoverRange)) {
+        if (pressedCommand && definition && !_languageHoverTimer)
+            [self requestLanguageInformation:LanguageCommand::Definition at:word.location];
+        return;
+    }
+
+    [self dismissLanguageInformation];
+    _commandHover = command;
+    _hoveredError = error;
+    if (!error)
+        _languageHoverRange = word;
+    __weak CodeView *view = self;
+    NSTimeInterval delay = error ? 0.20 : definition ? 0.14 : 0.30;
+    _languageHoverTimer = [NSTimer scheduledTimerWithTimeInterval:delay repeats:NO block:^(NSTimer *) {
+        CodeView *editor = view;
+        if (!editor)
+            return;
+        editor->_languageHoverTimer = nil;
+        if (editor->_hoveredError) {
+            const BuildError &mark = *editor->_hoveredError;
+            [editor showLanguageInformation:nil signature:nil error:&mark at:mark.range.location];
+            [editor requestHoveredQuickFixes];
+        } else {
+            if (editor->_commandHover)
+                [editor requestLanguageInformation:LanguageCommand::Definition at:word.location];
+            if (documentation)
+                [editor requestLanguageInformation:LanguageCommand::Hover at:word.location];
+        }
+    }];
+}
+
+- (void)updateLanguageHoverModifiers:(NSEventModifierFlags)flags atWindowPoint:(NSPoint)point
+{
+    if (DefinitionModifier(flags) != _commandHover)
+        [self updateLanguageHoverAtWindowPoint:point modifiers:flags];
+}
+
+- (void)mouseMoved:(NSEvent *)event
+{
+    if (_languageTracking)
+        [self updateLanguageHoverAtWindowPoint:event.locationInWindow modifiers:event.modifierFlags];
+    else
+        [super mouseMoved:event];
+}
+
+- (void)mouseEntered:(NSEvent *)event
+{
+    if (event.trackingArea == _languageTracking)
+        [self updateLanguageHoverAtWindowPoint:event.locationInWindow modifiers:event.modifierFlags];
+    [super mouseEntered:event];
+}
+
+- (void)mouseExited:(NSEvent *)event
+{
+    if (event.trackingArea == _languageTracking)
+        [self scheduleLanguageInformationDismissal];
+    [super mouseExited:event];
+}
+
+- (BOOL)viewErrorAtCursor
+{
+    const BuildError *target = self.hasHoveredError ? &*_hoveredError : nullptr;
+    SyntaxBuffer *buffer = self.syntax;
+    if (!target && buffer) {
+        NSUInteger cursor = std::min(self.vimDisplayedCursor, self.string.length);
+        NSUInteger line = [buffer offsetForLine:[buffer lineForOffset:cursor]];
+        const BuildError *next = nullptr, *first = nullptr;
+        auto find = [&](const std::vector<BuildError> &errors) {
+            auto begin = std::lower_bound(errors.begin(), errors.end(), line,
+                [](const BuildError &error, NSUInteger offset) { return error.range.location < offset; });
+            for (auto it = begin; it != errors.end(); ++it) {
+                if (it->range.location > cursor) {
+                    if (!next || it->range.location <= next->range.location)
+                        next = &*it;
+                    break;
+                }
+                if (cursor == it->range.location || NSLocationInRange(cursor, it->range)) {
+                    if (!target || (target->warning && !it->warning))
+                        target = &*it;
+                }
+            }
+            if (!errors.empty() && (!first || errors.front().range.location <= first->range.location))
+                first = &errors.front();
+        };
+        find(buffer.buildErrors);
+        find(buffer.languageErrors);
+        if (!target)
+            target = next ? next : first;
+    }
+    if (!target || !self.revealError)
+        return NO;
+    BuildError error = *target;
+    [self dismissLanguageInformation];
+    [self.window makeFirstResponder:self];
+    [self visitVimFileMark:error.range.location exact:YES];
+    self.revealError(error);
+    return YES;
+}
+
+- (void)presentLanguageError:(NSString *)message
+{
+    if (message.length && self.window)
+        [self.window presentError:[NSError errorWithDomain:@"RetinaCode.LanguageServer" code:1
+                                                  userInfo:@{NSLocalizedDescriptionKey:message}]];
+}
+
+- (IBAction)openLanguageLocation:(NSMenuItem *)sender
+{
+    NSDictionary *location = LSPDict(sender.representedObject);
+    NSURL *file = LSPFile(location[@"uri"]);
+    auto position = LSPReadPosition(LSPDict(location[@"range"])[@"start"]);
+    if (!file || !position)
+        return;
+    if ([file isEqual:self.syntax.languageDocument.file]) {
+        NSUInteger offset = [self.syntax languageOffset:*position];
+        if (offset != NSNotFound)
+            [self visitDefinitionAtOffset:offset];
+        return;
+    }
+    LSPPosition target = *position;
+    __weak CodeView *view = self;
+    OpenSourceTab(file, self.window, ^(NSDocument *opened, BOOL, NSError *error) {
+        if ([opened isKindOfClass:SourceDocument.class])
+            [(SourceDocument *)opened revealLanguagePosition:target];
+        else if (error)
+            [view presentLanguageError:error.localizedDescription];
+    });
+}
+
+- (void)popupLanguageMenu:(NSMenu *)menu at:(NSUInteger)offset
+{
+    if (!menu.numberOfItems || self.window.firstResponder != self)
+        return;
+    NSRect anchor = [self vimCaretAt:std::min(offset, self.string.length)];
+    [menu popUpMenuPositioningItem:nil atLocation:NSMakePoint(NSMinX(anchor), NSMaxY(anchor)) inView:self];
+}
+
+- (void)showLanguageLocations:(id)result kind:(LanguageCommand)kind at:(NSUInteger)offset
+{
+    NSArray *locations = LSPArray(result);
+    if (!locations)
+        locations = LSPDict(result) ? @[result] : @[];
+    NSMenu *menu = [[NSMenu alloc] init];
+    for (id value in locations) {
+        NSDictionary *location = LSPDict(value);
+        id uri = LocationURI(location);
+        id range = LocationRange(location);
+        NSURL *file = LSPFile(uri);
+        auto position = LSPReadPosition(LSPDict(range)[@"start"]);
+        if (!file || !position)
+            continue;
+        NSString *relative = RelativeWorkspacePath(file.path, self.syntax.languageDocument.root.path);
+        NSString *title = [NSString stringWithFormat:@"%@:%lu:%lu", relative ? relative : file.lastPathComponent,
+                           (unsigned long)position->line + 1, (unsigned long)position->character + 1];
+        NSMenuItem *item = [menu addItemWithTitle:title action:@selector(openLanguageLocation:) keyEquivalent:@""];
+        item.target = self;
+        item.toolTip = file.path;
+        item.representedObject = @{@"uri":uri, @"range":range};
+        if (menu.numberOfItems == 150)
+            break;
+    }
+    if (kind == LanguageCommand::Definition && menu.numberOfItems == 1)
+        [self openLanguageLocation:menu.itemArray.firstObject];
+    else if (menu.numberOfItems)
+        [self popupLanguageMenu:menu at:offset];
+    else
+        [self showLanguageInformation:kind == LanguageCommand::Definition ? @"No definition found." : @"No references found." at:offset];
+}
+
+- (void)addLanguageSymbols:(NSArray *)symbols toMenu:(NSMenu *)menu depth:(NSUInteger)depth
+{
+    if (depth == 24)
+        return;
+    NSString *uri = self.syntax.languageDocument.file.absoluteString;
+    for (id value in symbols) {
+        if (menu.numberOfItems == 150)
+            return;
+        NSDictionary *symbol = LSPDict(value);
+        NSString *name = LSPString(symbol[@"name"]);
+        NSDictionary *location = LSPDict(symbol[@"location"]);
+        id range = symbol[@"selectionRange"] ? symbol[@"selectionRange"] : symbol[@"range"];
+        if (!location && range)
+            location = @{@"uri":uri, @"range":range};
+        if (name.length && location) {
+            NSMenuItem *item = [menu addItemWithTitle:name action:@selector(openLanguageLocation:) keyEquivalent:@""];
+            item.target = self;
+            item.representedObject = location;
+            item.indentationLevel = std::min(depth, NSUInteger(10));
+        }
+        [self addLanguageSymbols:LSPArray(symbol[@"children"]) toMenu:menu depth:depth + 1];
+    }
+}
+
+- (void)applyResolvedLanguageAction:(NSDictionary *)action name:(NSString *)title
+{
+    LSPDocument *document = self.syntax.languageDocument;
+    NSString *failure = nil;
+    if (LSPDict(action[@"edit"]))
+        failure = ApplyWorkspaceLanguageEdit(action[@"edit"], document.root, title);
+    if (failure) {
+        [self presentLanguageError:failure];
+        return;
+    }
+    NSDictionary *command = LanguageActionCommand(action);
+    if (NSString *name = LSPString(command[@"command"])) {
+        NSMutableDictionary *params = [@{@"command":name} mutableCopy];
+        if (NSArray *arguments = LSPArray(command[@"arguments"]))
+            params[@"arguments"] = arguments;
+        __weak CodeView *view = self;
+        NSURL *root = document.root;
+        [document executeCommand:params applyEdit:^NSString *(id edit) {
+            return ApplyWorkspaceLanguageEdit(edit, root, title);
+        } reply:^(id, NSString *error) {
+            [view presentLanguageError:error];
+        }];
+    }
+}
+
+- (IBAction)applyLanguageAction:(NSMenuItem *)sender
+{
+    LSPDocument *document = self.syntax.languageDocument;
+    NSDictionary *selection = LSPDict(sender.representedObject);
+    NSUInteger version = [LSPNumber(selection[@"version"]) unsignedIntegerValue];
+    if (document != selection[@"document"] || document.state != LSPState::Ready || self.syntax.textVersion != version)
+        return;
+    NSDictionary *action = LSPDict(selection[@"action"]);
+    NSString *title = sender.title;
+    if (!LSPDict(action[@"edit"]) && !LSPString(LanguageActionCommand(action)[@"command"]).length && document.resolvesCodeActions) {
+        __weak CodeView *view = self;
+        __weak LSPDocument *file = document;
+        [document request:@"codeAction/resolve" params:action reply:^(id result, NSString *error) {
+            CodeView *editor = view;
+            if (!editor || !file || editor.syntax.languageDocument != file || editor.syntax.textVersion != version)
+                return;
+            if (error)
+                [editor presentLanguageError:error];
+            else if (NSDictionary *resolved = LSPDict(result)) {
+                if (!LSPDict(resolved[@"disabled"]))
+                    [editor applyResolvedLanguageAction:resolved name:title];
+            }
+        }];
+    } else {
+        [self applyResolvedLanguageAction:action name:title];
+    }
+}
+
+- (void)showLanguageActions:(NSArray<NSDictionary *> *)actions at:(NSUInteger)offset
+{
+    LSPDocument *document = self.syntax.languageDocument;
+    if (!actions.count || document.state != LSPState::Ready)
+        return;
+    NSNumber *version = @(self.syntax.textVersion);
+    NSMenu *menu = [[NSMenu alloc] init];
+    for (NSDictionary *action in actions) {
+        NSMenuItem *item = [menu addItemWithTitle:action[@"title"] action:@selector(applyLanguageAction:) keyEquivalent:@""];
+        item.target = self;
+        item.representedObject = @{@"action":action, @"document":document, @"version":version};
+    }
+    [self popupLanguageMenu:menu at:offset];
+}
+
+- (void)showHoveredQuickFixes
+{
+    NSArray *actions = _hoverQuickFixes;
+    if (!actions.count || !self.hasHoveredError || !self.window.isKeyWindow || self.window.attachedSheet)
+        return;
+    NSUInteger offset = _hoveredError->range.location;
+    if (![self.window makeFirstResponder:self])
+        return;
+    ++_languageActionsGeneration;
+    [self dismissLanguageInformation];
+    [self showLanguageActions:actions at:offset];
+}
+
+- (void)requestLanguageActions:(NSRange)selection at:(NSUInteger)offset quickFix:(BOOL)quickFix
+{
+    LSPDocument *document = self.syntax.languageDocument;
+    NSUInteger version = self.syntax.textVersion;
+    NSUInteger generation = ++_languageActionsGeneration;
+    NSRange originalSelection = self.selectedRange;
+    NSUInteger caret = self.vimDisplayedCursor;
+    NSDictionary *params = LanguageActionParams(self.syntax, selection, quickFix, NO);
+    __weak CodeView *view = self;
+    __weak LSPDocument *file = document;
+    [document request:@"textDocument/codeAction" params:params reply:^(id result, NSString *error) {
+        CodeView *editor = view;
+        LSPDocument *open = file;
+        if (!editor || !open || editor.syntax.languageDocument != open || editor.syntax.textVersion != version ||
+            editor->_languageActionsGeneration != generation || editor.window.firstResponder != editor ||
+            !editor.window.isKeyWindow || editor.window.attachedSheet || editor.vimDisplayedCursor != caret ||
+            !NSEqualRanges(editor.selectedRange, originalSelection))
+            return;
+        if (error) {
+            [editor presentLanguageError:error];
+            return;
+        }
+        NSArray *actions = UsableLanguageActions(result, open, quickFix);
+        [editor dismissLanguageInformation];
+        if (actions.count)
+            [editor showLanguageActions:actions at:offset];
+        else
+            [editor showLanguageInformation:quickFix ? @"No quick fixes available." : @"No code actions available." at:offset];
+    }];
+}
+
+- (void)renameLanguageSymbolAt:(NSUInteger)offset
+{
+    LSPDocument *document = self.syntax.languageDocument;
+    NSUInteger version = document.version;
+    NSString *text = self.string;
+    NSUInteger start = offset, end = offset;
+    bool lisp = LispSymbols(self.syntax.language);
+    while (start && WordCharacterAt(text, start - 1, lisp))
+        --start;
+    while (end < text.length && WordCharacterAt(text, end, lisp))
+        ++end;
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.messageText = @"Rename Symbol";
+    NSTextField *field = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 0, 280, 24)];
+    field.stringValue = [text substringWithRange:NSMakeRange(start, end - start)];
+    field.placeholderString = @"New name";
+    field.cell.scrollable = YES;
+    alert.accessoryView = field;
+    [alert addButtonWithTitle:@"Rename"];
+    [alert addButtonWithTitle:@"Cancel"];
+    __weak CodeView *view = self;
+    [alert beginSheetModalForWindow:self.window completionHandler:^(NSModalResponse response) {
+        CodeView *editor = view;
+        if (response != NSAlertFirstButtonReturn || !editor || !field.stringValue.length ||
+            editor.syntax.languageDocument != document || document.version != version)
+            return;
+        NSMutableDictionary *params = [editor languageParamsAt:offset];
+        params[@"newName"] = field.stringValue;
+        [document request:@"textDocument/rename" params:params reply:^(id result, NSString *error) {
+            NSString *failure = error;
+            if (!error && result)
+                failure = ApplyWorkspaceLanguageEdit(result, document.root, @"Rename Symbol");
+            [view presentLanguageError:failure];
+        }];
+    }];
+    [alert.window makeFirstResponder:field];
+    [field selectText:nil];
+}
+
+- (BOOL)validateUserInterfaceItem:(id<NSValidatedUserInterfaceItem>)item
+{
+    if (item.action == @selector(languageCommand:)) {
+        NSInteger tag = item.tag;
+        if (tag < 0 || NSUInteger(tag) >= std::size(languageFeatures) ||
+            !SupportsLanguageFeature(self.syntax.languageDocument, LanguageCommand(tag)))
+            return NO;
+        return LanguageCommand(tag) != LanguageCommand::Completion || ([self allowsCompletion] && self.cursorCount == 1);
+    }
+    return [super validateUserInterfaceItem:item];
+}
+
+- (IBAction)languageCommand:(NSMenuItem *)sender
+{
+    NSWindow *window = self.window;
+    if (!window || window.attachedSheet || ![self validateUserInterfaceItem:sender] ||
+        (window.firstResponder != self && ![window makeFirstResponder:self]))
+        return;
+    [self dismissLanguageInformation];
+    LanguageCommand kind = LanguageCommand(sender.tag);
+    if (kind == LanguageCommand::Completion) {
+        [self complete:sender];
+        return;
+    }
+    [self dismissCompletion];
+    NSNumber *clicked = LSPNumber(sender.representedObject);
+    NSUInteger offset = std::min(clicked ? clicked.unsignedIntegerValue : self.vimDisplayedCursor, self.string.length);
+    if (kind == LanguageCommand::Hover || kind == LanguageCommand::Signature) {
+        [self requestLanguageInformation:kind at:offset];
+        return;
+    }
+    if (kind == LanguageCommand::Rename) {
+        [self renameLanguageSymbolAt:offset];
+        return;
+    }
+    if (kind == LanguageCommand::CodeActions || kind == LanguageCommand::QuickFix) {
+        NSRange selection = !clicked && self.selectedRange.length ? self.selectedRange : NSMakeRange(offset, 0);
+        [self requestLanguageActions:selection at:offset quickFix:kind == LanguageCommand::QuickFix];
+        return;
+    }
+    LSPDocument *document = self.syntax.languageDocument;
+    NSMutableDictionary *params = [self languageParamsAt:offset];
+    NSString *method = languageFeatures[size_t(kind)].method;
+    if (kind == LanguageCommand::References) {
+        params[@"context"] = @{@"includeDeclaration":@YES};
+    } else if (kind == LanguageCommand::Format) {
+        [params removeObjectForKey:@"position"];
+        Indentation style = self.syntax.indentation;
+        params[@"options"] = @{@"tabSize":@(style.tabs ? style.tabWidth : style.width), @"insertSpaces":@(!style.tabs)};
+        if (![document supports:@"documentFormattingProvider"]) {
+            method = @"textDocument/rangeFormatting";
+            LSPPosition end = [self.syntax languagePosition:self.string.length];
+            params[@"range"] = @{@"start":LSPPositionValue({}), @"end":LSPPositionValue(end)};
+        }
+    } else if (kind == LanguageCommand::Symbols) {
+        [params removeObjectForKey:@"position"];
+    }
+    __weak CodeView *view = self;
+    [document request:method params:params reply:^(id result, NSString *error) {
+        CodeView *editor = view;
+        if (!editor.window || editor.window.firstResponder != editor)
+            return;
+        if (error) {
+            [editor presentLanguageError:error];
+        } else if (kind == LanguageCommand::Definition || kind == LanguageCommand::References) {
+            [editor showLanguageLocations:result kind:kind at:offset];
+        } else if (kind == LanguageCommand::Symbols) {
+            NSMenu *menu = [[NSMenu alloc] init];
+            [editor addLanguageSymbols:LSPArray(result) toMenu:menu depth:0];
+            [editor popupLanguageMenu:menu at:offset];
+        } else if (result) {
+            std::vector<Vim::CursorEdit> edits;
+            Vim::EditBatch batch;
+            if (AddLSPTextEdits(result, [&](id range) { return [editor.syntax languageRange:range]; }, edits) &&
+                batch.assign(std::move(edits), Vim::EditOrder::Server)) {
+                [editor applyDocumentEdits:std::move(batch) undoName:@"Format Document" options:{}];
+                return;
+            }
+            [editor presentLanguageError:@"The formatter returned invalid edits."];
+        }
+    }];
+}
+
+- (NSMenu *)menuForEvent:(NSEvent *)event
+{
+    NSMenu *menu = [super menuForEvent:event];
+    LSPDocument *document = self.syntax.languageDocument;
+    if (document.state != LSPState::Ready)
+        return menu;
+
+    NSInteger index = 0;
+    NSNumber *offset = nil;
+    for (auto kind : {LanguageCommand::Definition, LanguageCommand::References, LanguageCommand::Rename,
+                      LanguageCommand::CodeActions, LanguageCommand::Format}) {
+        if (!SupportsLanguageFeature(document, kind))
+            continue;
+
+        if (!index) {
+            menu = menu ? [menu copy] : [[NSMenu alloc] init];
+            NSPoint point = [self convertPoint:event.locationInWindow fromView:nil];
+            offset = @([self characterIndexForInsertionAtPoint:point]);
+        }
+
+        NSMenuItem *item = MakeLanguageCommand(kind);
+        item.target = self;
+        item.representedObject = offset;
+        [menu insertItem:item atIndex:index++];
+    }
+
+    if (index && index < menu.numberOfItems && ![menu itemAtIndex:index].isSeparatorItem)
+        [menu insertItem:NSMenuItem.separatorItem atIndex:index];
+    return menu;
 }
 
 - (void)complete:(id)sender
@@ -1680,12 +3992,28 @@ static bool IdentifierAt(NSString *text, NSUInteger offset)
 
 - (void)moveCompletionSelectionUp:(BOOL)up
 {
-    NSUInteger count = _completion.items.count;
+    NSUInteger count = [_completion items].size();
     _completion.selectedRow = (_completion.selectedRow + (up ? count - 1 : 1)) % count;
+}
+
+- (BOOL)performKeyEquivalent:(NSEvent *)event
+{
+    NSWindow *window = self.window;
+    if (DefinitionModifier(event.modifierFlags) && [event.charactersIgnoringModifiers isEqualToString:@"."] &&
+        !window.attachedSheet && (window.firstResponder == self || self.hoverHasFocus) &&
+        [self.syntax.languageDocument supports:@"codeActionProvider"]) {
+        if (self.hoverHasFocus && _hoverQuickFixes.count)
+            [self showHoveredQuickFixes];
+        else
+            [self languageCommand:MakeLanguageCommand(LanguageCommand::QuickFix)];
+        return YES;
+    }
+    return [super performKeyEquivalent:event];
 }
 
 - (void)keyDown:(NSEvent *)event
 {
+    [self dismissLanguageInformation];
     NSString *keys = event.charactersIgnoringModifiers;
     unichar key = keys.length == 1 ? [keys characterAtIndex:0] : 0;
     NSEventModifierFlags modifiers = event.modifierFlags &
@@ -1717,22 +4045,51 @@ static bool IdentifierAt(NSString *text, NSUInteger offset)
     }
 
     BOOL backspace = !modifiers && (key == NSDeleteCharacter || key == NSBackspaceCharacter);
-    if (!backspace)
+    NSString *typed = event.characters;
+    BOOL word = !(modifiers & (NSEventModifierFlagCommand | NSEventModifierFlagControl)) &&
+        typed.length && WordCharacterAt(typed, 0, LispSymbols(self.syntax.language));
+    if (!backspace && !word)
         [self dismissCompletion];
+    BOOL refine = backspace && (self.vimEnabled || self.cursorCount > 1) &&
+        [self completionAtCaret] && _completionPrefix.length;
+    NSUInteger version = self.syntax.textVersion;
+    _editingCompletionPrefix = refine;
     [super keyDown:event];
-    if (open && backspace && (self.vimEnabled || self.cursorCount > 1))
-        [self showCompletionsWithMinimumPrefix:2];
+    _editingCompletionPrefix = NO;
+    if (refine && version != self.syntax.textVersion)
+        [self showCompletionsWithMinimumPrefix:2 trigger:nil continuing:YES];
 }
 
 - (void)mouseDown:(NSEvent *)event
 {
     [self dismissCompletion];
+    [self dismissLanguageInformation];
+    if (DefinitionModifier(event.modifierFlags) && [self.syntax.languageDocument supports:@"definitionProvider"]) {
+        NSRange word = [self languageWordAtWindowPoint:event.locationInWindow];
+        if (word.length) {
+            [self.window makeFirstResponder:self];
+            NSMenuItem *item = MakeLanguageCommand(LanguageCommand::Definition);
+            item.representedObject = @(word.location);
+            [self languageCommand:item];
+            return;
+        }
+    }
     [super mouseDown:event];
 }
 
 - (BOOL)resignFirstResponder
 {
     [self dismissCompletion];
+    if (_languageInformation && !_languageInformation.hidden) {
+        __weak CodeView *view = self;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            CodeView *editor = view;
+            if (editor && editor.window.firstResponder != editor && !editor.hoverHasFocus)
+                [editor dismissLanguageInformation];
+        });
+    } else {
+        [self dismissLanguageInformation];
+    }
     return [super resignFirstResponder];
 }
 
@@ -1783,15 +4140,25 @@ static bool IdentifierAt(NSString *text, NSUInteger offset)
     NSRange selected = range.location == NSNotFound ? self.selectedRange : range;
     BOOL singleCharacter = text.length == 1 ||
         (text.length == 2 && [text rangeOfComposedCharacterSequenceAtIndex:0].length == 2);
-    bool lisp = self.syntax.language == Language::CommonLisp;
+    bool lisp = LispSymbols(self.syntax.language);
     BOOL suggest = !_pasting && singleCharacter &&
                    WordCharacterAt(text, 0, lisp) && [self allowsCompletion];
+    LSPDocument *document = self.syntax.languageDocument;
+    BOOL trigger = !_pasting && singleCharacter && [document triggersCompletion:text];
+    BOOL signature = !_pasting && ([text isEqualToString:@"("] || [text isEqualToString:@","]) &&
+        [document supports:@"signatureHelpProvider"];
+    BOOL refine = suggest && !selected.length && NSEqualRanges(selected, self.selectedRange) && [self completionAtCaret];
     NSUInteger version = self.syntax.textVersion;
-    if (text.length == 1 && [self applyTyping:TypingKey::Character character:[text characterAtIndex:0] selected:selected])
-        return;
-    [super insertText:string replacementRange:range];
-    if (suggest && version != self.syntax.textVersion)
-        [self showCompletionsWithMinimumPrefix:2];
+    _editingCompletionPrefix = refine;
+    if (text.length != 1 || ![self applyTyping:TypingKey::Character character:[text characterAtIndex:0] selected:selected])
+        [super insertText:string replacementRange:range];
+    _editingCompletionPrefix = NO;
+    if (version != self.syntax.textVersion) {
+        if (trigger || suggest)
+            [self showCompletionsWithMinimumPrefix:2 trigger:trigger ? text : nil continuing:refine];
+        else if (signature)
+            [self requestLanguageInformation:LanguageCommand::Signature at:self.selectedRange.location];
+    }
 }
 
 - (void)insertNewline:(id)sender
@@ -1808,11 +4175,15 @@ static bool IdentifierAt(NSString *text, NSUInteger offset)
 
 - (void)deleteBackward:(id)sender
 {
-    BOOL update = !self.vimEnabled && [self validateCompletion];
+    BOOL wasEditing = _editingCompletionPrefix;
+    BOOL refine = [self completionAtCaret] && _completionPrefix.length;
+    NSUInteger version = self.syntax.textVersion;
+    _editingCompletionPrefix = wasEditing || refine;
     if (![self applyTyping:TypingKey::Backspace character:0 selected:self.selectedRange])
         [super deleteBackward:sender];
-    if (update)
-        [self showCompletionsWithMinimumPrefix:2];
+    _editingCompletionPrefix = wasEditing;
+    if (refine && version != self.syntax.textVersion)
+        [self showCompletionsWithMinimumPrefix:2 trigger:nil continuing:YES];
 }
 
 - (void)insertTab:(id)sender
@@ -1919,7 +4290,7 @@ static bool IdentifierAt(NSString *text, NSUInteger offset)
 
     NSString *word = nil;
     NSString *text = self.string;
-    bool lisp = self.syntax.language == Language::CommonLisp;
+    bool lisp = LispSymbols(self.syntax.language);
     if (selection.length && selection.length < text.length && selection.location <= text.length &&
         selection.length <= text.length - selection.location && AtWordBoundaries(text, selection, lisp)) {
         NSUInteger end = NSMaxRange(selection);
@@ -1956,7 +4327,7 @@ static bool IdentifierAt(NSString *text, NSUInteger offset)
     NSUInteger start = characters.location - std::min(characters.location, padding);
     NSUInteger end = std::min(NSMaxRange(characters) + padding, text.length);
     const Theme &theme = *self.theme;
-    bool lisp = self.syntax.language == Language::CommonLisp;
+    bool lisp = LispSymbols(self.syntax.language);
     [[SRGBColor(theme.accents.wordMatch) colorWithAlphaComponent:theme.dark ? 0.19 : 0.15] setFill];
     while (start < end && end - start >= _selectedWord.length) {
         NSRange match = [text rangeOfString:_selectedWord options:NSLiteralSearch range:NSMakeRange(start, end - start)];
@@ -2085,6 +4456,13 @@ static NSColor *ContrastingSelectionColor(Col32 background)
 
 - (void)applyAppearanceWithTheme:(const ThemeRef &)palette
 {
+    NSFont *font = EditorFontPreference();
+    [self applyAppearanceWithTheme:palette font:font hintFont:ShowInlayHints() ? InlayFont(font) : nil];
+}
+
+- (void)applyAppearanceWithTheme:(const ThemeRef &)palette font:(NSFont *)font hintFont:(NSFont *)hintFont
+{
+    [self dismissLanguageInformation];
     [self dismissCompletion];
     _palette = palette;
     const Theme *theme = _palette.get();
@@ -2100,17 +4478,20 @@ static NSColor *ContrastingSelectionColor(Col32 background)
         self.selectedTextAttributes = @{NSBackgroundColorAttributeName:selection};
     }
 
-    NSFont *font = EditorFontPreference();
     [self.syntax refreshIndentationDefaults];
     Indentation indentation = self.syntax.indentation;
     [self setVimIndentation:indentation];
     NSUInteger tabStop = indentation.tabWidth;
     EditorTextStorage *storage = self.syntax.storage;
-    bool typographyChanged = ![_editorFont isEqual:font] || _fontTabStop != tabStop;
+    CGFloat lineHeight = std::ceil(font.ascender - font.descender + font.leading);
+    if (hintFont)
+        lineHeight = std::max(lineHeight, std::ceil(hintFont.ascender - hintFont.descender));
+
+    bool typographyChanged = ![_editorFont isEqual:font] || _fontTabStop != tabStop || _minimumLineHeight != lineHeight;
     if (typographyChanged) {
         NSMutableParagraphStyle *paragraph = [[NSMutableParagraphStyle alloc] init];
         paragraph.baseWritingDirection = NSWritingDirectionLeftToRight;
-        paragraph.minimumLineHeight = std::ceil(font.ascender - font.descender + font.leading);
+        paragraph.minimumLineHeight = lineHeight;
         // Put the extra space below the glyphs so diagnostic marks clear descenders.
         paragraph.lineSpacing = editorLineSpacing;
         paragraph.tabStops = @[];
@@ -2126,6 +4507,7 @@ static NSColor *ContrastingSelectionColor(Col32 background)
                                   NSLigatureAttributeName:@0};
         _editorFont = font;
         _fontTabStop = tabStop;
+        _minimumLineHeight = lineHeight;
     } else {
         NSMutableDictionary *typing = [self.typingAttributes mutableCopy];
         typing[NSFontAttributeName] = _editorFont;
@@ -2137,7 +4519,6 @@ static NSColor *ContrastingSelectionColor(Col32 background)
     if (typographyChanged) {
         if (self.vimEnabled)
             [self refreshVimCaret];
-        [self refreshBuildErrorToolTips];
     }
     [self updateInsertionPointStateAndRestartTimer:NO];
     [self setNeedsDisplay:YES];
@@ -2180,7 +4561,8 @@ static NSColor *ContrastingSelectionColor(Col32 background)
     if (!buffer)
         return;
     const auto &errors = [buffer buildErrors];
-    if (errors.empty())
+    const auto &languageErrors = [buffer languageErrors];
+    if (errors.empty() && languageErrors.empty())
         return;
     CodeLayoutManager *layout = (CodeLayoutManager *)self.layoutManager;
     NSTextContainer *container = self.textContainer;
@@ -2192,64 +4574,79 @@ static NSColor *ContrastingSelectionColor(Col32 background)
     if (layout.extraLineFragmentTextContainer == container && NSIntersectsRect(search, layout.extraLineFragmentRect))
         visibleEnd = self.string.length;
     const auto &hidden = [layout hiddenEditorRanges];
-    for (const BuildError &error : errors) {
-        NSRange span = error.range;
-        if (span.location > visibleEnd)
-            break;
-        if (NSMaxRange(span) < visible.location)
-            continue;
-        auto next = std::upper_bound(hidden.begin(), hidden.end(), span.location,
-                                    [](NSUInteger at, NSRange range) { return at < range.location; });
-        if (next != hidden.begin() && NSLocationInRange(span.location, *(next - 1)))
-            continue;
-        NSRect rect;
-        if (span.length) {
-            NSRange range = [layout glyphRangeForCharacterRange:span actualCharacterRange:nullptr];
-            rect = [layout boundingRectForGlyphRange:range inTextContainer:container];
-            NSRect line = [layout lineFragmentRectForGlyphAtIndex:range.location effectiveRange:nullptr];
-            rect.origin.y = NSMinY(line);
-            rect.size.height = NSHeight(line);
-            rect = NSOffsetRect(rect, origin.x, origin.y);
-        } else {
-            rect = [self vimCaretAt:span.location];
+    NSUInteger start = [buffer offsetForLine:[buffer lineForOffset:visible.location]];
+    bool showUnusedWarnings = ShowUnusedWarnings();
+    auto drawErrors = [&](const std::vector<BuildError> &items) {
+        auto first = std::lower_bound(items.begin(), items.end(), start,
+            [](const BuildError &error, NSUInteger offset) { return error.range.location < offset; });
+        for (auto item = first; item != items.end(); ++item) {
+            const BuildError &error = *item;
+            NSRange span = error.range;
+            if (span.location > visibleEnd)
+                break;
+            if ((error.unusedWarning && !showUnusedWarnings) || NSMaxRange(span) < visible.location)
+                continue;
+            auto next = std::upper_bound(hidden.begin(), hidden.end(), span.location,
+                                        [](NSUInteger at, NSRange range) { return at < range.location; });
+            if (next != hidden.begin() && NSLocationInRange(span.location, *(next - 1)))
+                continue;
+            NSRect rect;
+            if (span.length) {
+                NSRange range = [layout glyphRangeForCharacterRange:span actualCharacterRange:nullptr];
+                rect = [layout boundingRectForGlyphRange:range inTextContainer:container];
+                NSRange fragment;
+                NSRect line = [layout lineFragmentRectForGlyphAtIndex:range.location effectiveRange:&fragment];
+                if (NSMaxRange(range) <= NSMaxRange(fragment))
+                    rect.size.width = std::max(0.0, NSWidth(rect) - [layout inlayWidthAfterCharacter:NSMaxRange(span) - 1]);
+                rect.origin.y = NSMinY(line);
+                rect.size.height = NSHeight(line);
+                rect = NSOffsetRect(rect, origin.x, origin.y);
+            } else {
+                rect = [self vimCaretAt:span.location];
+            }
+            if (NSIntersectsRect(rect, area))
+                block(error, rect);
         }
-        if (NSIntersectsRect(rect, area))
-            block(error, rect);
-    }
+    };
+    drawErrors(errors);
+    drawErrors(languageErrors);
 }
 
-- (void)refreshBuildErrorToolTips
+- (void)diagnosticsChanged
 {
-    for (NSToolTipTag tag : _buildErrorToolTips)
-        [self removeToolTip:tag];
-    _buildErrorToolTips.clear();
-    if (!self.window)
-        return;
-    NSRect visible = self.visibleRect;
-    if (NSIsEmptyRect(visible))
-        return;
-    [self enumerateBuildErrorsInRect:visible usingBlock:^(const BuildError &error, NSRect rect) {
-        if (!error.message.length)
-            return;
-        NSToolTipTag tag = [self addToolTipRect:NSIntersectionRect(rect, visible) owner:error.message userData:nullptr];
-        if (tag)
-            _buildErrorToolTips.push_back(tag);
-    }];
+    if (_hoveredError)
+        [self dismissLanguageInformation];
+    [self updateLanguageTracking];
 }
 
 - (void)viewDidMoveToWindow
 {
     [super viewDidMoveToWindow];
-    [self refreshBuildErrorToolTips];
+    [self dismissLanguageInformation];
+    [self updateLanguageTracking];
+    if (self.window)
+        [self.syntax scheduleInlayHints];
+    else
+        [self.syntax suspendInlayHintsIfHidden];
+}
+
+- (BOOL)becomeFirstResponder
+{
+    BOOL focused = [super becomeFirstResponder];
+    if (focused)
+        [self.syntax scheduleInlayHints];
+    return focused;
 }
 
 - (void)drawBuildErrors:(NSRect)dirty
 {
-    [self enumerateBuildErrorsInRect:dirty usingBlock:^(const BuildError &, NSRect rect) {
+    [self enumerateBuildErrorsInRect:dirty usingBlock:^(const BuildError &error, NSRect rect) {
         NSRect underline = NSMakeRect(NSMinX(rect), NSMaxY(rect) - 2, NSWidth(rect), 2);
         if (!NSIntersectsRect(underline, dirty))
             return;
-        [SRGBColor(self.theme->dark ? rgb(255, 83, 83) : rgb(210, 25, 35)) setStroke];
+        Col32 color = error.warning ? (self.theme->dark ? rgb(233, 182, 69) : rgb(168, 107, 0)) :
+            (self.theme->dark ? rgb(255, 83, 83) : rgb(210, 25, 35));
+        [SRGBColor(color) setStroke];
         constexpr CGFloat amplitude = 0.5;
         CGFloat y = NSMidY(underline);
         CGFloat start = NSMinX(rect);
@@ -2333,13 +4730,158 @@ static NSColor *ContrastingSelectionColor(Col32 background)
     [message drawInRect:NSMakeRect(x, y, width, NSHeight(line)) withAttributes:attributes];
 }
 
+static void AddInlayOutline(CGContextRef context, NSRect rect, CGFloat radius)
+{
+    CGFloat left = NSMinX(rect), right = NSMaxX(rect);
+    CGFloat top = NSMinY(rect), bottom = NSMaxY(rect);
+    CGContextMoveToPoint(context, left + radius, top);
+    CGContextAddArcToPoint(context, right, top, right, bottom, radius);
+    CGContextAddArcToPoint(context, right, bottom, left, bottom, radius);
+    CGContextAddArcToPoint(context, left, bottom, left, top, radius);
+    CGContextAddArcToPoint(context, left, top, right, top, radius);
+    CGContextClosePath(context);
+}
+
+- (CGFloat)vimExtraGlyphWidthAt:(NSUInteger)position
+{
+    return [(CodeLayoutManager *)self.layoutManager inlayWidthAfterCharacter:position];
+}
+
+static bool InlayGapIsHidden(CodeLayoutManager *layout, const InlayGap &gap)
+{
+    const auto &hidden = [layout hiddenEditorRanges];
+    auto fold = std::upper_bound(hidden.begin(), hidden.end(), gap.glyphStart,
+        [](NSUInteger index, NSRange range) { return index < range.location; });
+    return fold != hidden.begin() && NSLocationInRange(gap.glyphStart, *(fold - 1));
+}
+
+static NSRect InlayGapRect(CodeLayoutManager *layout, NSTextContainer *container, NSPoint origin, const InlayGap &gap)
+{
+    if (InlayGapIsHidden(layout, gap))
+        return NSZeroRect;
+
+    NSUInteger glyph = [layout glyphIndexForCharacterAtIndex:gap.glyphStart];
+    NSRect row = [layout lineFragmentRectForGlyphAtIndex:glyph effectiveRange:nullptr];
+    CGFloat right;
+    if (gap.kind == InlayGapKind::Leading) {
+        right = NSMinX(row) + [layout locationForGlyphAtIndex:glyph].x;
+    } else {
+        NSRange anchor = [layout glyphRangeForCharacterRange:NSMakeRange(gap.glyphStart, gap.at - gap.glyphStart) actualCharacterRange:nullptr];
+        right = NSMaxX([layout boundingRectForGlyphRange:anchor inTextContainer:container]);
+    }
+    return NSMakeRect(origin.x + right - gap.width, origin.y + NSMinY(row), gap.width, NSHeight(row));
+}
+
+- (CGFloat)inlayWidthAtInsertion:(NSUInteger)position
+{
+    auto gaps = [self.syntax.storage inlayGaps];
+    auto gap = std::ranges::lower_bound(gaps, position, {}, &InlayGap::at);
+    if (gap == gaps.end() || gap->at != position || InlayGapIsHidden((CodeLayoutManager *)self.layoutManager, *gap))
+        return 0;
+    return gap->width;
+}
+
+- (NSUInteger)inlayInsertionAtPoint:(NSPoint)point before:(BOOL *)before
+{
+    auto gaps = [self.syntax.storage inlayGaps];
+    if (gaps.empty())
+        return NSNotFound;
+
+    CodeLayoutManager *layout = (CodeLayoutManager *)self.layoutManager;
+    NSTextContainer *container = self.textContainer;
+    NSPoint origin = self.textContainerOrigin;
+    auto characters = [self vimCharactersInViewport:NSMakeRect(point.x, point.y, 1, 1)];
+    auto gap = std::ranges::lower_bound(gaps, characters.first, {}, &InlayGap::at);
+    for (; gap != gaps.end() && gap->at <= characters.last; ++gap) {
+        NSRect rect = InlayGapRect(layout, container, origin, *gap);
+        if (NSPointInRect(point, rect)) {
+            *before = point.x < NSMidX(rect);
+            return gap->at;
+        }
+    }
+    return NSNotFound;
+}
+
+- (void)drawInlayHints:(NSRect)dirty foreground:(NSColor *)foreground
+{
+    auto labels = [self.syntax.storage inlayLabels];
+    if (labels.empty())
+        return;
+
+    CodeLayoutManager *layout = (CodeLayoutManager *)self.layoutManager;
+    NSTextContainer *container = self.textContainer;
+    auto characters = [self vimCharactersInViewport:dirty];
+    auto gaps = [self.syntax.storage inlayGaps];
+    auto gap = std::ranges::lower_bound(gaps, characters.first, {}, &InlayGap::at);
+    if (gap == gaps.end() || gap->at > characters.last)
+        return;
+    auto label = std::ranges::lower_bound(labels, gap->at, {}, &InlayLabel::at);
+    NSPoint origin = self.textContainerOrigin;
+    auto colors = self.theme->inlay;
+    NSColor *text = foreground ? foreground : SRGBColor(colors.text);
+    NSColor *background = foreground ? nil : SRGBColor(colors.background);
+    NSColor *border = !foreground && ColorAlpha(colors.border) ? SRGBColor(colors.border) : nil;
+    CGFloat pixel = 1 / std::max(1.0, self.window.backingScaleFactor);
+    auto snap = [pixel](CGFloat value) { return std::round(value / pixel) * pixel; };
+
+    CGContextRef context = NSGraphicsContext.currentContext.CGContext;
+    CGContextSaveGState(context);
+    CGContextClipToRect(context, dirty);
+    CGContextSetBlendMode(context, kCGBlendModeNormal);
+    CGContextSetShouldAntialias(context, true);
+    CGContextSetShouldSmoothFonts(context, false);
+    CGContextSetLineWidth(context, pixel);
+    if (border)
+        CGContextSetStrokeColorWithColor(context, border.CGColor);
+    for (; gap != gaps.end() && gap->at <= characters.last; ++gap) {
+        auto first = label;
+        while (label != labels.end() && label->at == gap->at)
+            ++label;
+
+        NSRect row = InlayGapRect(layout, container, origin, *gap);
+        if (NSIsEmptyRect(row))
+            continue;
+
+        CGFloat x = NSMinX(row);
+        CGFloat midY = NSMidY(row) - editorLineSpacing / 2;
+        for (auto item = first; item != label; ++item) {
+            CGFloat left = snap(x + item->left);
+            x += item->width();
+            if (x <= NSMinX(dirty) || left >= NSMaxX(dirty))
+                continue;
+
+            CTLineRef line = (__bridge CTLineRef)item->line;
+            CGFloat ascent, descent;
+            CTLineGetTypographicBounds(line, &ascent, &descent, nullptr);
+            if (background) {
+                CGFloat height = std::min(NSHeight(row) - pixel, std::ceil(ascent + descent) + 1);
+                NSRect rect = NSMakeRect(left, snap(midY - height / 2), item->textWidth + 2 * inlayInset, height);
+                CGContextSetFillColorWithColor(context, background.CGColor);
+                CGContextBeginPath(context);
+                AddInlayOutline(context, rect, 2);
+                CGContextFillPath(context);
+                if (border) {
+                    CGContextBeginPath(context);
+                    AddInlayOutline(context, NSInsetRect(rect, pixel / 2, pixel / 2), 2 - pixel / 2);
+                    CGContextStrokePath(context);
+                }
+            }
+            NSPoint baseline = NSMakePoint(left + inlayInset, snap(midY + (ascent - descent) / 2));
+            [layout drawShapedLine:line atPoint:baseline color:text];
+        }
+    }
+    CGContextRestoreGState(context);
+}
+
 - (void)drawVimBlockCarets:(const std::vector<VimBlockCaret> &)carets dirty:(NSRect)dirty
 {
     CodeLayoutManager *layout = (CodeLayoutManager *)self.layoutManager;
     NSPoint origin = self.textContainerOrigin;
     NSString *source = self.string;
     NSColor *fill = self.insertionPointColor;
-    NSColor *ink = SRGBColor(*self.theme->blockCaretText);
+    auto caretText = self.theme->blockCaretText;
+    NSColor *ink = caretText ? SRGBColor(*caretText) : nil;
+    NSColor *inlayInk = ink;
     CGContextRef context = NSGraphicsContext.currentContext.CGContext;
     for (const auto &caret : carets) {
         NSRect box = [self backingAlignedRect:caret.rect options:NSAlignAllEdgesNearest];
@@ -2348,7 +4890,11 @@ static NSColor *ContrastingSelectionColor(Col32 background)
             continue;
         [fill setFill];
         NSRectFill(box);
-        if (caret.position < source.length) {
+        if (caret.position == NSNotFound) {
+            if (!inlayInk)
+                inlayInk = ContrastingSelectionColor(self.theme->caret.value_or(self.theme->ink[size_t(Ink::Text)]));
+            [self drawInlayHints:box foreground:inlayInk];
+        } else if (ink && caret.position < source.length) {
             NSRange characters = [source rangeOfComposedCharacterSequenceAtIndex:caret.position];
             NSRange glyphs = [layout glyphRangeForCharacterRange:characters actualCharacterRange:nullptr];
             CGContextSaveGState(context);
@@ -2359,9 +4905,79 @@ static NSColor *ContrastingSelectionColor(Col32 background)
     }
 }
 
+- (void)sizeToFit
+{
+    BOOL fitting = _fittingDocument;
+    _fittingDocument = YES;
+    [super sizeToFit];
+    _fittingDocument = fitting;
+}
+
+- (void)setFrameSize:(NSSize)size
+{
+    if (!_fittingDocument && self.layoutManager.hasNonContiguousLayout &&
+        self.enclosingScrollView && !self.syntax.hasPendingHighlighting) {
+        NSSize current = self.frame.size;
+        NSRect visible = self.visibleRect;
+        // Small changes to the estimated height can wait while both sizes cover the viewport.
+        // Resizing on each estimate makes AppKit discard the existing scroll pixels.
+        if (size.width == current.width && std::abs(size.height - current.height) < NSHeight(visible) &&
+            NSMaxY(visible) + NSHeight(visible) < std::min(size.height, current.height))
+            return;
+    }
+
+    [super setFrameSize:size];
+}
+
+- (void)prepareContentInRect:(NSRect)rect
+{
+    NSRect visible = self.visibleRect;
+    NSLayoutManager *layout = self.layoutManager;
+    SyntaxBuffer *buffer = self.syntax;
+    if (_preparingViewport || !layout.hasNonContiguousLayout || NSIsEmptyRect(visible) ||
+        !buffer || buffer.hasPendingHighlighting) {
+        [super prepareContentInRect:NSIntersectionRect(rect, visible)];
+        return;
+    }
+
+    NSTextContainer *container = self.textContainer;
+    NSRect area = NSMakeRect(0, NSMinY(visible) - self.textContainerOrigin.y, NSWidth(self.bounds), NSHeight(visible));
+    NSRange glyphs = [layout glyphRangeForBoundingRectWithoutAdditionalLayout:area inTextContainer:container];
+    NSRect before = glyphs.length ?
+        [layout lineFragmentRectForGlyphAtIndex:glyphs.location effectiveRange:nullptr withoutAdditionalLayout:YES] : NSZeroRect;
+    NSUInteger character = NSIsEmptyRect(before) ? NSNotFound : [layout characterIndexForGlyphAtIndex:glyphs.location];
+    NSClipView *clip = self.enclosingScrollView.contentView;
+    NSRect target = clip.bounds;
+    _preparingViewport = YES;
+    if (character == NSNotFound || [self hasVimFolds]) {
+        [layout ensureLayoutForBoundingRect:area inTextContainer:container];
+    } else {
+        // Fill the same group of nearby rows until the viewport reaches the next group.
+        NSUInteger row = [buffer lineForOffset:character];
+        CGFloat lineHeight = std::max(1.0, [layout defaultLineHeightForFont:self.editorFont]);
+        NSUInteger group = std::clamp(NSUInteger(NSHeight(visible) / lineHeight), NSUInteger(1), NSUInteger(32));
+        NSUInteger offset = [buffer offsetForLine:row - row % group];
+        [self prepareLayoutAroundOffset:offset verticalMargin:2 * NSHeight(visible)];
+    }
+
+    if (character != NSNotFound) {
+        NSUInteger glyph = [layout glyphIndexForCharacterAtIndex:character];
+        NSRect after = [layout lineFragmentRectForGlyphAtIndex:glyph effectiveRange:nullptr withoutAdditionalLayout:YES];
+        if (!NSIsEmptyRect(after)) {
+            // Preserve the visible row's screen position when filling a hole moves its layout.
+            target.origin.y += NSMinY(after) - NSMinY(before);
+            if (std::abs(NSMinY(target) - NSMinY(clip.bounds)) > 0.01)
+                [clip scrollToPoint:[clip constrainBoundsRect:target].origin];
+        }
+    }
+    [super prepareContentInRect:NSIntersectionRect(rect, self.visibleRect)];
+    _preparingViewport = NO;
+}
+
 - (void)drawRect:(NSRect)dirty
 {
-    dirty = NSIntersectionRect(dirty, self.visibleRect);
+    // AppKit also paints rows just outside the viewport for scrolling.
+    dirty = NSIntersectionRect(dirty, self.bounds);
     if (NSIsEmptyRect(dirty))
         return;
     RenderSettings settings = self.rendering;
@@ -2384,6 +5000,11 @@ static NSColor *ContrastingSelectionColor(Col32 background)
             NSRectFillUsingOperation(NSIntersectionRect(debugLine, rect), NSCompositingOperationSourceOver);
         }
         [self drawWordOccurrences:rect];
+        if (NSIntersectsRect(_languageHoverHighlight, rect)) {
+            const Theme &theme = *self.theme;
+            [[SRGBColor(theme.accents.wordMatch) colorWithAlphaComponent:theme.dark ? 0.20 : 0.14] setFill];
+            NSRectFillUsingOperation(NSIntersectionRect(_languageHoverHighlight, rect), NSCompositingOperationSourceOver);
+        }
         std::vector<NSRange> selections;
         std::vector<NSRange> inactiveSelections;
         std::vector<VimBlockCaret> blockCarets;
@@ -2403,7 +5024,7 @@ static NSColor *ContrastingSelectionColor(Col32 background)
             NSColor *flash = SRGBColor(self.theme->accents.vimFlash);
             [self drawVimOverlays:rect selection:SRGBColor(self.theme->selection) flash:flash
                    selectedRanges:showWhitespace || selectionColor ? &selections : nullptr
-                      blockCarets:self.theme->blockCaretText ? &blockCarets : nullptr];
+                      blockCarets:blockCarets contrastingCaret:self.theme->blockCaretText.has_value()];
         }
         [self drawBracketMatch:rect flash:YES];
         bool recolor = selectionColor && selections.size() > firstColoredRange;
@@ -2415,6 +5036,7 @@ static NSColor *ContrastingSelectionColor(Col32 background)
         if (showWhitespace)
             DrawEditorWhitespace(self, rect, self.editorFont, settings.whitespace, self.theme->whitespace,
                                  self.theme->selection, selections, inactiveSelections);
+        [self drawInlayHints:rect foreground:nil];
         [self drawFoldMarks:rect];
         [self drawBracketMatch:rect flash:NO];
         [self drawBuildErrors:rect];
@@ -2433,6 +5055,8 @@ static CodeView *CreateCodeView(SyntaxBuffer *buffer, NSString *text)
     CodeLayoutManager *layout = [[CodeLayoutManager alloc] init];
     layout.backgroundLayoutEnabled = NO;
     [buffer.storage addLayoutManager:layout];
+    if (![buffer.storage inlayGaps].empty())
+        [layout setInlaySpacingSource:buffer.storage];
     NSTextContainer *container = [[NSTextContainer alloc] initWithContainerSize:NSMakeSize(containerLimit, containerLimit)];
     container.lineFragmentPadding = 0;
     [layout addTextContainer:container];
@@ -2465,30 +5089,36 @@ static CodeView *CreateCodeView(SyntaxBuffer *buffer, NSString *text)
 }
 
 @interface EditorPreview : NSScrollView
+- (instancetype)initWithCompactSample:(BOOL)compact;
 @end
 
 @implementation EditorPreview {
     SyntaxBuffer *_buffer;
     CodeView *_editor;
+    NSFont *_hintFont;
+    NSUInteger _hintOffset;
 }
 
-- (instancetype)init
+- (instancetype)initWithCompactSample:(BOOL)compact
 {
     self = [super initWithFrame:NSMakeRect(0, 0, 516, 190)];
     if (!self)
         return nil;
+
     _buffer = [[SyntaxBuffer alloc] init];
     _buffer.language = Language::C;
-    _editor = CreateCodeView(_buffer, @"#include <stdio.h>\n\n"
-                            "enum { WIDTH = 64, HEIGHT = 64 };\n\n"
-                            "int main(void)\n{\n"
-                            "\t/* P6 is the binary PPM format. */\n"
-                            "    printf(\"P6\\n%d %d\\n255\\n\", WIDTH, HEIGHT);  \n"
-                            "    for (int i = 0; i < WIDTH * HEIGHT; ++i) {\n"
-                            "        unsigned char rgb[] = {i & 255, 64, 255};\n"
-                            "        fwrite(rgb, 1, sizeof rgb, stdout);\n"
-                            "    }\n"
-                            "    return 0;\n}");
+    NSString *sample = compact ? @"printf(\"Hello, world!\\n\");" : @"#include <stdio.h>\n\n"
+                         "enum { WIDTH = 64, HEIGHT = 64 };\n\n"
+                         "int main(void)\n{\n"
+                         "\t/* P6 is the binary PPM format. */\n"
+                         "    printf(\"P6\\n%d %d\\n255\\n\", WIDTH, HEIGHT);  \n"
+                         "    for (int i = 0; i < WIDTH * HEIGHT; ++i) {\n"
+                         "        unsigned char rgb[] = {i & 255, 64, 255};\n"
+                         "        fwrite(rgb, 1, sizeof rgb, stdout);\n"
+                         "    }\n"
+                         "    return 0;\n}";
+    _hintOffset = NSMaxRange([sample rangeOfString:@"printf("]);
+    _editor = CreateCodeView(_buffer, sample);
     _editor.editable = NO;
     _editor.selectable = NO;
     self.borderType = NSBezelBorder;
@@ -2500,6 +5130,8 @@ static CodeView *CreateCodeView(SyntaxBuffer *buffer, NSString *text)
     self.documentView = _editor;
     [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(preferencesChanged:)
                                                name:EditorPreferencesChanged object:nil];
+    [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(preferencesChanged:)
+                                               name:InlayPreferencesChanged object:nil];
     [self preferencesChanged:nil];
     return self;
 }
@@ -2507,7 +5139,17 @@ static CodeView *CreateCodeView(SyntaxBuffer *buffer, NSString *text)
 - (void)preferencesChanged:(NSNotification *)notification
 {
     (void)notification;
-    [_editor applyAppearance];
+    NSFont *font = EditorFontPreference();
+    NSFont *hintFont = InlayFont(font);
+    [_editor applyAppearanceWithTheme:SelectedTheme() font:font hintFont:hintFont];
+    if (![_hintFont isEqual:hintFont] || [_buffer.storage inlayLabels].empty()) {
+        _hintFont = hintFont;
+        NSDictionary *attributes = @{NSFontAttributeName:hintFont, (id)kCTForegroundColorFromContextAttributeName:@YES};
+        CGFloat width;
+        id line = ShapeInlayLine(@"format:", attributes, width);
+        [_buffer.storage replaceInlayLabels:{{_hintOffset, width, 0, inlayGap, line}}];
+    }
+
     [_editor sizeToFit];
     self.backgroundColor = RenderedEditorColor(_editor.theme->paper, _editor.rendering);
     self.appearance = [NSAppearance appearanceNamed:_editor.theme->dark ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua];
@@ -2515,9 +5157,9 @@ static CodeView *CreateCodeView(SyntaxBuffer *buffer, NSString *text)
 
 @end
 
-NSView *CreateEditorPreview()
+NSView *CreateEditorPreview(bool compact)
 {
-    return [[EditorPreview alloc] init];
+    return [[EditorPreview alloc] initWithCompactSample:compact];
 }
 
 struct GutterBreakpointHit {
@@ -2786,31 +5428,20 @@ static CGFloat GutterLineCenter(NSRect fragment, CGFloat originY)
 @interface WindowStatusBar : NSView
 @end
 
-@implementation WindowStatusBar {
-    NSGradient *_gradient;
-}
+@implementation WindowStatusBar
 
 - (BOOL)isOpaque { return YES; }
 
 - (void)viewDidChangeEffectiveAppearance
 {
     [super viewDidChangeEffectiveAppearance];
-    _gradient = nil;
     self.needsDisplay = YES;
 }
 
 - (void)drawRect:(NSRect)dirty
 {
-    if (!_gradient) {
-        NSString *appearance = [self.effectiveAppearance bestMatchFromAppearancesWithNames:@[
-            NSAppearanceNameAqua, NSAppearanceNameDarkAqua
-        ]];
-        BOOL dark = [appearance isEqualToString:NSAppearanceNameDarkAqua];
-        _gradient = [[NSGradient alloc] initWithStartingColor:SRGBColor(dark ? rgb(54, 55, 58) : rgb(242, 242, 243))
-                                                   endingColor:SRGBColor(dark ? rgb(41, 42, 45) : rgb(225, 225, 228))];
-    }
     NSRect bounds = self.bounds;
-    [_gradient drawInRect:bounds angle:-90];
+    DrawWindowBarGradient(bounds, self.effectiveAppearance);
     NSRect rule = NSMakeRect(0, NSMaxY(bounds) - 1, NSWidth(bounds), 1);
     [NSColor.separatorColor setFill];
     NSRectFillUsingOperation(NSIntersectionRect(dirty, rule), NSCompositingOperationSourceOver);
@@ -2861,6 +5492,7 @@ static bool RunHasBreakpoint(RunProject project, Language language, NSURL *file)
 }
 
 enum class RunCommand { Run, Continue, Stop };
+static constexpr NSInteger titleDebugButtonTag = 1;
 
 static NSString *RunCommandTitle(RunCommand command)
 {
@@ -2910,6 +5542,47 @@ static void SetRunButton(NSButton *button, RunCommand command)
         [title stringByAppendingString:@" (⌘R)"];
 }
 
+static void SetTitleDebugButton(NSButton *runButton, DebugPhase phase)
+{
+    NSView *container = runButton.superview;
+    NSButton *button = (NSButton *)[container viewWithTag:titleDebugButtonTag];
+    if (!button)
+        return;
+
+    bool paused = phase == DebugPhase::Paused;
+    BOOL hidden = !paused && phase != DebugPhase::Running;
+    if (!hidden) {
+        SEL action = paused ? @selector(stopDebugging:) : @selector(pauseDebugging:);
+        if (button.action != action) {
+            DebugCommand command = paused ? DebugCommand::Stop : DebugCommand::Pause;
+            NSString *title = paused ? @"Stop Debugging" : @"Pause";
+            NSImage *symbol = [NSImage imageWithSystemSymbolName:paused ? @"stop.fill" : @"pause.fill" accessibilityDescription:title];
+            static NSImageSymbolConfiguration *size = [NSImageSymbolConfiguration configurationWithPointSize:14 weight:NSFontWeightRegular];
+            button.image = [symbol imageWithSymbolConfiguration:size];
+            button.accessibilityLabel = title;
+            button.toolTip = DebugCommandToolTip(command, title);
+            button.action = action;
+        }
+    }
+
+    if (button.hidden != hidden) {
+        button.hidden = hidden;
+        NSSize size = container.frame.size;
+        size.width += hidden ? -NSWidth(button.frame) : NSWidth(button.frame);
+        [container setFrameSize:size];
+    }
+}
+
+static NSButton *MakeTitleRunControl(NSRect frame, SEL action)
+{
+    NSButton *button = [[NSButton alloc] initWithFrame:frame];
+    [button setButtonType:NSButtonTypeMomentaryPushIn];
+    button.bordered = NO;
+    button.imagePosition = NSImageOnly;
+    button.action = action;
+    return button;
+}
+
 @interface SourceDocument (VimActions)
 - (void)performVimAction:(Vim::Action)action argument:(NSString *)argument force:(BOOL)force;
 @end
@@ -2920,7 +5593,8 @@ static void SetRunButton(NSButton *button, RunCommand command)
 - (void)cancelRun;
 - (NSUInteger)beginBuildDiagnostics;
 - (NSUInteger)diagnosticVersion;
-- (void)applyBuildMessages:(const std::vector<RunMessage> &)messages version:(NSUInteger)version owner:(BOOL)owner;
+- (void)applyBuildMessages:(const std::vector<RunMessage> &)messages version:(NSUInteger)version
+                     owner:(BOOL)owner fromOutput:(BOOL)fromOutput;
 @end
 
 @interface SourceDocument (LanguageDetection)
@@ -3020,9 +5694,7 @@ static Vim::EditBatch IndentationConversion(NSString *text, Indentation style)
 static void SyncNativeTabOutput(NSWindow *window);
 static char selectedOutputTabContext;
 
-enum class DockPage { Hidden, Output, Errors, Debug };
-
-@interface WindowOutput : NSObject
+@interface WindowOutput : NSView
 @property(nonatomic) OutputPane *pane;
 @property(nonatomic) OutputPane *errorsPane;
 @property(nonatomic) DebugPane *debugPane;
@@ -3040,17 +5712,25 @@ enum class DockPage { Hidden, Output, Errors, Debug };
 @property(nonatomic, readonly) BOOL debugging;
 - (void)stopDebug;
 @property(nonatomic, weak) EditorWindow *host;
+@property(nonatomic, weak) EditorWindow *otherEditor;
 @property(nonatomic, weak) SourceDocument *source;
 @property(nonatomic) SourceRunner *runner;
 @property(nonatomic) FolderWorkspace *runWorkspace;
 @property(nonatomic) BOOL shown;
-@property(nonatomic) DockPage page;
 @property(nonatomic) BOOL returnFocus;
-@property(nonatomic, readonly) NSUInteger errorCount;
 @property(nonatomic, readonly) NSTimer *checkTimer;
 @property(nonatomic) SourceRunner *checkRunner;
 @property(nonatomic) RustCheckCache *checkCache;
 - (void)observeTabGroup:(NSWindowTabGroup *)group;
+- (void)attachTo:(NSView *)body editors:(NSSplitView *)editors;
+- (void)showDockPage:(DockPage)page;
+- (void)toggleDockPage:(DockPage)page;
+- (void)updateEditorStatus;
+- (void)updateEditorSettings;
+- (void)updateLanguageStatus;
+- (void)updateConsoleAppearance;
+- (void)refreshDebugControls;
+- (void)debugUpdated;
 - (void)finishRun;
 - (void)armCheckTimer:(NSTimeInterval)delay;
 - (void)cancelCheck;
@@ -3062,7 +5742,7 @@ enum class DockPage { Hidden, Output, Errors, Debug };
 - (instancetype)initWithDocument:(SourceDocument *)document text:(NSString *)text language:(Language)language;
 @property(nonatomic, readonly) CodeView *editor;
 @property(nonatomic, readonly) CodeView *activeEditor;
-@property(nonatomic, readonly) BOOL outputShown;
+@property(nonatomic, readonly) BOOL hasSplit;
 @property(nonatomic, readonly, getter=isRunning) BOOL running;
 @property(nonatomic, readonly) BOOL canRun;
 @property(nonatomic, readonly) Indentation indentation;
@@ -3075,15 +5755,18 @@ enum class DockPage { Hidden, Output, Errors, Debug };
 - (void)convertIndentationToTabs:(BOOL)tabs;
 - (void)rememberTabFocus;
 - (NSView *)tabFocus;
-- (void)setWindowOutput:(WindowOutput *)output attach:(BOOL)attach;
-- (void)detachWindowOutput;
-- (void)showOutput:(BOOL)show;
-- (void)scheduleRustCheck;
-- (void)resumeRustCheck;
-- (void)cancelRustCheck;
-- (void)startPendingRustCheck;
-- (void)updateErrorsTab;
-- (CodeView *)editorForOutput;
+- (void)setWindowOutput:(WindowOutput *)output;
+- (void)updateLanguageDiagnostics;
+- (void)scheduleLanguageCheck;
+- (void)resumeLanguageCheck;
+- (void)refreshLanguageServices;
+- (void)closeLanguageServices;
+- (void)updateLanguageHoverModifiers:(NSEvent *)event;
+- (BOOL)hasDiagnostics;
+- (BOOL)viewErrorAtCursor;
+- (NSArray<NSMenuItem *> *)languagePaletteCommands;
+- (void)cancelLanguageCheck;
+- (void)startPendingLanguageCheck;
 - (NSDictionary *)sessionView;
 - (void)restoreSessionView:(NSDictionary *)state;
 - (void)replaceDocumentText:(NSString *)text;
@@ -3099,22 +5782,624 @@ enum class DockPage { Hidden, Output, Errors, Debug };
 - (IBAction)runSource:(id)sender;
 - (void)performDebugCommand:(DebugCommand)command;
 - (BOOL)canDebugCommand:(DebugCommand)command;
-- (void)debugUpdated;
 - (void)refreshDebugLocation;
+- (void)startDebugTarget;
+- (void)editBreakpoint:(NSString *)path line:(NSUInteger)line;
 - (RunCommand)runCommand;
 - (BOOL)canRunCommand;
 - (void)refreshRunButton;
-- (IBAction)toggleOutput:(id)sender;
 - (BOOL)isRunSource;
 - (void)stopRun;
 - (void)revealRunLocation:(const RunLocation &)location;
 @property(nonatomic, weak) NSButton *runButton;
 @end
 
+static BOOL MoveFocusInDocumentSplit(EditorWindow *from, unichar key);
+
 @implementation WindowOutput {
     __weak NSWindowTabGroup *_tabGroup;
     __weak SourceDocument *_diagnosticsSource;
     std::optional<std::vector<RunMessage>> _pendingDiagnostics;
+    NSUInteger _errorCount, _warningCount;
+    __weak NSSplitView *_editors;
+    WindowStatusBar *_statusBar;
+    NSTextField *_position;
+    NSTextField *_encoding;
+    NSPopUpButton *_language;
+    NSButton *_indentationButton;
+    NSButton *_languageStatus;
+    DockTab *_outputTab;
+    DockTab *_errorsTab;
+    DockTab *_debugTab;
+    DockRail *_outputRail;
+    DockDivider *_outputDivider;
+    DockDropTarget *_dropTarget;
+    DockSide _dockSide;
+    DockPage _page;
+    CGFloat _dockWidth;
+    CGFloat _dockHeight;
+}
+
+- (instancetype)initWithFrame:(NSRect)frame
+{
+    self = [super initWithFrame:frame];
+    if (!self)
+        return nil;
+
+    self.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    _statusBar = [[WindowStatusBar alloc] init];
+    [self addSubview:_statusBar];
+    _position = StatusLabel(@"");
+    _encoding = StatusLabel(@"UTF-8");
+    _encoding.alignment = NSTextAlignmentCenter;
+    [_statusBar addSubview:_position];
+    [_statusBar addSubview:_encoding];
+    _indentationButton = [NSButton buttonWithTitle:@"" target:nil action:@selector(showIndentationMenu:)];
+    _indentationButton.bordered = NO;
+    _indentationButton.refusesFirstResponder = YES;
+    _indentationButton.font = [NSFont systemFontOfSize:NSFont.smallSystemFontSize];
+    _indentationButton.toolTip = @"Indentation";
+    [_statusBar addSubview:_indentationButton];
+    _languageStatus = [NSButton buttonWithTitle:@"LSP" target:nil action:@selector(showLanguageStatus:)];
+    _languageStatus.bordered = NO;
+    _languageStatus.refusesFirstResponder = YES;
+    _languageStatus.font = [NSFont systemFontOfSize:NSFont.smallSystemFontSize];
+    _languageStatus.contentTintColor = NSColor.textColor;
+    _languageStatus.cell.lineBreakMode = NSLineBreakByTruncatingTail;
+    [_statusBar addSubview:_languageStatus];
+
+    _outputRail = [[DockRail alloc] init];
+    _outputRail.clipsToBounds = YES;
+    [self addSubview:_outputRail];
+    __weak WindowOutput *view = self;
+    NSMenu *dockMenu = [[NSMenu alloc] initWithTitle:@"Output"];
+    for (NSString *title in @[@"Dock Bottom", @"Dock Left", @"Dock Right", @"Dock Top"]) {
+        NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:title action:@selector(chooseOutputDock:) keyEquivalent:@""];
+        item.target = self;
+        item.tag = dockMenu.numberOfItems;
+        [dockMenu addItem:item];
+    }
+    _outputTab = [self addDockTab:@"Output" page:DockPage::Output menu:dockMenu];
+    _errorsTab = [self addDockTab:@"0 Errors" page:DockPage::Errors menu:dockMenu];
+    _debugTab = [self addDockTab:@"Debug" page:DockPage::Debug menu:dockMenu];
+    _outputDivider = [[DockDivider alloc] init];
+    _outputDivider.resize = ^(CGFloat delta, BOOL finished) { [view resizeOutputBy:delta finished:finished]; };
+    _outputDivider.hidden = YES;
+    [self addSubview:_outputDivider];
+    [self readDockPlacement];
+
+    _language = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO];
+    [_language addItemWithTitle:@"Auto Detect"];
+    _language.lastItem.tag = -1;
+    NSMenuItem *separator = NSMenuItem.separatorItem;
+    separator.tag = -2;
+    [_language.menu addItem:separator];
+    NSArray<NSString *> *names = EditorLanguageNames();
+    [_language addItemWithTitle:names.firstObject];
+    for (NSString *name in [[names subarrayWithRange:NSMakeRange(1, names.count - 1)]
+                           sortedArrayUsingSelector:@selector(localizedStandardCompare:)]) {
+        [_language addItemWithTitle:name];
+        _language.lastItem.tag = [names indexOfObject:name];
+    }
+    _language.bordered = NO;
+    _language.font = [NSFont systemFontOfSize:NSFont.smallSystemFontSize];
+    _language.action = @selector(chooseLanguage:);
+    _language.accessibilityLabel = @"Language";
+    _language.toolTip = @"Language (Auto Detect)";
+    [_statusBar addSubview:_language];
+
+    [self updateEditorSettings];
+    return self;
+}
+
+- (void)attachTo:(NSView *)body editors:(NSSplitView *)editors
+{
+    if (self.superview == body)
+        return;
+
+    [self removeFromSuperview];
+    _editors = editors;
+    self.frame = body.bounds;
+    [body addSubview:self positioned:NSWindowAbove relativeTo:editors];
+    self.needsLayout = YES;
+}
+
+- (NSView *)hitTest:(NSPoint)point
+{
+    NSView *view = [super hitTest:point];
+    return view == self ? nil : view;
+}
+
+- (void)resizeSubviewsWithOldSize:(NSSize)oldSize
+{
+    (void)oldSize;
+    self.needsLayout = YES;
+}
+
+- (void)setHost:(EditorWindow *)host
+{
+    if (_host == host)
+        return;
+
+    [self cancelCheck];
+    CodeView *previous = _host.editor;
+    _host = host;
+    [self updateEditorStatus];
+    [self updateEditorSettings];
+    [self updateLanguageStatus];
+    CodeView *editor = host.editor;
+    if (editor && (previous.theme != editor.theme || ![previous.editorFont isEqual:editor.editorFont]))
+        [self updateConsoleAppearance];
+    [self refreshDebugControls];
+    if (!host)
+        [self setCheckResult:{} source:nil];
+}
+
+- (void)updateEditorSettings
+{
+    EditorWindow *host = _host;
+    _language.target = host;
+    _languageStatus.target = host;
+    _indentationButton.target = host;
+    _language.hidden = !host;
+    _languageStatus.hidden = !host;
+    _indentationButton.hidden = !host;
+    _encoding.hidden = !host;
+    if (host) {
+        [_language selectItemWithTag:host.languageMode];
+        _language.toolTip = host.automaticLanguageMode ? @"Language (Auto Detect)" : @"Language";
+        Indentation indentation = host.indentation;
+        NSUInteger width = indentation.tabs ? indentation.tabWidth : indentation.width;
+        _indentationButton.title = [NSString stringWithFormat:indentation.tabs ? @"Tabs: %lu" : @"Spaces: %lu", (unsigned long)width];
+        _indentationButton.toolTip = host.hasFileIndentation ? @"Indentation saved for this file." : @"Indentation for this file.";
+    }
+    self.needsLayout = YES;
+}
+
+- (void)updateConsoleAppearance
+{
+    if (CodeView *editor = _host.editor) {
+        for (OutputPane *pane : {_pane, _errorsPane, _debugPane.console})
+            [pane applyFont:editor.editorFont rendering:editor.rendering dark:editor.theme->dark];
+    }
+}
+
+- (void)updateEditorStatus
+{
+    CodeView *editor = _host.activeEditor;
+    if (!editor) {
+        _position.stringValue = @"";
+        _position.toolTip = nil;
+        return;
+    }
+
+    SyntaxBuffer *buffer = editor.syntax;
+    NSUInteger caret = std::min(editor.vimDisplayedCursor, editor.string.length);
+    NSUInteger line = [buffer lineForOffset:caret];
+    NSUInteger start = [buffer offsetForLine:line];
+    NSString *position = [NSString stringWithFormat:@"Line %lu, Col %lu",
+                          (unsigned long)line + 1, (unsigned long)(caret - start + 1)];
+    if (editor.cursorCount > 1)
+        position = [NSString stringWithFormat:@"%@     %lu cursors", position, (unsigned long)editor.cursorCount];
+    NSError *saveError = [(SourceDocument *)editor.vimDocument autoSaveError];
+    if (saveError || _position.toolTip)
+        _position.toolTip = saveError.localizedDescription;
+    if (saveError)
+        position = [position stringByAppendingString:@"     Auto Save Failed"];
+    NSUInteger promptCaret = editor.vimCommandCaret;
+    if (promptCaret != NSNotFound) {
+        NSString *text = [editor.vimStatus stringByAppendingString:@" "];
+        NSMutableAttributedString *prompt = [[NSMutableAttributedString alloc] initWithString:text
+            attributes:@{NSFontAttributeName:[NSFont fontWithName:@"Menlo" size:10],
+                         NSForegroundColorAttributeName:_position.textColor}];
+        if (promptCaret < prompt.length)
+            [prompt addAttribute:NSBackgroundColorAttributeName
+                           value:SRGBColor(editor.theme->accents.commandCaret) range:NSMakeRange(promptCaret, 1)];
+        _position.attributedStringValue = prompt;
+    } else if (editor.vimCommandLine)
+        _position.stringValue = editor.vimStatus;
+    else if (editor.vimEnabled)
+        _position.stringValue = [NSString stringWithFormat:@"%@     %@", editor.vimStatus, position];
+    else
+        _position.stringValue = position;
+}
+
+- (void)updateLanguageStatus
+{
+    LSPDocument *document = _host.editor.syntax.languageDocument;
+    NSString *detail = document.status;
+    NSString *title = @"LSP";
+    NSColor *ink = NSColor.textColor;
+    if (document) {
+        switch (document.state) {
+        case LSPState::Starting: title = @"LSP: Starting…"; break;
+        case LSPState::Ready: title = @"LSP: Ready"; break;
+        case LSPState::Missing: title = document.canInstall ? @"Install LSP" : @"Configure LSP…"; break;
+        case LSPState::Installing: title = [detail hasPrefix:@"Downloading"] ? @"Downloading LSP…" : @"Installing LSP…"; break;
+        case LSPState::Uninstalling: title = @"Uninstalling LSP…"; break;
+        case LSPState::Failed:
+            title = document.failureTitle;
+            if (!title)
+                title = @"LSP: Failed";
+            ink = NSColor.systemRedColor;
+            break;
+        case LSPState::Stopped: title = @"LSP: Stopped"; break;
+        }
+    }
+    if (![_languageStatus.title isEqualToString:title]) {
+        _languageStatus.title = title;
+        self.needsLayout = YES;
+    }
+    _languageStatus.contentTintColor = ink;
+    _languageStatus.toolTip = document ? [NSString stringWithFormat:@"%@ — %@", document.serverName, detail ? detail : title] :
+        @"Save the file to connect a language server.";
+    _languageStatus.accessibilityLabel = title;
+}
+
+- (void)readDockPlacement
+{
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    NSInteger edge = [defaults integerForKey:@"OutputDockEdge"];
+    _dockSide = edge >= 0 && edge <= NSInteger(DockSide::Top) ? DockSide(edge) : DockSide::Bottom;
+    CGFloat width = [defaults doubleForKey:@"OutputDockWidth"];
+    CGFloat height = [defaults doubleForKey:@"OutputDockHeight"];
+    _dockWidth = std::isfinite(width) && width >= 74 ? width : 282;
+    _dockHeight = std::isfinite(height) && height >= 74 ? height : 172;
+}
+
+- (DockTab *)addDockTab:(NSString *)title page:(DockPage)page menu:(NSMenu *)menu
+{
+    DockTab *tab = [[DockTab alloc] initWithFrame:NSZeroRect];
+    tab.title = title;
+    tab.target = self;
+    tab.action = @selector(toggleDockTab:);
+    tab.tag = NSInteger(page);
+    [tab setButtonType:NSButtonTypePushOnPushOff];
+    tab.bezelStyle = NSBezelStyleAccessoryBar;
+    tab.controlSize = NSControlSizeSmall;
+    tab.clipsToBounds = YES;
+    tab.menu = menu;
+    __weak WindowOutput *view = self;
+    tab.track = ^(NSPoint point, BOOL finished) { [view dragOutputTab:point finished:finished]; };
+    [_outputRail addSubview:tab];
+    return tab;
+}
+
+- (void)moveOutputDock:(DockSide)side
+{
+    if (_dockSide != side) {
+        _dockSide = side;
+        [NSUserDefaults.standardUserDefaults setInteger:NSInteger(side) forKey:@"OutputDockEdge"];
+        self.needsLayout = YES;
+        [self.superview layoutSubtreeIfNeeded];
+    }
+}
+
+- (IBAction)chooseOutputDock:(NSMenuItem *)sender
+{
+    [self moveOutputDock:DockSide(sender.tag)];
+}
+
+- (void)dragOutputTab:(NSPoint)point finished:(BOOL)finished
+{
+    NSRect body = [self editorBody];
+    NSPoint local = [self convertPoint:point fromView:nil];
+    std::optional<DockSide> side;
+    if (NSPointInRect(local, NSInsetRect(self.bounds, -5, -5))) {
+        local.x = std::clamp(local.x, NSMinX(body), NSMaxX(body));
+        local.y = std::clamp(local.y, NSMinY(body), NSMaxY(body));
+        side = DockSideAtPoint(body, local);
+    }
+    if (finished) {
+        _dropTarget.hidden = YES;
+        if (side)
+            [self moveOutputDock:*side];
+        return;
+    }
+    if (side && !_dropTarget) {
+        _dropTarget = [[DockDropTarget alloc] init];
+        [self addSubview:_dropTarget positioned:NSWindowAbove relativeTo:nil];
+    }
+    _dropTarget.hidden = !side;
+    if (side) {
+        DockPage page = _page == DockPage::Hidden ? DockPage::Output : _page;
+        _dropTarget.frame = [self dockFramesAtSide:*side page:page extent:DockIsSide(*side) ? _dockWidth : _dockHeight].output;
+    }
+}
+
+- (void)resizeOutputBy:(CGFloat)delta finished:(BOOL)finished
+{
+    bool horizontal = DockIsSide(_dockSide);
+    CGFloat &extent = horizontal ? _dockWidth : _dockHeight;
+    NSRect pane = [self dockFramesAtSide:_dockSide page:_page extent:extent].output;
+    CGFloat shown = horizontal ? NSWidth(pane) : NSHeight(pane);
+    if (!shown)
+        return;
+
+    CGFloat sign = (_dockSide == DockSide::Top || _dockSide == DockSide::Right) ? -1 : 1;
+    if (delta) {
+        auto next = [self dockFramesAtSide:_dockSide page:_page extent:shown + sign * delta];
+        extent = horizontal ? NSWidth(next.output) : NSHeight(next.output);
+        self.needsLayout = YES;
+        [self.superview layoutSubtreeIfNeeded];
+    }
+    if (finished)
+        [NSUserDefaults.standardUserDefaults setDouble:extent forKey:horizontal ? @"OutputDockWidth" : @"OutputDockHeight"];
+}
+
+- (void)updateErrorsTab
+{
+    NSUInteger count = _errorCount;
+    NSUInteger warnings = _warningCount;
+    NSString *title = count ? [NSString stringWithFormat:@"%lu %@", (unsigned long)count, count == 1 ? @"Error" : @"Errors"] :
+        warnings ? [NSString stringWithFormat:@"%lu %@", (unsigned long)warnings, warnings == 1 ? @"Warning" : @"Warnings"] : @"0 Errors";
+    if (![_errorsTab.title isEqualToString:title]) {
+        _errorsTab.title = title;
+        self.needsLayout = YES;
+    }
+}
+
+- (void)attachDockView:(NSView *)view console:(OutputPane *)console shown:(BOOL)shown
+{
+    view.hidden = !shown;
+    if (!view || view.superview == self)
+        return;
+
+    [view removeFromSuperview];
+    [self addSubview:view positioned:NSWindowBelow relativeTo:_outputRail];
+    if (CodeView *editor = _host.editor)
+        [console applyFont:editor.editorFont rendering:editor.rendering dark:editor.theme->dark];
+}
+
+- (void)attachDockPanes
+{
+    for (DockPage page : {DockPage::Output, DockPage::Errors}) {
+        bool diagnostics = page == DockPage::Errors;
+        BOOL shown = _page == page;
+        OutputPane *pane = diagnostics ? _errorsPane : _pane;
+        if (!pane && shown) {
+            pane = [[OutputPane alloc] initWithFrame:NSMakeRect(0, 0, NSWidth(self.bounds), 160) diagnostics:diagnostics];
+            __weak WindowOutput *output = self;
+            pane.openLocation = ^(const RunLocation &location, SourceDocument *source) {
+                [output openRunLocation:location source:source];
+            };
+            if (diagnostics) {
+                _errorsPane = pane;
+            } else {
+                pane.sendInput = ^BOOL(NSString *line) { return [output.runner sendInput:line]; };
+                _pane = pane;
+            }
+        }
+        [self attachDockView:pane console:pane shown:shown];
+    }
+    BOOL showDebugger = _page == DockPage::Debug;
+    DebugPane *debugger = _debugPane;
+    if (showDebugger && !debugger) {
+        debugger = [[DebugPane alloc] initWithFrame:NSZeroRect];
+        __weak WindowOutput *output = self;
+        debugger.command = ^(DebugCommand command) {
+            if (EditorWindow *host = output.host) {
+                [host performDebugCommand:command];
+            } else if (command == DebugCommand::Stop) {
+                [output stopDebug];
+            } else {
+                [output.debugSession performCommand:command];
+            }
+        };
+        debugger.openLocation = ^(NSString *path, NSUInteger line) {
+            [output openDebugLocation:path line:line column:1];
+        };
+        debugger.editBreakpoint = ^(NSString *path, NSUInteger line) { [output.host editBreakpoint:path line:line]; };
+        debugger.console.openLocation = ^(const RunLocation &location, SourceDocument *source) {
+            [output openRunLocation:location source:source];
+        };
+        _debugPane = debugger;
+    }
+    [self attachDockView:debugger console:debugger.console shown:showDebugger];
+    _debugTab.state = showDebugger ? NSControlStateValueOn : NSControlStateValueOff;
+    if (_page == DockPage::Errors)
+        [self presentDiagnostics];
+    _outputTab.state = self.shown ? NSControlStateValueOn : NSControlStateValueOff;
+    _errorsTab.state = _page == DockPage::Errors ? NSControlStateValueOn : NSControlStateValueOff;
+    [self refreshDebugControls];
+}
+
+- (IBAction)toggleDockTab:(NSButton *)sender
+{
+    [self toggleDockPage:DockPage(sender.tag)];
+}
+
+- (void)toggleDockPage:(DockPage)page
+{
+    [self showDockPage:_page == page ? DockPage::Hidden : page];
+    if (self.shown && _runner && [_pane focusInput])
+        _returnFocus = YES;
+}
+
+- (void)showDockPage:(DockPage)page
+{
+    if (_page == page)
+        return;
+
+    CodeView *source = _host.activeEditor;
+    NSUInteger offset = std::min(source.vimDisplayedCursor, source.string.length);
+    NSRect caret = source && page != DockPage::Hidden ? [source vimCaretAt:offset] : NSZeroRect;
+    BOOL keepCaretVisible = !NSIsEmptyRect(caret) && NSIntersectsRect(caret, source.visibleRect);
+    if (_pane.hasKeyboardFocus || _errorsPane.hasKeyboardFocus || _debugPane.hasKeyboardFocus)
+        [self.window makeFirstResponder:source];
+
+    _page = page;
+    [self attachDockPanes];
+    self.needsLayout = YES;
+    [self.superview layoutSubtreeIfNeeded];
+    if (keepCaretVisible && !NSContainsRect(source.visibleRect, caret))
+        [source scrollRangeToVisible:NSMakeRange(offset, 0)];
+}
+
+- (void)openRunLocation:(const RunLocation &)location source:(SourceDocument *)source
+{
+    NSWindow *window = self.window;
+    if (!window)
+        return;
+
+    if (source && source == _host.editor.vimDocument) {
+        [source revealRunLocation:location];
+        return;
+    }
+    if (source.editorHostWindow && [NSDocumentController.sharedDocumentController.documents containsObject:source]) {
+        if (![source joinNavigationTabInWindow:window])
+            return;
+        [source showWindows];
+        [source revealRunLocation:location];
+        return;
+    }
+    if (location.file) {
+        RunLocation target = location;
+        __weak NSWindow *anchor = window;
+        OpenSourceTab(target.file, window, ^(NSDocument *opened, BOOL, NSError *error) {
+            if ([opened isKindOfClass:SourceDocument.class])
+                [(SourceDocument *)opened revealRunLocation:target];
+            else if (error)
+                [anchor presentError:error];
+        });
+    }
+}
+
+- (void)openDebugLocation:(NSString *)path line:(NSUInteger)line column:(NSUInteger)column
+{
+    if (!path.isAbsolutePath || !line || ![NSFileManager.defaultManager fileExistsAtPath:path])
+        return;
+    NSURL *file = CanonicalFileURL([NSURL fileURLWithPath:path]);
+    RunLocation location{file, line, column, 0, 0, false, false};
+    CodeView *editor = _host.editor;
+    SourceDocument *source = [editor.debugPath isEqualToString:file.path] ? (SourceDocument *)editor.vimDocument : nil;
+    [self openRunLocation:location source:source];
+}
+
+- (void)refreshDebugControls
+{
+    EditorWindow *host = _host;
+    [host refreshRunButton];
+    _debugPane.session = _debugSession;
+    SourceDocument *document = (SourceDocument *)host.editor.vimDocument;
+    BOOL restartable = host && (_debugFile || _externalExecutable) && !document.workspace.runningDocument;
+    [_debugPane updateStatus:_debugStatus building:_debugBuilder != nil restartable:restartable];
+}
+
+- (void)debugUpdated
+{
+    [self refreshDebugControls];
+    [_host refreshDebugLocation];
+    [_otherEditor refreshDebugLocation];
+    NSDictionary *frame = _debugSession.frame;
+    if (frame && frame != _navigatedFrame) {
+        _navigatedFrame = frame;
+        [self openDebugLocation:frame[@"source"][@"path"] line:[frame[@"line"] unsignedIntegerValue]
+                         column:[frame[@"column"] unsignedIntegerValue]];
+    } else if (_debugSession && _debugSession.phase == DebugPhase::Finished) {
+        _navigatedFrame = nil;
+        if (_restartDebug) {
+            _restartDebug = NO;
+            [_host startDebugTarget];
+        } else {
+            [_host resumeLanguageCheck];
+        }
+    }
+}
+
+static void PlaceDockTab(DockTab *button, NSRect frame, bool vertical)
+{
+    button.frameRotation = 0;
+    if (vertical) {
+        button.frame = NSMakeRect(NSMaxX(frame), NSMinY(frame), NSHeight(frame), NSWidth(frame));
+        button.frameRotation = 90;
+    } else {
+        button.frame = frame;
+    }
+}
+
+static NSRect NextDockTab(NSRect tab, CGFloat length, CGFloat railWidth, bool vertical)
+{
+    if (vertical) {
+        CGFloat end = std::max(0.0, NSMinY(tab) - 3);
+        tab.size.height = std::min(length, end);
+        tab.origin.y = end - tab.size.height;
+    } else {
+        tab.origin.x = NSMaxX(tab) + 3;
+        tab.size.width = std::clamp(railWidth - tab.origin.x, 0.0, length);
+    }
+    return tab;
+}
+
+- (NSRect)editorBody
+{
+    NSRect body = self.bounds;
+    CGFloat height = std::min(statusHeight, NSHeight(body));
+    body.origin.y += height;
+    body.size.height -= height;
+    return body;
+}
+
+- (DockFrames)dockFramesAtSide:(DockSide)side page:(DockPage)page extent:(CGFloat)extent
+{
+    CGFloat minimumEditorWidth = 200;
+    if (DockIsSide(side) && _editors.arrangedSubviews.count > 1)
+        minimumEditorWidth += minimumExplorerWidth + _editors.dividerThickness;
+    return LayoutDock([self editorBody], side, page, extent, minimumEditorWidth);
+}
+
+- (void)layout
+{
+    [super layout];
+    CGFloat width = NSWidth(self.bounds);
+    bool vertical = DockIsSide(_dockSide);
+    DockFrames dock = [self dockFramesAtSide:_dockSide page:_page extent:vertical ? _dockWidth : _dockHeight];
+    if (!NSEqualRects(_editors.frame, dock.editor))
+        _editors.frame = dock.editor;
+    CGFloat chromeHeight = statusHeight + (_dockSide == DockSide::Bottom ? NSHeight(dock.rail) : 0);
+    _statusBar.frame = NSMakeRect(0, 0, width, chromeHeight);
+    if (_outputRail.side != _dockSide) {
+        _outputRail.side = _dockSide;
+        [_outputRail setNeedsDisplay:YES];
+    }
+    _outputRail.frame = dock.rail;
+    NSRect tab = NSOffsetRect(dock.tab, -NSMinX(dock.rail), -NSMinY(dock.rail));
+    CGFloat railWidth = NSWidth(dock.rail);
+    NSRect errors = NextDockTab(tab, std::max(74.0, std::ceil(_errorsTab.fittingSize.width)), railWidth, vertical);
+    NSRect debug = NextDockTab(errors, 68, railWidth, vertical);
+    PlaceDockTab(_outputTab, tab, vertical);
+    PlaceDockTab(_errorsTab, errors, vertical);
+    PlaceDockTab(_debugTab, debug, vertical);
+    _outputDivider.hidden = NSIsEmptyRect(dock.divider);
+    _outputDivider.vertical = vertical;
+    _outputDivider.frame = dock.divider;
+    switch (_page) {
+    case DockPage::Output:
+        _pane.frame = dock.output;
+        break;
+    case DockPage::Errors:
+        _errorsPane.frame = dock.output;
+        break;
+    case DockPage::Debug:
+        _debugPane.frame = dock.output;
+        break;
+    case DockPage::Hidden:
+        break;
+    }
+
+    if (!_host)
+        return;
+
+    CGFloat languageWidth = std::clamp(std::ceil([_language.titleOfSelectedItem sizeWithAttributes:@{NSFontAttributeName:_language.font}].width) + 30,
+                   97.0, 166.0);
+    CGFloat languageLeft = width - 59 - languageWidth;
+    CGFloat lspRight = std::max(0.0, languageLeft - 86);
+    CGFloat lspWidth = std::min(lspRight, std::clamp(std::ceil(_languageStatus.fittingSize.width) + 10, 54.0, 129.0));
+    _position.frame = NSMakeRect(9, 2, std::max(0.0, lspRight - lspWidth - 13), 15);
+    _languageStatus.frame = NSMakeRect(lspRight - lspWidth, 1, lspWidth, 20);
+    _indentationButton.frame = NSMakeRect(languageLeft - 83, 1, 80, 20);
+    _encoding.frame = NSMakeRect(width - 57, 4, 50, 14);
+    _language.frame = NSMakeRect(languageLeft, 1, languageWidth, 20);
 }
 
 - (BOOL)shown { return _page == DockPage::Output; }
@@ -3130,11 +6415,14 @@ enum class DockPage { Hidden, Output, Errors, Debug };
 - (void)setShown:(BOOL)shown
 {
     if (shown || self.shown)
-        _page = shown ? DockPage::Output : DockPage::Hidden;
+        [self showDockPage:shown ? DockPage::Output : DockPage::Hidden];
 }
 
 - (void)observeTabGroup:(NSWindowTabGroup *)group
 {
+    if (_tabGroup == group)
+        return;
+    [_tabGroup removeObserver:self forKeyPath:@"selectedWindow" context:&selectedOutputTabContext];
     _tabGroup = group;
     [group addObserver:self forKeyPath:@"selectedWindow" options:0 context:&selectedOutputTabContext];
 }
@@ -3152,13 +6440,13 @@ enum class DockPage { Hidden, Output, Errors, Debug };
     EditorWindow *host = self.host;
     [_pane setInputEnabled:NO];
     if (_returnFocus && _pane.hasKeyboardFocus)
-        [host.window makeFirstResponder:[host editorForOutput]];
+        [self.window makeFirstResponder:host.activeEditor];
     _runner = nil;
     if (_runWorkspace.runningDocument == _source)
         _runWorkspace.runningDocument = nil;
     _runWorkspace = nil;
-    [host refreshRunButton];
-    [host resumeRustCheck];
+    [self refreshDebugControls];
+    [host resumeLanguageCheck];
 }
 
 - (void)armCheckTimer:(NSTimeInterval)delay
@@ -3172,7 +6460,7 @@ enum class DockPage { Hidden, Output, Errors, Debug };
         WindowOutput *dock = output;
         if (dock && dock->_checkTimer == timer) {
             dock->_checkTimer = nil;
-            [dock.host startPendingRustCheck];
+            [dock.host startPendingLanguageCheck];
         }
     }];
     [NSRunLoop.mainRunLoop addTimer:_checkTimer forMode:NSRunLoopCommonModes];
@@ -3188,11 +6476,12 @@ enum class DockPage { Hidden, Output, Errors, Debug };
 - (void)setCheckResult:(CheckResult)result source:(SourceDocument *)source
 {
     _errorCount = result.errors;
+    _warningCount = result.warnings;
     _diagnosticsSource = source;
     _pendingDiagnostics = std::move(result.diagnostics);
     if (_page == DockPage::Errors)
         [self presentDiagnostics];
-    [_host updateErrorsTab];
+    [self updateErrorsTab];
 }
 
 - (void)presentDiagnostics
@@ -3222,29 +6511,18 @@ enum class DockPage { Hidden, Output, Errors, Debug };
     NSSplitView *_splitView;
     EditorWindow *_secondPane;
     __weak EditorWindow *_splitParent;
-    WindowStatusBar *_statusBar;
-    NSTextField *_position;
-    NSTextField *_encoding;
-    NSPopUpButton *_language;
-    NSButton *_indentationButton;
-    DockTab *_outputTab;
-    DockTab *_errorsTab;
-    DockTab *_debugTab;
-    DockRail *_outputRail;
-    DockDivider *_outputDivider;
-    DockDropTarget *_dropTarget;
-    WindowOutput *_windowOutput;
+    DockSide _splitSide;
+    __weak WindowOutput *_windowOutput;
     __weak WindowOutput *_runningOutput;
-    __weak CodeView *_outputSource;
     __weak NSView *_tabFocus;
-    DockSide _dockSide;
-    CGFloat _dockWidth;
-    CGFloat _dockHeight;
+    NSURL *_languageWorkspace;
     NSUInteger _laidOutLineCount;
-    BOOL _scrollRepaintPending;
+    BOOL _scrollUpdatePending;
     BOOL _automaticLanguageMode;
     BOOL _detectLanguageFromContent;
-    BOOL _needsRustCheck;
+    BOOL _needsLanguageCheck;
+    std::optional<CheckResult> _languageCheckResult;
+    NSUInteger _languageCheckVersion;
 }
 
 - (instancetype)initWithDocument:(SourceDocument *)document text:(NSString *)text language:(Language)language
@@ -3274,6 +6552,8 @@ enum class DockPage { Hidden, Output, Errors, Debug };
     _editor.allowsUndo = YES;
     _editor.usesFindBar = YES;
     _editor.delegate = self;
+    __weak EditorWindow *pane = self;
+    _editor.revealError = ^(const BuildError &error) { [pane showDiagnostic:error]; };
 
     _scroll = [[NSScrollView alloc] initWithFrame:NSZeroRect];
     _scroll.borderType = NSNoBorder;
@@ -3296,65 +6576,8 @@ enum class DockPage { Hidden, Output, Errors, Debug };
                                                name:DebugBreakpointsChanged object:nil];
     [self addSubview:_gutter];
 
-    if (!parent) {
-        _needsRustCheck = language == Language::Rust;
-        _windowOutput = [[WindowOutput alloc] init];
-        _windowOutput.host = self;
-        _statusBar = [[WindowStatusBar alloc] init];
-        [self addSubview:_statusBar];
-        _position = StatusLabel(@"");
-        _encoding = StatusLabel(@"UTF-8");
-        _encoding.alignment = NSTextAlignmentCenter;
-        [_statusBar addSubview:_position];
-        [_statusBar addSubview:_encoding];
-        _indentationButton = [NSButton buttonWithTitle:@"" target:self action:@selector(showIndentationMenu:)];
-        _indentationButton.bordered = NO;
-        _indentationButton.refusesFirstResponder = YES;
-        _indentationButton.font = [NSFont systemFontOfSize:NSFont.smallSystemFontSize];
-        _indentationButton.toolTip = @"Indentation";
-        [_statusBar addSubview:_indentationButton];
-        _outputRail = [[DockRail alloc] init];
-        _outputRail.clipsToBounds = YES;
-        [self addSubview:_outputRail];
-        __weak EditorWindow *view = self;
-        NSMenu *dockMenu = [[NSMenu alloc] initWithTitle:@"Output"];
-        for (NSString *title in @[@"Dock Bottom", @"Dock Left", @"Dock Right", @"Dock Top"]) {
-            NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:title action:@selector(chooseOutputDock:) keyEquivalent:@""];
-            item.target = self;
-            item.tag = dockMenu.numberOfItems;
-            [dockMenu addItem:item];
-        }
-        _outputTab = [self addDockTab:@"Output" action:@selector(toggleOutput:) menu:dockMenu];
-        _errorsTab = [self addDockTab:@"0 Errors" action:@selector(toggleErrors:) menu:dockMenu];
-        _debugTab = [self addDockTab:@"Debug" action:@selector(toggleDebug:) menu:dockMenu];
-        _outputDivider = [[DockDivider alloc] init];
-        _outputDivider.resize = ^(CGFloat delta, BOOL finished) { [view resizeOutputBy:delta finished:finished]; };
-        _outputDivider.hidden = YES;
-        [self addSubview:_outputDivider];
-        [self readDockPlacement];
-
-        _language = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO];
-        [_language addItemWithTitle:@"Auto Detect"];
-        _language.lastItem.tag = -1;
-        NSMenuItem *separator = NSMenuItem.separatorItem;
-        separator.tag = -2;
-        [_language.menu addItem:separator];
-        NSArray<NSString *> *names = EditorLanguageNames();
-        [_language addItemWithTitle:names.firstObject];
-        for (NSString *name in [[names subarrayWithRange:NSMakeRange(1, names.count - 1)]
-                               sortedArrayUsingSelector:@selector(localizedStandardCompare:)]) {
-            [_language addItemWithTitle:name];
-            _language.lastItem.tag = [names indexOfObject:name];
-        }
-        [_language selectItemWithTag:NSInteger(language)];
-        _language.bordered = NO;
-        _language.font = [NSFont systemFontOfSize:NSFont.smallSystemFontSize];
-        _language.target = self;
-        _language.action = @selector(chooseLanguage:);
-        _language.accessibilityLabel = @"Language";
-        _language.toolTip = @"Language (Auto Detect)";
-        [_statusBar addSubview:_language];
-    }
+    if (!parent)
+        _needsLanguageCheck = CheckableLanguage(language);
 
     __weak EditorWindow *root = self;
     _editor.vimStatusChanged = ^{
@@ -3367,9 +6590,14 @@ enum class DockPage { Hidden, Output, Errors, Debug };
                                                name:NSViewBoundsDidChangeNotification object:_scroll.contentView];
     [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(scrollTracking:)
                                                name:NSScrollViewDidLiveScrollNotification object:_scroll];
-    if (!parent)
+    if (!parent) {
         [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(preferencesChanged:)
                                                    name:EditorPreferencesChanged object:nil];
+        [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(unusedWarningsChanged:)
+                                                   name:UnusedWarningsPreferencesChanged object:nil];
+        [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(inlaySettingsChanged:)
+                                                   name:InlayPreferencesChanged object:nil];
+    }
     [self applyPreferences];
     self.needsLayout = YES;
     return self;
@@ -3377,10 +6605,12 @@ enum class DockPage { Hidden, Output, Errors, Debug };
 
 - (CodeView *)activeEditor
 {
-    return _splitView && self.window.firstResponder == _secondPane.editor ? _secondPane.editor : _editor;
+    CodeView *second = _secondPane.editor;
+    NSResponder *focus = self.window.firstResponder;
+    BOOL useSecond = focus == second || second.hoverHasFocus || (focus != _editor && _tabFocus == second);
+    return _splitView && useSecond ? second : _editor;
 }
 
-- (BOOL)outputShown { return _windowOutput.shown; }
 - (BOOL)isRunning { return _windowOutput.runner != nil; }
 - (BOOL)canRun
 {
@@ -3392,6 +6622,8 @@ enum class DockPage { Hidden, Output, Errors, Debug };
         return NO;
     if (language == Language::VisualBasic)
         return [_document.fileURL.pathExtension.lowercaseString isEqualToString:@"vb"];
+    if (language == Language::Assembly)
+        return !_document.fileURL || DebuggableLanguage(language, _document.fileURL);
     if (RunnableLanguage(language))
         return YES;
     return language == Language::Plain && _document.workspace && !_document.fileURL && !_buffer.storage.length;
@@ -3428,7 +6660,7 @@ enum class DockPage { Hidden, Output, Errors, Debug };
     Indentation indentation = _buffer.indentation;
     indentation.tabs = tabs;
     auto edits = IndentationConversion(_buffer.storage.string, indentation);
-    if ([editor applyDocumentEdits:std::move(edits) undoName:@"Convert Indentation"])
+    if ([editor applyDocumentEdits:std::move(edits) undoName:@"Convert Indentation" options:{}])
         [self setFileIndentation:indentation];
 }
 
@@ -3453,8 +6685,7 @@ enum class DockPage { Hidden, Output, Errors, Debug };
 - (void)rememberTabFocus
 {
     NSResponder *focus = self.window.firstResponder;
-    if (!(_windowOutput.host == self && _windowOutput.pane.hasKeyboardFocus) &&
-        [focus isKindOfClass:NSView.class] && [(NSView *)focus isDescendantOf:self])
+    if ([focus isKindOfClass:NSView.class] && [(NSView *)focus isDescendantOf:self])
         _tabFocus = (NSView *)focus;
 }
 
@@ -3463,280 +6694,59 @@ enum class DockPage { Hidden, Output, Errors, Debug };
     return _tabFocus && _tabFocus.window == self.window && !_tabFocus.hiddenOrHasHiddenAncestor ? _tabFocus : _editor;
 }
 
-- (void)readDockPlacement
+- (void)setWindowOutput:(WindowOutput *)output
 {
-    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
-    NSInteger edge = [defaults integerForKey:@"OutputDockEdge"];
-    _dockSide = edge >= 0 && edge <= NSInteger(DockSide::Top) ? DockSide(edge) : DockSide::Bottom;
-    CGFloat width = [defaults doubleForKey:@"OutputDockWidth"];
-    CGFloat height = [defaults doubleForKey:@"OutputDockHeight"];
-    _dockWidth = std::isfinite(width) && width >= 74 ? width : 282;
-    _dockHeight = std::isfinite(height) && height >= 74 ? height : 172;
-}
-
-- (DockTab *)addDockTab:(NSString *)title action:(SEL)action menu:(NSMenu *)menu
-{
-    DockTab *tab = [[DockTab alloc] initWithFrame:NSZeroRect];
-    tab.title = title;
-    tab.target = self;
-    tab.action = action;
-    [tab setButtonType:NSButtonTypePushOnPushOff];
-    tab.bezelStyle = NSBezelStyleAccessoryBar;
-    tab.controlSize = NSControlSizeSmall;
-    tab.clipsToBounds = YES;
-    tab.menu = menu;
-    __weak EditorWindow *view = self;
-    tab.track = ^(NSPoint point, BOOL finished) { [view dragOutputTab:point finished:finished]; };
-    [_outputRail addSubview:tab];
-    return tab;
-}
-
-- (void)moveOutputDock:(DockSide)side
-{
-    if (_dockSide != side) {
-        _dockSide = side;
-        [NSUserDefaults.standardUserDefaults setInteger:NSInteger(side) forKey:@"OutputDockEdge"];
-        [self setNeedsLayout:YES];
-        [self layoutSubtreeIfNeeded];
-    }
-}
-
-- (IBAction)chooseOutputDock:(NSMenuItem *)sender
-{
-    [self moveOutputDock:DockSide(sender.tag)];
-}
-
-- (void)dragOutputTab:(NSPoint)point finished:(BOOL)finished
-{
-    NSRect body = [self editorBody];
-    NSPoint local = [self convertPoint:point fromView:nil];
-    std::optional<DockSide> side;
-    if (NSPointInRect(local, NSInsetRect(self.bounds, -5, -5))) {
-        local.x = std::clamp(local.x, NSMinX(body), NSMaxX(body));
-        local.y = std::clamp(local.y, NSMinY(body), NSMaxY(body));
-        side = DockSideAtPoint(body, local);
-    }
-    if (finished) {
-        _dropTarget.hidden = YES;
-        if (side)
-            [self moveOutputDock:*side];
+    if (_windowOutput == output)
         return;
-    }
-    if (side && !_dropTarget) {
-        _dropTarget = [[DockDropTarget alloc] init];
-        [self addSubview:_dropTarget positioned:NSWindowAbove relativeTo:nil];
-    }
-    _dropTarget.hidden = !side;
-    if (side)
-        _dropTarget.frame = LayoutDock(body, *side, YES, DockIsSide(*side) ? _dockWidth : _dockHeight).output;
+
+    _windowOutput = output;
+    [self refreshDebugLocation];
 }
 
-- (void)resizeOutputBy:(CGFloat)delta finished:(BOOL)finished
+- (void)showDiagnostic:(const BuildError &)error
 {
-    bool horizontal = DockIsSide(_dockSide);
-    CGFloat &extent = horizontal ? _dockWidth : _dockHeight;
-    NSRect body = [self editorBody];
-    NSRect pane = [self dockFrames].output;
-    CGFloat shown = horizontal ? NSWidth(pane) : NSHeight(pane);
-    CGFloat sign = (_dockSide == DockSide::Top || _dockSide == DockSide::Right) ? -1 : 1;
-    if (delta) {
-        auto next = LayoutDock(body, _dockSide, YES, shown + sign * delta);
-        extent = horizontal ? NSWidth(next.output) : NSHeight(next.output);
-        [self setNeedsLayout:YES];
-        [self layoutSubtreeIfNeeded];
-    }
-    if (finished)
-        [NSUserDefaults.standardUserDefaults setDouble:extent forKey:horizontal ? @"OutputDockWidth" : @"OutputDockHeight"];
+    EditorWindow *root = _splitParent ? _splitParent : self;
+    WindowOutput *output = root->_windowOutput;
+    if (output.host != root)
+        [self.window makeFirstResponder:_editor];
+    [output showDockPage:error.fromOutput ? DockPage::Output : DockPage::Errors];
+    OutputPane *pane = error.fromOutput ? output.pane : output.errorsPane;
+    [pane revealDiagnostic:error.location source:_document];
 }
 
-- (CodeView *)editorForOutput
+- (BOOL)hasDiagnostics
 {
-    CodeView *editor = _outputSource;
-    return editor && editor.window == self.window ? editor : self.activeEditor;
+    return !_buffer.buildErrors.empty() || !_buffer.languageErrors.empty();
 }
 
-- (void)updateErrorsTab
+- (BOOL)viewErrorAtCursor
 {
-    NSUInteger count = _windowOutput.errorCount;
-    NSString *title = count == 1 ? @"1 Error" : [NSString stringWithFormat:@"%lu Errors", (unsigned long)count];
-    if (![_errorsTab.title isEqualToString:title]) {
-        _errorsTab.title = title;
-        self.needsLayout = YES;
-    }
-}
-
-- (void)attachDockPanes
-{
-    for (DockPage page : {DockPage::Output, DockPage::Errors}) {
-        bool diagnostics = page == DockPage::Errors;
-        BOOL shown = _windowOutput.page == page;
-        OutputPane *pane = diagnostics ? _windowOutput.errorsPane : _windowOutput.pane;
-        if (!pane && shown) {
-            pane = [[OutputPane alloc] initWithFrame:NSMakeRect(0, 0, NSWidth(self.bounds), 160) diagnostics:diagnostics];
-            __weak WindowOutput *output = _windowOutput;
-            pane.openLocation = ^(const RunLocation &location, SourceDocument *source) {
-                [output.host openRunLocation:location source:source];
-            };
-            if (diagnostics) {
-                _windowOutput.errorsPane = pane;
-            } else {
-                pane.sendInput = ^BOOL(NSString *line) { return [output.runner sendInput:line]; };
-                _windowOutput.pane = pane;
-            }
-        }
-        pane.hidden = !shown;
-        if (pane && pane.superview != self) {
-            [pane removeFromSuperview];
-            [self addSubview:pane positioned:NSWindowBelow relativeTo:_outputRail];
-            [pane applyFont:_editor.editorFont rendering:_editor.rendering dark:_editor.theme->dark];
-        }
-    }
-    BOOL showDebugger = _windowOutput.page == DockPage::Debug;
-    DebugPane *debugger = _windowOutput.debugPane;
-    if (showDebugger && !debugger) {
-        debugger = [[DebugPane alloc] initWithFrame:NSZeroRect];
-        __weak WindowOutput *output = _windowOutput;
-        debugger.command = ^(DebugCommand command) { [output.host performDebugCommand:command]; };
-        debugger.openLocation = ^(NSString *path, NSUInteger line) {
-            [output.host openDebugLocation:path line:line column:1];
-        };
-        debugger.editBreakpoint = ^(NSString *path, NSUInteger line) { [output.host editBreakpoint:path line:line]; };
-        debugger.console.openLocation = ^(const RunLocation &location, SourceDocument *source) {
-            [output.host openRunLocation:location source:source];
-        };
-        _windowOutput.debugPane = debugger;
-    }
-    debugger.hidden = !showDebugger;
-    if (debugger && debugger.superview != self) {
-        [debugger removeFromSuperview];
-        [self addSubview:debugger positioned:NSWindowBelow relativeTo:_outputRail];
-        [debugger.console applyFont:_editor.editorFont rendering:_editor.rendering dark:_editor.theme->dark];
-    }
-    _debugTab.state = showDebugger ? NSControlStateValueOn : NSControlStateValueOff;
-    if (_windowOutput.page == DockPage::Errors)
-        [_windowOutput presentDiagnostics];
-    _outputTab.state = _windowOutput.shown ? NSControlStateValueOn : NSControlStateValueOff;
-    _errorsTab.state = _windowOutput.page == DockPage::Errors ? NSControlStateValueOn : NSControlStateValueOff;
-    [self updateErrorsTab];
-}
-
-- (void)setWindowOutput:(WindowOutput *)output attach:(BOOL)attach
-{
-    if (_windowOutput != output) {
-        [self detachWindowOutput];
-        _windowOutput = output;
-        self.needsLayout = YES;
-    }
-    if (attach && output.host != self) {
-        [output cancelCheck];
-        output.host = self;
-        [self readDockPlacement];
-        [self attachDockPanes];
-        self.needsLayout = YES;
-    }
-    if (attach) {
-        [self refreshDebugLocation];
-        [self resumeRustCheck];
-    }
-}
-
-- (void)detachWindowOutput
-{
-    if (_windowOutput.host == self) {
-        [_windowOutput cancelCheck];
-        _windowOutput.host = nil;
-        [_windowOutput.pane removeFromSuperview];
-        [_windowOutput.errorsPane removeFromSuperview];
-        [_windowOutput.debugPane removeFromSuperview];
-    }
-    [_editor showDebugLine:0 exception:nil];
-    [_secondPane.editor showDebugLine:0 exception:nil];
-    _gutter.debugSession = nil;
-    if (_secondPane)
-        _secondPane->_gutter.debugSession = nil;
-}
-
-- (void)showOutput:(BOOL)show
-{
-    if (show != self.outputShown)
-        [self showDockPage:show ? DockPage::Output : DockPage::Hidden];
-}
-
-- (void)showDockPage:(DockPage)page
-{
-    if (_windowOutput.page == page)
-        return;
-    BOOL show = page != DockPage::Hidden;
-    CodeView *source = [self editorForOutput];
-    NSUInteger offset = std::min(source.vimDisplayedCursor, source.string.length);
-    NSRect caret = show ? [source vimCaretAt:offset] : NSZeroRect;
-    BOOL keepCaretVisible = show && NSIntersectsRect(caret, source.visibleRect);
-    if (_windowOutput.pane.hasKeyboardFocus || _windowOutput.errorsPane.hasKeyboardFocus ||
-        _windowOutput.debugPane.hasKeyboardFocus)
-        [self.window makeFirstResponder:source];
-    _windowOutput.page = page;
-    [self attachDockPanes];
-    [self setNeedsLayout:YES];
-    [self layoutSubtreeIfNeeded];
-    if (keepCaretVisible && !NSContainsRect(source.visibleRect, caret))
-        [source scrollRangeToVisible:NSMakeRange(offset, 0)];
-}
-
-- (IBAction)toggleDebug:(id)sender
-{
-    (void)sender;
-    [self showDockPage:_windowOutput.page == DockPage::Debug ? DockPage::Hidden : DockPage::Debug];
-    [self refreshDebugControls];
-}
-
-- (IBAction)toggleErrors:(id)sender
-{
-    (void)sender;
-    [self showDockPage:_windowOutput.page == DockPage::Errors ? DockPage::Hidden : DockPage::Errors];
-}
-
-- (IBAction)toggleOutput:(id)sender
-{
-    (void)sender;
-    if (!self.outputShown)
-        _outputSource = self.activeEditor;
-    [self showOutput:!self.outputShown];
-    if (self.outputShown && self.running && [_windowOutput.pane focusInput])
-        _windowOutput.returnFocus = YES;
-}
-
-- (void)openRunLocation:(const RunLocation &)location source:(SourceDocument *)source
-{
-    RunLocation target = location;
-    if (source && source == _document) {
-        [self revealRunLocation:target];
-        return;
-    }
-    if (source.editorHostWindow && [NSDocumentController.sharedDocumentController.documents containsObject:source]) {
-        [source showWindows];
-        [source revealRunLocation:target];
-        return;
-    }
-    if (target.file) {
-        __weak SourceDocument *document = _document;
-        OpenRelatedFile(target.file, self.window, ^(NSDocument *opened, BOOL, NSError *error) {
-            if ([opened isKindOfClass:SourceDocument.class])
-                [(SourceDocument *)opened revealRunLocation:target];
-            else if (error)
-                [document presentError:error];
-        });
-    }
+    if (_editor.hasHoveredError)
+        return [_editor viewErrorAtCursor];
+    if (_secondPane.editor.hasHoveredError)
+        return [_secondPane.editor viewErrorAtCursor];
+    return [self.activeEditor viewErrorAtCursor];
 }
 
 - (void)revealRunLocation:(const RunLocation &)location
 {
     [_buffer finishHighlighting];
-    NSRange line = SourceLine(_buffer, location.line);
-    if (line.location == NSNotFound)
+    if (location.utf16Columns) {
+        NSUInteger offset = [_buffer languageOffset:{location.line ? location.line - 1 : 0, location.column ? location.column - 1 : 0}];
+        if (offset != NSNotFound)
+            [self.activeEditor visitVimFileMark:offset exact:YES];
         return;
-    NSUInteger offset = SourceColumn(_buffer.storage.string, line, location.column, location.byteColumns,
-                                     _document.hasUTF8BOM);
-    [[self editorForOutput] visitVimFileMark:offset exact:YES];
+    }
+    NSRange line = SourceLine(_buffer, location.line);
+    if (line.location == NSNotFound && location.line == _buffer.lineCount + 1) {
+        [self.activeEditor visitVimFileMark:_buffer.storage.length exact:YES];
+        return;
+    }
+
+    if (line.location != NSNotFound) {
+        NSUInteger offset = DiagnosticColumn(_buffer.storage.string, line, location.column, location, _document.hasUTF8BOM);
+        [self.activeEditor visitVimFileMark:offset exact:YES];
+    }
 }
 
 - (BOOL)isRunSource
@@ -3759,7 +6769,11 @@ enum class DockPage { Hidden, Output, Errors, Debug };
     return _buffer.textVersion;
 }
 
-- (BOOL)hasBuildErrors { return !_buffer.buildErrors.empty(); }
+- (BOOL)hasBuildErrors
+{
+    auto isError = [](const BuildError &error) { return !error.warning; };
+    return std::ranges::any_of(_buffer.buildErrors, isError) || std::ranges::any_of(_buffer.languageErrors, isError);
+}
 - (BOOL)hasMarkedEditorText { return _editor.hasMarkedText || _secondPane.editor.hasMarkedText; }
 
 - (void)finishEditingForClose
@@ -3771,22 +6785,30 @@ enum class DockPage { Hidden, Output, Errors, Debug };
     [_secondPane finishEditingForClose];
 }
 
-- (void)applyBuildMessages:(const std::vector<RunMessage> &)messages version:(NSUInteger)version owner:(BOOL)owner
+- (void)applyBuildMessages:(const std::vector<RunMessage> &)messages version:(NSUInteger)version
+                     owner:(BOOL)owner fromOutput:(BOOL)fromOutput
 {
     if (version != _buffer.textVersion)
         return;
+    [_buffer finishHighlighting];
     NSURL *file = CanonicalFileURL(_document.fileURL);
     std::vector<BuildError> errors;
     BOOL hasBOM = _document.hasUTF8BOM;
     for (const auto &message : messages) {
-        if (message.tone != OutputTone::Error ||
+        bool warning = !fromOutput && message.tone == OutputTone::Warning;
+        if ((!message.diagnostic.length && fromOutput) || (message.tone != OutputTone::Error && !warning) ||
             !((owner && message.location.currentSource) || [file.path isEqualToString:message.location.file.path]))
             continue;
         NSRange range = BuildErrorRange(_buffer, message.location, hasBOM);
-        if (range.location != NSNotFound)
-            errors.push_back({range, message.diagnostic});
+        if (range.location == NSNotFound)
+            continue;
+        bool unused = warning && IsHideableUnusedWarning(_buffer, range.location, message.diagnosticLabel, message.diagnostic);
+        errors.push_back({range, message.diagnostic, warning, message.diagnosticLabel, message.location, fromOutput != NO, unused});
     }
-    [_buffer addBuildErrors:errors];
+    if (fromOutput)
+        [_buffer addBuildErrors:errors];
+    else
+        [_buffer replaceCheckErrors:errors];
 }
 
 - (NSArray<SourceDocument *> *)documentsForBuild:(RunProject)project
@@ -3805,13 +6827,18 @@ enum class DockPage { Hidden, Output, Errors, Debug };
     return documents;
 }
 
-- (void)scheduleRustCheck
+- (void)scheduleLanguageCheck
 {
-    _needsRustCheck = _buffer.language == Language::Rust;
+    if (_languageCheckResult) {
+        _languageCheckResult.reset();
+        [_buffer replaceCheckErrors:{}];
+        [self updateLanguageDiagnostics];
+    }
+    _needsLanguageCheck = CheckableLanguage(_buffer.language);
     WindowOutput *dock = _windowOutput;
     if (dock.host != self)
         return;
-    if (![self canQueueRustCheck]) {
+    if (![self canQueueLanguageCheck]) {
         [dock cancelCheck];
         return;
     }
@@ -3819,38 +6846,78 @@ enum class DockPage { Hidden, Output, Errors, Debug };
     [dock armCheckTimer:1];
 }
 
-- (BOOL)canQueueRustCheck
+- (BOOL)usesLocalCheck
+{
+    Language language = _buffer.language;
+    if (!CheckableLanguage(language))
+        return NO;
+
+    LSPDocument *server = _buffer.languageDocument;
+    if (server && server.state == LSPState::Starting)
+        return NO;
+
+    if (!server.handlesDiagnostics)
+        return YES;
+
+    // Cargo supplies compiler errors while rust-analyzer is still checking unsaved text.
+    return language == Language::Rust && (server.changedSinceSave || _document.isDocumentEdited);
+}
+
+- (BOOL)canQueueLanguageCheck
 {
     WindowOutput *dock = _windowOutput;
-    return _needsRustCheck && dock.host == self && self.window.isKeyWindow &&
+    return _needsLanguageCheck && dock.host == self && self.window.isKeyWindow && [self usesLocalCheck] &&
            !dock.runner && !dock.debugging && !_document.workspace.runningDocument;
 }
 
-- (void)resumeRustCheck
+- (void)resumeLanguageCheck
 {
     WindowOutput *dock = _windowOutput;
-    if ([self canQueueRustCheck] && !dock.checkTimer && (!dock.checkRunner || dock.checkRunner.isStopped))
+    if ([self canQueueLanguageCheck] && !dock.checkTimer && (!dock.checkRunner || dock.checkRunner.isStopped))
         [dock armCheckTimer:1];
 }
 
-- (void)cancelRustCheck
+- (void)cancelLanguageCheck
 {
-    _needsRustCheck = NO;
+    _needsLanguageCheck = NO;
     if (_windowOutput.host == self)
         [_windowOutput cancelCheck];
 }
 
-- (void)startPendingRustCheck
+- (void)startPendingLanguageCheck
 {
     WindowOutput *dock = _windowOutput;
     SourceDocument *owner = _document;
-    if (!owner || !_needsRustCheck || dock.host != self || !self.window || dock.checkRunner || dock.runner ||
-        dock.debugging || owner.workspace.runningDocument || self.hasMarkedEditorText)
+    if (!owner || ![self canQueueLanguageCheck] || dock.checkRunner || self.hasMarkedEditorText)
         return;
 
     NSURL *file = CanonicalFileURL(owner.fileURL);
-    RunProject project = LocateRunProject(Language::Rust, file, file ? owner.workspace.folder : nil);
-    NSArray<SourceDocument *> *documents = [self documentsForBuild:project];
+    Language language = _buffer.language;
+    bool odin = language == Language::Odin && file;
+    RunProject project = language == Language::Rust || odin ? LocateRunProject(language, file, file ? owner.workspace.folder : nil) : RunProject{};
+    bool cargo = project.kind == RunKind::Cargo;
+    // Non-Cargo Rust projects are checked by their configured language server.
+    if (language == Language::Rust && _buffer.languageDocument.handlesDiagnostics && !cargo) {
+        _needsLanguageCheck = NO;
+        return;
+    }
+
+    NSArray<SourceDocument *> *documents = cargo ? [self documentsForBuild:project] : @[owner];
+    if (odin) {
+        NSMutableArray<SourceDocument *> *package = [NSMutableArray arrayWithObject:owner];
+        NSString *directory = file.URLByDeletingLastPathComponent.path;
+        for (NSDocument *open in NSDocumentController.sharedDocumentController.documents) {
+            if (open == owner || ![open isKindOfClass:SourceDocument.class])
+                continue;
+
+            NSURL *path = CanonicalFileURL(open.fileURL);
+            if (LanguageForSource(path) == Language::Odin && [path.URLByDeletingLastPathComponent.path isEqualToString:directory])
+                [package addObject:(SourceDocument *)open];
+        }
+
+        documents = package;
+    }
+
     std::vector<CheckSource> sources;
     std::vector<BuildTarget> targets;
     sources.reserve(documents.count);
@@ -3861,42 +6928,50 @@ enum class DockPage { Hidden, Output, Errors, Debug };
         targets.push_back({document, document.diagnosticVersion, active, path});
         if (active || (path && document.isDocumentEdited)) {
             NSString *text = document.sourceText;
-            sources.push_back({path, document.hasUTF8BOM ? [@"\uFEFF" stringByAppendingString:text] : [text copy]});
+            sources.push_back({path, document.hasUTF8BOM ? [@"\uFEFF" stringByAppendingString:text] : [text copy], !document.isDocumentEdited});
         }
     }
 
     SourceRunner *checker = [[SourceRunner alloc] init];
     dock.checkRunner = checker;
-    if (project.kind == RunKind::Cargo && !dock.checkCache)
+    if (cargo && !dock.checkCache)
         dock.checkCache = [[RustCheckCache alloc] init];
     __weak WindowOutput *output = dock;
     __weak EditorWindow *view = self;
-    __weak SourceDocument *document = owner;
-    [checker checkRustProject:project file:file name:file ? file.lastPathComponent : owner.displayName
+    [checker checkProject:project language:language file:file name:file ? file.lastPathComponent : owner.displayName
                        sources:std::move(sources) cache:dock.checkCache finished:^(CheckResult result) {
         WindowOutput *console = output;
         if (console.checkRunner != checker)
             return;
         console.checkRunner = nil;
         EditorWindow *root = view;
-        if (!checker.isStopped && root && console.host == root) {
+        if (!checker.isStopped && root && console.host == root && root->_buffer.language == language &&
+            [root usesLocalCheck]) {
             bool current = std::ranges::all_of(targets, [](const BuildTarget &target) {
                 SourceDocument *source = target.document;
                 NSURL *path = CanonicalFileURL(source.fileURL);
                 return source && source.diagnosticVersion == target.version && (path == target.file || [path isEqual:target.file]);
             });
             if (current) {
-                root->_needsRustCheck = NO;
-                for (const auto &target : targets) {
-                    if (target.owner || [target.file.pathExtension.lowercaseString isEqualToString:@"rs"]) {
-                        [target.document beginBuildDiagnostics];
-                        [target.document applyBuildMessages:result.diagnostics version:target.version owner:target.owner];
-                    }
+                root->_needsLanguageCheck = NO;
+                if (root->_buffer.languageDocument.handlesDiagnostics) {
+                    // The language server can keep checking when Cargo cannot start, e.g. offline dependencies.
+                    std::erase_if(result.diagnostics, [](const RunMessage &message) { return !message.location.line; });
+                    result.errors = std::ranges::count_if(result.diagnostics, [](const RunMessage &message) {
+                        return message.tone == OutputTone::Error;
+                    });
+                    result.warnings = result.diagnostics.size() - result.errors;
                 }
-                [console setCheckResult:std::move(result) source:document];
+                for (const auto &target : targets) {
+                    if (target.owner || odin || (cargo && [target.file.pathExtension.lowercaseString isEqualToString:@"rs"]))
+                        [target.document applyBuildMessages:result.diagnostics version:target.version owner:target.owner fromOutput:NO];
+                }
+                root->_languageCheckResult = std::move(result);
+                root->_languageCheckVersion = root->_buffer.textVersion;
+                [root updateLanguageDiagnostics];
             }
         }
-        [console.host resumeRustCheck];
+        [console.host resumeLanguageCheck];
     }];
 }
 
@@ -3926,7 +7001,7 @@ enum class DockPage { Hidden, Output, Errors, Debug };
         [console.pane setInputEnabled:YES];
         EditorWindow *root = view;
         if (root && console.host == root && root.window.isKeyWindow && root->_buffer.textVersion == version &&
-            (root.window.firstResponder == [root editorForOutput] || root.window.firstResponder == startingFocus))
+            (root.window.firstResponder == root.activeEditor || root.window.firstResponder == startingFocus))
             console.returnFocus = [console.pane focusInput];
     };
     [runner startProject:project language:language file:file name:name ? name : @"Untitled" workingText:text
@@ -3936,7 +7011,7 @@ enum class DockPage { Hidden, Output, Errors, Debug };
             return message.tone == OutputTone::Error && message.location.line;
         })) {
             for (const auto &target : targets)
-                [target.document applyBuildMessages:messages version:target.version owner:target.owner];
+                [target.document applyBuildMessages:messages version:target.version owner:target.owner fromOutput:YES];
         }
     } finished:^{
         [windowOutput finishRun];
@@ -3971,6 +7046,7 @@ enum class DockPage { Hidden, Output, Errors, Debug };
     NSButton *button = self.runButton;
     if (button) {
         SetRunButton(button, self.runCommand);
+        SetTitleDebugButton(button, _windowOutput.debugSession.phase);
         button.enabled = self.canRunCommand;
     }
 }
@@ -4058,47 +7134,6 @@ enum class DockPage { Hidden, Output, Errors, Debug };
     }
 }
 
-- (void)openDebugLocation:(NSString *)path line:(NSUInteger)line column:(NSUInteger)column
-{
-    if (!path.isAbsolutePath || !line || ![NSFileManager.defaultManager fileExistsAtPath:path])
-        return;
-    NSURL *file = CanonicalFileURL([NSURL fileURLWithPath:path]);
-    RunLocation location{file, line, column, 0, 0, false, false};
-    SourceDocument *document = [_editor.debugPath isEqualToString:file.path] ? _document : nil;
-    [self openRunLocation:location source:document];
-}
-
-- (void)refreshDebugControls
-{
-    WindowOutput *dock = _windowOutput;
-    [self refreshRunButton];
-    dock.debugPane.session = dock.debugSession;
-    [dock.debugPane updateStatus:dock.debugStatus building:dock.debugBuilder != nil
-                    restartable:(dock.debugFile || dock.externalExecutable) && !_document.workspace.runningDocument];
-}
-
-- (void)debugUpdated
-{
-    WindowOutput *dock = _windowOutput;
-    [self refreshDebugControls];
-    [self refreshDebugLocation];
-    DebugSession *session = dock.debugSession;
-    NSDictionary *frame = session.frame;
-    if (frame && frame != dock.navigatedFrame) {
-        dock.navigatedFrame = frame;
-        [self openDebugLocation:frame[@"source"][@"path"] line:[frame[@"line"] unsignedIntegerValue]
-                         column:[frame[@"column"] unsignedIntegerValue]];
-    } else if (session && session.phase == DebugPhase::Finished) {
-        dock.navigatedFrame = nil;
-        if (dock.restartDebug) {
-            dock.restartDebug = NO;
-            [self startDebugTarget];
-        } else {
-            [self resumeRustCheck];
-        }
-    }
-}
-
 - (void)startDebugSession:(DebugExecutable *)executable pid:(pid_t)pid
 {
     WindowOutput *dock = _windowOutput;
@@ -4120,10 +7155,10 @@ enum class DockPage { Hidden, Output, Errors, Debug };
         if (current.phase == DebugPhase::Finished && ([current.status isEqualToString:@"Debugging failed"] ||
             [current.status isEqualToString:@"Could not start LLDB"] || [current.status isEqualToString:@"Disconnected"]))
             [output.debugPane showConsole];
-        [output.host debugUpdated];
+        [output debugUpdated];
     };
 
-    [self debugUpdated];
+    [dock debugUpdated];
     [session start];
 }
 
@@ -4131,7 +7166,7 @@ enum class DockPage { Hidden, Output, Errors, Debug };
 {
     WindowOutput *dock = _windowOutput;
     [dock cancelCheck];
-    [self showDockPage:DockPage::Debug];
+    [dock showDockPage:DockPage::Debug];
     [dock.debugPane prepare];
     dock.debugSession = nil;
     dock.debugStatus = nil;
@@ -4151,7 +7186,7 @@ enum class DockPage { Hidden, Output, Errors, Debug };
     SourceRunner *runner = [[SourceRunner alloc] init];
     dock.debugBuilder = runner;
     dock.debugStatus = @"Building…";
-    [self refreshDebugControls];
+    [dock refreshDebugControls];
     __weak WindowOutput *weak = dock;
     __weak SourceDocument *weakSource = source;
     SaveBuildDocuments(documents, 0, runner, ^(NSError *error) {
@@ -4171,8 +7206,8 @@ enum class DockPage { Hidden, Output, Errors, Debug };
                                                           OutputTone::Error, {}}} source:nil];
                 [output.debugPane showConsole];
             }
-            [output.host debugUpdated];
-            [output.host resumeRustCheck];
+            [output debugUpdated];
+            [output.host resumeLanguageCheck];
             return;
         }
         [runner buildDebugProject:project language:language file:file output:^(const std::vector<RunMessage> &messages) {
@@ -4191,8 +7226,8 @@ enum class DockPage { Hidden, Output, Errors, Debug };
                 current.debugStatus = runner.isStopped ? @"Stopped" : @"Build failed";
                 if (!runner.isStopped)
                     [current.debugPane showConsole];
-                [current.host debugUpdated];
-                [current.host resumeRustCheck];
+                [current debugUpdated];
+                [current.host resumeLanguageCheck];
             }
         }];
     });
@@ -4265,7 +7300,7 @@ enum class DockPage { Hidden, Output, Errors, Debug };
         dock.debugLanguage = Language::Plain;
         dock.externalExecutable = nil;
         [dock cancelCheck];
-        [editor showDockPage:DockPage::Debug];
+        [dock showDockPage:DockPage::Debug];
         [dock.debugPane prepare];
         [editor startDebugSession:nil pid:pid];
     }];
@@ -4407,7 +7442,7 @@ enum class DockPage { Hidden, Output, Errors, Debug };
         [self editDebugArguments];
         break;
     case DebugCommand::ShowPane:
-        [self toggleDebug:nil];
+        [dock toggleDockPage:DockPage::Debug];
         break;
     }
 }
@@ -4448,9 +7483,7 @@ enum class DockPage { Hidden, Output, Errors, Debug };
     if (!self.canRun)
         return;
     [output cancelCheck];
-    if (!output.pane.hasKeyboardFocus)
-        _outputSource = self.activeEditor;
-    [self showOutput:YES];
+    output.shown = YES;
     [output.pane prepareForRun];
     NSArray<SourceDocument *> *documents = [self documentsForBuild:project];
     SourceRunner *runner = [[SourceRunner alloc] init];
@@ -4490,7 +7523,8 @@ enum class DockPage { Hidden, Output, Errors, Debug };
 - (void)dealloc
 {
     [self stopRun];
-    [self cancelRustCheck];
+    [self cancelLanguageCheck];
+    [self closeLanguageServices];
 }
 
 - (void)splitResized:(NSNotification *)notification
@@ -4500,7 +7534,7 @@ enum class DockPage { Hidden, Output, Errors, Debug };
     [_secondPane setNeedsLayout:YES];
 }
 
-- (void)installSplitVertical:(BOOL)vertical
+- (void)installSplitAtSide:(DockSide)side fraction:(CGFloat)fraction
 {
     if (!_secondPane)
         _secondPane = [[EditorWindow alloc] initWithDocument:_document text:nil language:_buffer.language
@@ -4513,34 +7547,41 @@ enum class DockPage { Hidden, Output, Errors, Debug };
         [_paneContent addSubview:_gutter];
         _splitView = [[NSSplitView alloc] initWithFrame:_paneContent.frame];
         _splitView.dividerStyle = NSSplitViewDividerStyleThin;
-        _splitView.vertical = vertical;
-        [_splitView addArrangedSubview:_paneContent];
-        [_splitView addArrangedSubview:_secondPane];
         [self addSubview:_splitView];
         [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(splitResized:)
                       name:NSSplitViewDidResizeSubviewsNotification object:_splitView];
-    } else {
-        _splitView.vertical = vertical;
     }
-    [_secondPane applyPreferences];
-    [_splitView adjustSubviews];
-    CGFloat extent = vertical ? NSWidth(_splitView.bounds) : NSHeight(_splitView.bounds);
-    [_splitView setPosition:extent / 2 ofDividerAtIndex:0];
+
+    _splitSide = side;
+    ArrangeEditorSplit(_splitView, _paneContent, _secondPane, side, fraction);
     [self setNeedsLayout:YES];
     [self layoutSubtreeIfNeeded];
 }
 
 - (void)showSplitRight:(BOOL)vertical from:(EditorWindow *)pane
 {
-    [self installSplitVertical:vertical];
+    [self installSplitAtSide:vertical ? DockSide::Right : DockSide::Bottom fraction:0.5];
     EditorWindow *target = pane == self ? _secondPane : self;
     [target.editor visitVimFileMark:pane.editor.vimCursor exact:YES];
     [self updateEditorStatus];
 }
 
+- (void)splitTabAtSide:(DockSide)side
+{
+    BOOL newSplit = !_splitView;
+    if (newSplit || _splitSide != side)
+        [self installSplitAtSide:side fraction:0.5];
+    if (newSplit)
+        [_secondPane.editor visitVimFileMark:_editor.vimCursor exact:YES];
+    else
+        [self.window makeFirstResponder:_secondPane.editor];
+    [self updateEditorStatus];
+}
+
 - (void)closeSplitFrom:(EditorWindow *)pane
 {
-    NSUInteger cursor = pane == self ? _secondPane.editor.vimCursor : _editor.vimCursor;
+    BOOL keepRight = pane == self;
+    NSUInteger cursor = _secondPane.editor.vimCursor;
     [NSNotificationCenter.defaultCenter removeObserver:self name:NSSplitViewDidResizeSubviewsNotification
                                                object:_splitView];
     [_secondPane removeFromSuperview];
@@ -4550,12 +7591,26 @@ enum class DockPage { Hidden, Output, Errors, Debug };
     [_splitView removeFromSuperview];
     _splitView = nil;
     _paneContent = nil;
-    [self addSubview:_scroll positioned:NSWindowBelow relativeTo:_statusBar];
-    [self addSubview:_gutter positioned:NSWindowBelow relativeTo:_statusBar];
+    [self addSubview:_scroll];
+    [self addSubview:_gutter];
     [self setNeedsLayout:YES];
     [self layoutSubtreeIfNeeded];
-    [_editor visitVimFileMark:cursor exact:YES];
+    if (keepRight)
+        [_editor visitVimFileMark:cursor exact:YES];
+    else
+        [self.window makeFirstResponder:_editor];
+
+    self.window.initialFirstResponder = _editor;
+    _secondPane = nil;
     [self updateEditorStatus];
+}
+
+- (BOOL)hasSplit { return _splitView != nil; }
+
+- (void)closeTabSplit
+{
+    if (_splitView)
+        [self closeSplitFrom:_secondPane];
 }
 
 - (void)performEditorAction:(Vim::Action)action argument:(NSString *)argument force:(BOOL)force
@@ -4583,11 +7638,14 @@ enum class DockPage { Hidden, Output, Errors, Debug };
             else {
                 CodeView *target = self == root ? root->_secondPane.editor : root.editor;
                 bool along = root->_splitView.isVertical ? key == 'h' || key == 'l' : key == 'k' || key == 'j';
-                bool toward = self == root ? key == 'l' || key == 'j' : key == 'h' || key == 'k';
+                bool forward = key == 'l' || key == 'j';
+                bool toward = forward == ((self == root) != SplitDockFirst(root->_splitSide));
                 if ((along && toward) || key == 'w' || key == 'W' || key == 'p')
                     [root.window makeFirstResponder:target];
                 [root updateEditorStatus];
             }
+        } else if (MoveFocusInDocumentSplit(self, key)) {
+            return;
         } else if (key == 'c' || key == 'q') {
             [_document performVimAction:Action::Close argument:@"" force:NO];
         } else if (key != 'o') {
@@ -4614,6 +7672,7 @@ enum class DockPage { Hidden, Output, Errors, Debug };
                        name:NSWindowDidBecomeKeyNotification object:self.window];
         [center addObserver:self selector:@selector(keyWindowChanged:)
                        name:NSWindowDidResignKeyNotification object:self.window];
+        [_buffer scheduleInlayHints];
     }
 }
 
@@ -4623,129 +7682,52 @@ enum class DockPage { Hidden, Output, Errors, Debug };
     [_editor invalidateVimCaret];
     [_editor updateInsertionPointStateAndRestartTimer:YES];
     [_gutter refreshBreakpointHover];
-    if (!self.window.isKeyWindow)
+    if (!self.window.isKeyWindow) {
         [_editor dismissCompletion];
-    else if (_outputRail) {
-        [self readDockPlacement];
-        [self resumeRustCheck];
-        [self setNeedsLayout:YES];
+        [_editor dismissLanguageInformation];
+    } else if (!_splitParent) {
+        [self refreshLanguageServices];
+        [_buffer scheduleInlayHints];
+        [self resumeLanguageCheck];
     }
-    [_statusBar setNeedsDisplay:YES];
-    [_outputRail setNeedsDisplay:YES];
 }
 
-static void PlaceDockTab(DockTab *button, NSRect frame, bool vertical)
+- (void)updateLanguageHoverModifiers:(NSEvent *)event
 {
-    button.frameRotation = 0;
-    if (vertical) {
-        button.frame = NSMakeRect(NSMaxX(frame), NSMinY(frame), NSHeight(frame), NSWidth(frame));
-        button.frameRotation = 90;
-    } else {
-        button.frame = frame;
-    }
+    NSPoint point = self.window.mouseLocationOutsideOfEventStream;
+    [_editor updateLanguageHoverModifiers:event.modifierFlags atWindowPoint:point];
+    [_secondPane.editor updateLanguageHoverModifiers:event.modifierFlags atWindowPoint:point];
 }
 
 - (void)layout
 {
     [super layout];
-    CGFloat width = NSWidth(self.bounds);
-    NSRect content = [self editorArea];
-    if (!_splitParent) {
-        auto dock = [self dockFrames];
-        CGFloat chromeHeight = statusHeight + (_dockSide == DockSide::Bottom ? NSHeight(dock.rail) : 0);
-        _statusBar.frame = NSMakeRect(0, 0, width, chromeHeight);
-        if (_outputRail.side != _dockSide) {
-            _outputRail.side = _dockSide;
-            [_outputRail setNeedsDisplay:YES];
-        }
-        _outputRail.frame = dock.rail;
-        NSRect tab = NSOffsetRect(dock.tab, -NSMinX(dock.rail), -NSMinY(dock.rail));
-        bool vertical = DockIsSide(_dockSide);
-        CGFloat length = std::max(74.0, std::ceil(_errorsTab.fittingSize.width));
-        NSRect errors = tab;
-        if (vertical) {
-            CGFloat end = std::max(0.0, NSMinY(tab) - 3);
-            errors.size.height = std::min(length, end);
-            errors.origin.y = end - errors.size.height;
-        } else {
-            errors.origin.x = NSMaxX(tab) + 3;
-            errors.size.width = std::clamp(NSWidth(dock.rail) - errors.origin.x, 0.0, length);
-        }
-        NSRect debug = errors;
-        if (vertical) {
-            CGFloat end = std::max(0.0, NSMinY(errors) - 3);
-            debug.size.height = std::min(68.0, end);
-            debug.origin.y = end - debug.size.height;
-        } else {
-            debug.origin.x = NSMaxX(errors) + 3;
-            debug.size.width = std::clamp(NSWidth(dock.rail) - debug.origin.x, 0.0, 68.0);
-        }
-        PlaceDockTab(_outputTab, tab, vertical);
-        PlaceDockTab(_errorsTab, errors, vertical);
-        PlaceDockTab(_debugTab, debug, vertical);
-        _outputDivider.hidden = NSIsEmptyRect(dock.divider);
-        _outputDivider.vertical = DockIsSide(_dockSide);
-        _outputDivider.frame = dock.divider;
-        if (_windowOutput.host == self) {
-            if (self.outputShown)
-                _windowOutput.pane.frame = dock.output;
-            if (_windowOutput.page == DockPage::Errors)
-                _windowOutput.errorsPane.frame = dock.output;
-            if (_windowOutput.page == DockPage::Debug)
-                _windowOutput.debugPane.frame = dock.output;
-        }
+    if (_splitView && !NSEqualRects(_splitView.frame, self.bounds)) {
+        _splitView.frame = self.bounds;
+        [_splitView adjustSubviews];
     }
-    if (_splitView) {
-        if (!NSEqualRects(_splitView.frame, content)) {
-            _splitView.frame = content;
-            [_splitView adjustSubviews];
-        }
-    }
-    CGFloat languageWidth = _language ?
-        std::clamp(std::ceil([_language.titleOfSelectedItem sizeWithAttributes:@{NSFontAttributeName:_language.font}].width) + 30,
-                   97.0, 166.0) : 97;
-    CGFloat languageLeft = width - 59 - languageWidth;
-    _position.frame = NSMakeRect(9, 2, std::max(0.0, languageLeft - 95), 15);
-    _indentationButton.frame = NSMakeRect(languageLeft - 83, 1, 80, 20);
-    _encoding.frame = NSMakeRect(width - 57, 4, 50, 14);
-    _language.frame = NSMakeRect(languageLeft, 1, languageWidth, 20);
     [self layoutPane];
-}
-
-- (NSRect)editorBody
-{
-    return NSMakeRect(0, statusHeight, NSWidth(self.bounds),
-                      std::max<CGFloat>(0, NSHeight(self.bounds) - statusHeight));
-}
-
-- (DockFrames)dockFrames
-{
-    return LayoutDock([self editorBody], _dockSide, _windowOutput.page != DockPage::Hidden,
-                      DockIsSide(_dockSide) ? _dockWidth : _dockHeight);
-}
-
-- (NSRect)editorArea
-{
-    if (_splitParent)
-        return self.bounds;
-    return [self dockFrames].editor;
 }
 
 - (void)layoutPane
 {
-    NSRect area = _paneContent ? _paneContent.bounds : [self editorArea];
+    NSRect area = _paneContent ? _paneContent.bounds : self.bounds;
     CGFloat x = NSMinX(area), width = NSWidth(area), height = NSHeight(area);
     NSUInteger lineCount = std::max(NSUInteger(1), _buffer.lineCount);
     CGFloat digits = std::floor(std::log10(double(lineCount))) + 1;
     CGFloat digitWidth = [@"0" sizeWithAttributes:@{NSFontAttributeName:_gutter.numberFont}].width;
     CGFloat gutterWidth = std::min(std::max(42.0, std::ceil(digits * digitWidth + gutterInset + breakpointLane)),
                                   std::floor(width / 3));
-    _scroll.frame = NSMakeRect(x + gutterWidth, NSMinY(area), width - gutterWidth, height);
+    NSRect viewport = NSMakeRect(x + gutterWidth, NSMinY(area), width - gutterWidth, height);
+    bool viewportChanged = !NSEqualRects(_scroll.frame, viewport);
+    _scroll.frame = viewport;
     _gutter.frame = NSMakeRect(x, NSMinY(area), gutterWidth, height);
 
     // Refit after edits and clip changes so AppKit can clamp both scroll axes.
     [_editor sizeToFit];
     [self updateCursor];
+    if (viewportChanged)
+        [_buffer scheduleInlayHints];
     if (_laidOutLineCount != lineCount) {
         _laidOutLineCount = lineCount;
         // AppKit may reuse backing pixels while moving the existing line fragments.
@@ -4764,7 +7746,7 @@ static void PlaceDockTab(DockTab *button, NSRect frame, bool vertical)
     [self applyPreferences];
     [self layoutSubtreeIfNeeded];
     [_editor scrollRangeToVisible:NSMakeRange(0, 0)];
-    [self scheduleRustCheck];
+    [self scheduleLanguageCheck];
 }
 
 - (NSDictionary *)sessionPane
@@ -4778,17 +7760,17 @@ static void PlaceDockTab(DockTab *button, NSRect frame, bool vertical)
 - (NSDictionary *)sessionView
 {
     NSMutableDictionary *state = [@{@"pane":[self sessionPane], @"language":@(self.languageMode),
-                                    @"languageAutomatic":@(self.automaticLanguageMode),
-                                    @"output":@(self.outputShown)} mutableCopy];
+                                    @"languageAutomatic":@(self.automaticLanguageMode)} mutableCopy];
     if (_buffer.hasFileIndentation)
         state[@"indentation"] = EncodeIndentation(_buffer.indentation);
     if (_splitView) {
         BOOL vertical = _splitView.isVertical;
-        CGFloat first = vertical ? NSWidth(_paneContent.frame) : NSHeight(_paneContent.frame);
+        NSRect firstFrame = _splitView.arrangedSubviews.firstObject.frame;
+        CGFloat first = vertical ? NSWidth(firstFrame) : NSHeight(firstFrame);
         CGFloat extent = vertical ? NSWidth(_splitView.bounds) : NSHeight(_splitView.bounds);
         NSResponder *focus = self.window.firstResponder;
         BOOL second = focus == _secondPane.editor || (focus != _editor && _tabFocus == _secondPane.editor);
-        state[@"split"] = @{@"vertical":@(vertical), @"fraction":@(extent > 0 ? first / extent : 0.5),
+        state[@"split"] = @{@"vertical":@(vertical), @"side":@(NSInteger(_splitSide)), @"fraction":@(extent > 0 ? first / extent : 0.5),
                             @"secondActive":@(second), @"pane":[_secondPane sessionPane]};
     }
     return state;
@@ -4835,13 +7817,13 @@ static void PlaceDockTab(DockTab *button, NSRect frame, bool vertical)
     NSDictionary *split = SessionDictionary(state[@"split"]);
     if (split) {
         BOOL vertical = [SessionNumber(split[@"vertical"]) boolValue];
-        [self installSplitVertical:vertical];
+        NSNumber *savedSide = SessionNumber(split[@"side"]);
+        DockSide side = vertical ? DockSide::Right : DockSide::Bottom;
+        if (savedSide && savedSide.unsignedIntegerValue <= size_t(DockSide::Top))
+            side = DockSide(savedSide.integerValue);
         NSNumber *ratio = SessionNumber(split[@"fraction"]);
         CGFloat fraction = ratio ? ratio.doubleValue : 0.5;
-        if (std::isfinite(fraction)) {
-            CGFloat extent = vertical ? NSWidth(_splitView.bounds) : NSHeight(_splitView.bounds);
-            [_splitView setPosition:extent * std::clamp(fraction, 0.0, 1.0) ofDividerAtIndex:0];
-        }
+        [self installSplitAtSide:side fraction:std::isfinite(fraction) ? std::clamp(fraction, 0.0, 1.0) : 0.5];
         if ([SessionNumber(split[@"secondActive"]) boolValue])
             _tabFocus = _secondPane.editor;
     }
@@ -4854,20 +7836,25 @@ static void PlaceDockTab(DockTab *button, NSRect frame, bool vertical)
 - (void)scrollMoved:(NSNotification *)notification
 {
     (void)notification;
-    [_editor dismissCompletion];
-    if (_scrollRepaintPending)
+    [_editor completionViewportChanged];
+    [_editor dismissLanguageInformation];
+    if (_scrollUpdatePending)
         return;
-    _scrollRepaintPending = YES;
+    _scrollUpdatePending = YES;
     __weak EditorWindow *view = self;
-    // Repaint at the latest clip origin after AppKit finishes each scroll update.
+    // Keep gutter work out of the clip view's layout callbacks.
     [NSRunLoop.mainRunLoop performInModes:@[NSRunLoopCommonModes] block:^{
         EditorWindow *root = view;
         if (root) {
-            root->_scrollRepaintPending = NO;
-            [root->_editor refreshBuildErrorToolTips];
-            [root->_editor setNeedsDisplayInRect:root->_scroll.documentVisibleRect];
+            root->_scrollUpdatePending = NO;
+            CodeView *editor = root->_editor;
+            if (editor.debugException.length) {
+                NSRect used;
+                [editor setNeedsDisplayInRect:[editor debugLineInRect:editor.visibleRect used:&used]];
+            }
             [root->_gutter refreshBreakpointHover];
             [root->_gutter setNeedsDisplay:YES];
+            [root->_buffer scheduleInlayHints];
         }
     }];
 }
@@ -4907,17 +7894,312 @@ static void PlaceDockTab(DockTab *button, NSRect frame, bool vertical)
     [self applyLanguage:[_document inferredLanguageForText:_buffer.storage.string]];
 }
 
+static NSString *LanguageDiagnosticLabel(NSDictionary *diagnostic)
+{
+    NSString *source = LSPString(diagnostic[@"source"]);
+    id value = diagnostic[@"code"];
+    NSString *code = LSPString(value);
+    if (!code)
+        code = [LSPNumber(value) stringValue];
+    if (source.length && code.length)
+        return [NSString stringWithFormat:@"%@(%@)", source, code];
+    return source.length ? source : code;
+}
+
+- (void)updateLanguageDiagnostics
+{
+    LSPDocument *document = _buffer.languageDocument;
+    std::vector<BuildError> marks;
+    CheckResult result;
+    BOOL active = _windowOutput.host == self;
+    bool hasCheck = _languageCheckResult && _languageCheckVersion == _buffer.textVersion;
+    if (active && hasCheck)
+        result = *_languageCheckResult;
+    for (NSDictionary *diagnostic in document.diagnostics) {
+        NSInteger severity = [LSPNumber(diagnostic[@"severity"]) integerValue];
+        if (severity > 2)
+            continue;
+        BOOL warning = severity == 2;
+        NSRange range = [_buffer languageRange:diagnostic[@"range"]];
+        if (range.location == NSNotFound)
+            continue;
+        NSString *message = LSPString(diagnostic[@"message"]);
+        NSString *code = LSPString(diagnostic[@"code"]);
+        if (!code)
+            code = [LSPNumber(diagnostic[@"code"]) stringValue];
+        NSString *diagnostic_label = LanguageDiagnosticLabel(diagnostic);
+        LSPPosition start = [_buffer languagePosition:range.location];
+        NSRange line = SourceLine(_buffer, [_buffer lineForOffset:range.location] + 1);
+        if (line.location != NSNotFound && NSMaxRange(line) >= range.location)
+            range.length = std::min(range.length, NSMaxRange(line) - range.location);
+        if (hasCheck) {
+            const auto &checked = _buffer.buildErrors;
+            auto mark = std::lower_bound(checked.begin(), checked.end(), line.location,
+                [](const BuildError &error, NSUInteger offset) { return error.range.location < offset; });
+            NSString *compilerLabel = diagnostic_label;
+            for (; mark != checked.end() && mark->range.location <= NSMaxRange(range); ++mark) {
+                if (mark->warning == (warning != NO) &&
+                    (mark->range.location == range.location || NSIntersectionRange(mark->range, range).length) &&
+                    ([mark->label isEqualToString:compilerLabel] || [mark->message isEqualToString:message]))
+                    break;
+            }
+            if (mark != checked.end() && mark->range.location <= NSMaxRange(range))
+                continue;
+        }
+        RunLocation location{document.file, start.line + 1, start.character + 1, 0, 0, true, false, true};
+        bool unused = warning && IsHideableUnusedWarning(_buffer, range.location, code, message);
+        marks.push_back({range, message, warning != NO, diagnostic_label, location, false, unused});
+        if (!active)
+            continue;
+        NSString *path = document.file.lastPathComponent;
+        NSString *label = [NSString stringWithFormat:@"%@:%lu:%lu", path, (unsigned long)location.line,
+                           (unsigned long)location.column];
+        NSString *text = [NSString stringWithFormat:@"%@: %@: %@\n", label, warning ? @"warning" : @"error", message];
+        RunMessage output{text, warning ? OutputTone::Warning : OutputTone::Error, location, message};
+        output.linkRange = NSMakeRange(0, label.length);
+        result.diagnostics.push_back(std::move(output));
+        if (warning)
+            ++result.warnings;
+        else
+            ++result.errors;
+    }
+    [_buffer setLanguageErrors:std::move(marks)];
+    if (active)
+        [_windowOutput setCheckResult:std::move(result) source:_document];
+    [_document resumePendingAutoSave];
+}
+
+- (void)updateLanguageStatus
+{
+    if (_windowOutput.host == self)
+        [_windowOutput updateLanguageStatus];
+
+    LSPDocument *document = _buffer.languageDocument;
+    [_editor updateLanguageTracking];
+    [_secondPane.editor updateLanguageTracking];
+    if ([document supports:@"inlayHintProvider"])
+        [_buffer scheduleInlayHintsAfter:0];
+    else
+        [_buffer resetInlayHints];
+}
+
+- (void)closeLanguageServices
+{
+    LSPDocument *document = _buffer.languageDocument;
+    if (_splitParent || !document)
+        return;
+    document.updated = nil;
+    document.diagnosticsChanged = nil;
+    document.inlayHintsChanged = nil;
+    [document close];
+    _buffer.languageDocument = nil;
+    _languageWorkspace = nil;
+    [_editor dismissLanguageInformation];
+    [_secondPane.editor dismissLanguageInformation];
+    [_editor dismissCompletion];
+    [_secondPane.editor dismissCompletion];
+    [self updateLanguageDiagnostics];
+    [self updateLanguageStatus];
+}
+
+- (void)refreshLanguageServices
+{
+    if (_splitParent)
+        return;
+    NSURL *file = CanonicalFileURL(_document.fileURL);
+    NSURL *workspace = _document.workspace.folder;
+    LSPDocument *existing = _buffer.languageDocument;
+    BOOL sameWorkspace = workspace == _languageWorkspace || [workspace isEqual:_languageWorkspace];
+    if (existing && [existing.file isEqual:file] && existing.language == _buffer.language && sameWorkspace)
+        return;
+    [self closeLanguageServices];
+    if (!file || !self.window.isKeyWindow)
+        return;
+    LSPDocument *document = [[LSPDocument alloc] initWithFile:file workspace:workspace language:_buffer.language];
+    __weak EditorWindow *root = self;
+    __weak SyntaxBuffer *buffer = _buffer;
+    document.sourceText = ^NSString *{
+        NSString *text = [buffer.storage.string copy];
+        return text ? text : @"";
+    };
+    document.endPosition = ^LSPPosition {
+        return [buffer languagePosition:buffer.storage.length];
+    };
+    document.updated = ^{
+        EditorWindow *editor = root;
+        if (!editor)
+            return;
+        if (editor->_buffer.languageDocument.state != LSPState::Ready) {
+            [editor->_editor dismissServerCompletion];
+            [editor->_secondPane.editor dismissServerCompletion];
+            [editor->_editor dismissLanguageInformation];
+            [editor->_secondPane.editor dismissLanguageInformation];
+        }
+        [editor updateLanguageStatus];
+        if (editor->_buffer.language != Language::Rust && editor->_buffer.languageDocument.handlesDiagnostics &&
+            editor->_languageCheckResult) {
+            editor->_languageCheckResult.reset();
+            editor->_needsLanguageCheck = CheckableLanguage(editor->_buffer.language);
+            [editor->_buffer replaceCheckErrors:{}];
+        }
+
+        if (editor->_windowOutput.host == editor && ![editor canQueueLanguageCheck])
+            [editor->_windowOutput cancelCheck];
+        [editor updateLanguageDiagnostics];
+        [editor resumeLanguageCheck];
+    };
+    document.diagnosticsChanged = ^{ [root updateLanguageDiagnostics]; };
+    document.inlayHintsChanged = ^{
+        [buffer refreshInlayHintsAfter:inlayRefreshDelay];
+    };
+    _languageWorkspace = workspace;
+    _buffer.languageDocument = document;
+    [document start];
+}
+
+enum class LanguageStatusAction { Install, CancelInstall, Start, Restart, Stop, Configure, Default, Error, Uninstall };
+
+static bool CanUseLanguageStatusAction(LSPDocument *document, LanguageStatusAction action)
+{
+    if (action != LanguageStatusAction::Configure && (!document || document.state == LSPState::Uninstalling))
+        return false;
+    LSPState state = document.state;
+    switch (action) {
+    case LanguageStatusAction::Install:
+        return (state == LSPState::Missing || state == LSPState::Failed) && document.canInstall;
+    case LanguageStatusAction::CancelInstall:
+        return state == LSPState::Installing;
+    case LanguageStatusAction::Start:
+        return state == LSPState::Stopped || state == LSPState::Failed;
+    case LanguageStatusAction::Restart:
+    case LanguageStatusAction::Stop:
+        return state == LSPState::Ready || state == LSPState::Starting;
+    case LanguageStatusAction::Configure:
+        return true;
+    case LanguageStatusAction::Default:
+        return state != LSPState::Installing && document.customServer;
+    case LanguageStatusAction::Error:
+        return state == LSPState::Failed;
+    case LanguageStatusAction::Uninstall:
+        return state != LSPState::Installing && document.canUninstall;
+    }
+    return false;
+}
+
+- (IBAction)languageStatusAction:(NSMenuItem *)sender
+{
+    LSPDocument *document = _buffer.languageDocument;
+    auto action = LanguageStatusAction(sender.tag);
+    if (!self.window || self.window.attachedSheet || !CanUseLanguageStatusAction(document, action))
+        return;
+    switch (action) {
+    case LanguageStatusAction::Install: [document install]; break;
+    case LanguageStatusAction::CancelInstall: [document cancelInstall]; break;
+    case LanguageStatusAction::Start: [document start]; break;
+    case LanguageStatusAction::Restart: [document restart]; break;
+    case LanguageStatusAction::Stop: [document stop]; break;
+    case LanguageStatusAction::Configure: [[PreferencesController sharedController] showLSPPaneForLanguage:_buffer.language]; break;
+    case LanguageStatusAction::Default: SetLanguageServerConfiguration(document.language, nil, nil); break;
+    case LanguageStatusAction::Error: [self.editor presentLanguageError:document.status]; break;
+    case LanguageStatusAction::Uninstall: [document uninstall]; break;
+    }
+}
+
+- (NSMutableArray<NSMenuItem *> *)languageStatusCommandsForPalette:(BOOL)palette
+{
+    static const struct {
+        LanguageStatusAction action;
+        NSString *title;
+        NSString *menuTitle;
+    } commands[] = {
+        {LanguageStatusAction::CancelInstall, @"Cancel Installation", @"Cancel Installation"},
+        {LanguageStatusAction::Restart, @"Restart Language Server", @"Restart Server"},
+        {LanguageStatusAction::Stop, @"Stop Language Server", @"Stop Server"},
+        {LanguageStatusAction::Start, @"Start Language Server", @"Start Server"},
+        {LanguageStatusAction::Install, @"Install Language Tools", nil},
+        {LanguageStatusAction::Uninstall, @"Uninstall Language Tools", @"Uninstall Language Tools"},
+        {LanguageStatusAction::Error, @"Show Error…", @"Show Error…"},
+        {LanguageStatusAction::Configure, nil, @"Configure Server…"},
+        {LanguageStatusAction::Default, @"Use Default Language Server", @"Use Default Server"},
+    };
+    LSPDocument *document = _buffer.languageDocument;
+    NSMutableArray<NSMenuItem *> *items = [NSMutableArray array];
+    for (const auto &command : commands) {
+        if ((palette && !command.title) || !CanUseLanguageStatusAction(document, command.action))
+            continue;
+        NSString *title = command.menuTitle;
+        if (palette)
+            title = [@"LSP: " stringByAppendingString:command.title];
+        else if (command.action == LanguageStatusAction::Install)
+            title = [NSString stringWithFormat:@"Install %@…", document.serverName];
+        NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:title action:@selector(languageStatusAction:) keyEquivalent:@""];
+        item.target = self;
+        item.tag = NSInteger(command.action);
+        [items addObject:item];
+    }
+    return items;
+}
+
+- (NSArray<NSMenuItem *> *)languagePaletteCommands
+{
+    NSMutableArray<NSMenuItem *> *items = [self languageStatusCommandsForPalette:YES];
+    if (_buffer.languageDocument.state != LSPState::Ready)
+        return items;
+    CodeView *editor = self.activeEditor;
+    for (NSMenuItem *command in LanguageFeatureCommands()) {
+        if (![editor validateUserInterfaceItem:command])
+            continue;
+        command.title = [@"LSP: " stringByAppendingString:command.title];
+        command.target = editor;
+        [items addObject:command];
+    }
+    return items;
+}
+
+- (IBAction)showLanguageStatus:(NSButton *)sender
+{
+    if (self.window.attachedSheet)
+        return;
+    [self refreshLanguageServices];
+    LSPDocument *document = _buffer.languageDocument;
+    if (document && document.state == LSPState::Missing && !document.canInstall) {
+        [[PreferencesController sharedController] showLSPPaneForLanguage:_buffer.language];
+        return;
+    }
+    NSMenu *menu = [[NSMenu alloc] init];
+    menu.autoenablesItems = NO;
+    NSString *status = document.failureTitle ? document.failureTitle : document.status;
+    if (!status.length)
+        status = @"Save the file to use LSP.";
+    NSRange newline = [status rangeOfCharacterFromSet:NSCharacterSet.newlineCharacterSet];
+    if (newline.location != NSNotFound)
+        status = [status substringToIndex:newline.location];
+    if (status.length > 96)
+        status = [[status substringToIndex:96] stringByAppendingString:@"…"];
+    NSMenuItem *heading = [menu addItemWithTitle:status action:nil keyEquivalent:@""];
+    heading.enabled = NO;
+    NSArray<NSMenuItem *> *commands = [self languageStatusCommandsForPalette:NO];
+    if (commands.count) {
+        [menu addItem:NSMenuItem.separatorItem];
+        for (NSMenuItem *command in commands)
+            [menu addItem:command];
+    }
+    [menu popUpMenuPositioningItem:nil atLocation:NSMakePoint(0, NSHeight(sender.bounds)) inView:sender];
+}
+
 - (void)applyLanguage:(Language)language
 {
-    [_language selectItemWithTag:NSInteger(language)];
-    _language.toolTip = _automaticLanguageMode ? @"Language (Auto Detect)" : @"Language";
     BOOL changed = _buffer.language != language;
     if (changed)
         _buffer.language = language;
-    [self refreshDebugControls];
+    if (_windowOutput.host == self) {
+        [_windowOutput updateEditorSettings];
+        [_windowOutput refreshDebugControls];
+    }
     if (!changed)
         return;
-    [self scheduleRustCheck];
+    [self refreshLanguageServices];
+    [self scheduleLanguageCheck];
     [_document resumePendingAutoSave];
     [_editor dismissCompletion];
     [_editor refreshWordSelection];
@@ -4929,6 +8211,22 @@ static void PlaceDockTab(DockTab *button, NSRect frame, bool vertical)
 {
     (void)notification;
     [self applyPreferences];
+}
+
+- (void)unusedWarningsChanged:(NSNotification *)notification
+{
+    (void)notification;
+    if (self.hasDiagnostics)
+        [_buffer refreshBuildErrorViews];
+}
+
+- (void)inlaySettingsChanged:(NSNotification *)notification
+{
+    (void)notification;
+    [_buffer resetInlayHints];
+    [_editor applyAppearance];
+    [_secondPane.editor applyAppearance];
+    [_buffer scheduleInlayHints];
 }
 
 - (void)applyPreferences
@@ -4944,19 +8242,11 @@ static void PlaceDockTab(DockTab *button, NSRect frame, bool vertical)
         _editor.vimEnabled = vimEnabled;
     _editor.smoothScrollingEnabled = SmoothScrollingPreference();
     [_editor applyAppearanceWithTheme:palette];
-    if (_indentationButton) {
-        Indentation indentation = _buffer.indentation;
-        _indentationButton.title = [NSString stringWithFormat:indentation.tabs ? @"Tabs: %lu" : @"Spaces: %lu",
-            (unsigned long)(indentation.tabs ? indentation.tabWidth : indentation.width)];
-        _indentationButton.toolTip = _buffer.hasFileIndentation && _document.fileURL ?
-            @"Indentation saved for this file." : @"Indentation for this file.";
-    }
     _scroll.appearance = [NSAppearance appearanceNamed:_editor.theme->dark ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua];
     _scroll.backgroundColor = RenderedEditorColor(_editor.theme->paper, _editor.rendering);
     if (_windowOutput.host == self) {
-        [_windowOutput.pane applyFont:_editor.editorFont rendering:_editor.rendering dark:_editor.theme->dark];
-        [_windowOutput.errorsPane applyFont:_editor.editorFont rendering:_editor.rendering dark:_editor.theme->dark];
-        [_windowOutput.debugPane.console applyFont:_editor.editorFont rendering:_editor.rendering dark:_editor.theme->dark];
+        [_windowOutput updateEditorSettings];
+        [_windowOutput updateConsoleAppearance];
     }
 
     NSFont *font = _editor.editorFont;
@@ -4983,35 +8273,8 @@ static void PlaceDockTab(DockTab *button, NSRect frame, bool vertical)
 
 - (void)updateEditorStatus
 {
-    CodeView *editor = self.activeEditor;
-    NSUInteger caret = std::min(editor.vimDisplayedCursor, editor.string.length);
-    NSUInteger line = [_buffer lineForOffset:caret];
-    NSUInteger start = [_buffer offsetForLine:line];
-    NSString *position = [NSString stringWithFormat:@"Line %lu, Col %lu",
-                          (unsigned long)line + 1, (unsigned long)(caret - start + 1)];
-    if (editor.cursorCount > 1)
-        position = [NSString stringWithFormat:@"%@     %lu cursors", position, (unsigned long)editor.cursorCount];
-    NSError *saveError = _document.autoSaveError;
-    if (saveError || _position.toolTip)
-        _position.toolTip = saveError.localizedDescription;
-    if (saveError)
-        position = [position stringByAppendingString:@"     Auto Save Failed"];
-    NSUInteger promptCaret = editor.vimCommandCaret;
-    if (promptCaret != NSNotFound) {
-        NSString *text = [editor.vimStatus stringByAppendingString:@" "];
-        NSMutableAttributedString *prompt = [[NSMutableAttributedString alloc] initWithString:text
-            attributes:@{NSFontAttributeName:[NSFont fontWithName:@"Menlo" size:10],
-                         NSForegroundColorAttributeName:_position.textColor}];
-        if (promptCaret < prompt.length)
-            [prompt addAttribute:NSBackgroundColorAttributeName
-                           value:SRGBColor(editor.theme->accents.commandCaret) range:NSMakeRange(promptCaret, 1)];
-        _position.attributedStringValue = prompt;
-    } else if (editor.vimCommandLine)
-        _position.stringValue = editor.vimStatus;
-    else if (editor.vimEnabled)
-        _position.stringValue = [NSString stringWithFormat:@"%@     %@", editor.vimStatus, position];
-    else
-        _position.stringValue = position;
+    if (_windowOutput.host == self)
+        [_windowOutput updateEditorStatus];
 }
 
 - (void)updateCursor
@@ -5062,7 +8325,7 @@ static void PlaceDockTab(DockTab *button, NSRect frame, bool vertical)
     [other updateCursor];
     [other setNeedsLayout:YES];
     [_document scheduleAutoSaveAfterEdit];
-    [root scheduleRustCheck];
+    [root scheduleLanguageCheck];
 }
 
 - (void)textViewDidChangeSelection:(NSNotification *)notification
@@ -5227,10 +8490,14 @@ static void PlaceDockTab(DockTab *button, NSRect frame, bool vertical)
 @class SourceWindow, SourceWindowController;
 
 @interface SourceDocument (ProjectTabs)
-- (SourceWindowController *)projectWindowController;
-- (void)setProjectWindowController:(SourceWindowController *)controller;
+- (SourceWindowController *)tabWindowController;
+- (void)setTabWindowController:(SourceWindowController *)controller;
 - (void)installEditor:(SourceWindowController *)controller;
 - (void)requestTabClose;
+- (void)splitTabRight;
+- (void)copyTabIntoWindow:(NSWindow *)window;
+- (EditorWindow *)editorView;
+- (EditorWindow *)loadEditor;
 @end
 
 @interface SourceDocument (CloseReview)
@@ -5355,10 +8622,24 @@ void ReviewDocumentsForClosing(NSArray<SourceDocument *> *documents, CloseReview
 - (BOOL)revealFolderSearchMatch:(NSRange)range pattern:(FolderSearchPattern *)pattern;
 @end
 
+struct EditorTabGroup {
+    std::vector<__weak SourceDocument *> tabs;
+    __weak SourceDocument *selected = nil;
+    __weak EditorWindow *editor = nil;
+    ProjectTabBar *bar = nil;
+    NSView *container = nil;
+};
+
+struct EditorTabLocation {
+    NSUInteger group = NSNotFound;
+    NSUInteger index = NSNotFound;
+};
+
 @interface SourceWindowController : NSWindowController <NSSplitViewDelegate>
 @property(nonatomic, readonly) NSButton *runButton;
 @property(nonatomic, readonly) FolderWorkspace *workspace;
 @property(nonatomic, readonly) BOOL windowClosed;
+@property(nonatomic, readonly) BOOL usesPaneTabs;
 @property(nonatomic, readonly) NSUInteger projectTabCount;
 @property(nonatomic, readonly) BOOL projectTabBarShown;
 - (instancetype)initWithSourceWindow:(SourceWindow *)window;
@@ -5370,19 +8651,39 @@ void ReviewDocumentsForClosing(NSArray<SourceDocument *> *documents, CloseReview
 - (void)updateWorkspace;
 - (void)restoreWorkspace:(FolderWorkspace *)workspace tabs:(NSArray<SourceDocument *> *)tabs selected:(SourceDocument *)selected;
 - (NSArray<SourceDocument *> *)projectTabs;
+- (NSArray<SourceDocument *> *)tabsInGroupOfDocument:(SourceDocument *)document;
 - (void)revealCurrentFile;
 - (void)showFolderSearchReplacing:(BOOL)replace;
+- (void)updateLanguageHoverModifiers:(NSEvent *)event;
+- (BOOL)hasDiagnostics;
+- (BOOL)viewErrorAtCursor;
+- (BOOL)editorHoverHasFocus;
 - (void)addProjectDocument:(SourceDocument *)document;
+- (void)addProjectDocument:(SourceDocument *)document inGroup:(NSUInteger)group;
 - (BOOL)replaceProjectDocument:(SourceDocument *)document withDocument:(SourceDocument *)replacement;
 - (void)removeProjectDocument:(SourceDocument *)document;
-- (void)closeProjectDocument:(SourceDocument *)document;
 - (BOOL)selectProjectDocument:(SourceDocument *)document;
 - (void)selectProjectTabAtIndex:(NSUInteger)index;
 - (void)requestCloseProjectDocument:(SourceDocument *)document;
 - (void)requestCloseEditorWindow;
 - (void)cycleProjectTabs:(NSInteger)direction;
 - (void)toggleProjectTabBar;
-- (void)detachProjectTab;
+- (void)detachProjectDocument:(SourceDocument *)document;
+- (SourceDocument *)projectDocumentAtWindowPoint:(NSPoint)point tabView:(NSView **)tabView;
+- (EditorTabLocation)tabLocation:(SourceDocument *)document;
+- (EditorTabLocation)tabInsertionAtWindowPoint:(NSPoint)point marker:(NSRect *)marker;
+- (NSUInteger)editorGroupAtWindowPoint:(NSPoint)point;
+- (NSRect)frameForEditorGroup:(NSUInteger)group;
+- (BOOL)moveProjectDocument:(SourceDocument *)document to:(EditorTabLocation)location;
+- (std::optional<DockSide>)editorDockSideAtPoint:(NSPoint)point;
+- (void)showTabDropPreview:(NSRect)rect style:(DropPreviewStyle)style;
+- (void)clearTabDropPreview;
+- (BOOL)splitWithDocument:(SourceDocument *)document atSide:(DockSide)side;
+- (void)endDocumentSplit;
+- (void)editorFocusChanged;
+- (SourceDocument *)focusedDocument;
+- (BOOL)hasDocumentSplit;
+- (BOOL)moveFocusInDocumentSplitFrom:(EditorWindow *)from key:(unichar)key;
 - (void)mergeProjectWindows;
 - (IBAction)toggleWorkspaceSidebar:(id)sender;
 @end
@@ -5392,6 +8693,21 @@ static void SyncNativeTabOutput(NSWindow *window)
     NSWindowController *controller = window.windowController;
     if ([controller isKindOfClass:SourceWindowController.class])
         [(SourceWindowController *)controller syncWindowOutput];
+}
+
+SourceDocument *FocusedEditorDocument(NSWindow *window)
+{
+    NSWindowController *controller = window.windowController;
+    if ([controller isKindOfClass:SourceWindowController.class])
+        return [(SourceWindowController *)controller focusedDocument];
+    return nil;
+}
+
+static BOOL MoveFocusInDocumentSplit(EditorWindow *from, unichar key)
+{
+    NSWindowController *controller = from.window.windowController;
+    return [controller isKindOfClass:SourceWindowController.class] &&
+        [(SourceWindowController *)controller moveFocusInDocumentSplitFrom:from key:key];
 }
 
 FolderWorkspace *WorkspaceForEditorWindow(NSWindow *window)
@@ -5415,7 +8731,7 @@ NSArray<SourceDocument *> *EditorWindowTabs(NSWindow *window)
     SourceWindowController *controller = (SourceWindowController *)window.windowController;
     if (![controller isKindOfClass:SourceWindowController.class] || controller.windowClosed)
         return nil;
-    if (controller.workspace)
+    if (controller.usesPaneTabs)
         return controller.projectTabs;
     NSMutableArray<SourceDocument *> *documents = [NSMutableArray array];
     NSArray<NSWindow *> *tabs = window.tabGroup.windows;
@@ -5430,7 +8746,7 @@ NSArray<SourceDocument *> *EditorWindowTabs(NSWindow *window)
 BOOL EditorWindowShowsTabBar(NSWindow *window)
 {
     SourceWindowController *controller = (SourceWindowController *)window.windowController;
-    return WorkspaceForEditorWindow(window) ? controller.projectTabBarShown : window.tabGroup.isTabBarVisible;
+    return controller.usesPaneTabs ? controller.projectTabBarShown : window.tabGroup.isTabBarVisible;
 }
 
 BOOL EditorWindowOutputShown(NSWindow *window)
@@ -5466,13 +8782,157 @@ static NSMutableSet<SourceWindowController *> *EmptyProjectWindows()
     return windows;
 }
 
-@interface SourceWindow : NSWindow
+enum class TabCommand {
+    Close, CloseOthers, CloseRight, CloseAll, CopyPath, CopyRelativePath, RevealInFinder, SplitRight,
+    MoveToWindow, CopyToWindow, CopyToTab, Count
+};
+
+struct TabMenuEntry {
+    NSString *title;
+    unichar key;
+    NSEventModifierFlags modifiers;
+    bool separatorBefore;
+};
+
+static const TabMenuEntry tabMenuEntries[] = {
+    {@"Close", 'w', 0, false},
+    {@"Close Others", 't', NSEventModifierFlagOption | NSEventModifierFlagShift, false},
+    {@"Close to the Right", 0, 0, false},
+    {@"Close All", 'w', NSEventModifierFlagOption, false},
+    {@"Copy Path", 'c', NSEventModifierFlagOption, true},
+    {@"Copy Relative Path", 'c', NSEventModifierFlagOption | NSEventModifierFlagShift, false},
+    {@"Reveal in Finder", 'r', NSEventModifierFlagOption, true},
+    {@"Split Right", '\\', 0, true},
+    {@"Move Into New Window", 0, 0, true},
+    {@"Copy Into New Window", 'o', NSEventModifierFlagOption, false},
+    {@"Copy Into New Tab", 0, 0, false},
+};
+static_assert(std::size(tabMenuEntries) == size_t(TabCommand::Count));
+
+static BOOL TabActionsBlocked(NSWindow *window)
+{
+    return !window || window.attachedSheet || window.tabGroup.selectedWindow.attachedSheet ||
+        activeCloseReview || NSApp.modalWindow;
+}
+
+static NSString *TabRelativePath(SourceDocument *document)
+{
+    return RelativeWorkspacePath(document.fileURL.path, document.workspace.folder.path);
+}
+
+static BOOL CanUseTabCommand(TabCommand command, SourceDocument *document, NSUInteger index, NSUInteger count)
+{
+    if (index == NSNotFound)
+        return NO;
+
+    switch (command) {
+        case TabCommand::CloseOthers: return count > 1;
+        case TabCommand::CloseRight: return index + 1 < count;
+        case TabCommand::CopyPath:
+        case TabCommand::RevealInFinder: return document.fileURL.isFileURL;
+        case TabCommand::CopyRelativePath: return TabRelativePath(document) != nil;
+        case TabCommand::MoveToWindow: {
+            SourceWindowController *host = document.tabWindowController;
+            return host ? host.workspace || host.projectTabCount > 1 : count > 1;
+        }
+        default: return YES;
+    }
+}
+
+static NSString *const editorTabDragType = @"org.retina-code.editor-tab";
+
+static NSView *NativeTabStripAtPoint(NSWindow *window, NSPoint point, NSView **button, BOOL *overControl)
+{
+    NSWindowTabGroup *group = window.tabGroup;
+    if (!group.isTabBarVisible || NSPointInRect(point, window.contentLayoutRect))
+        return nil;
+
+    for (NSView *view = [window.contentView.superview hitTest:point]; view; view = view.superview) {
+        NSString *role = view.accessibilityRole;
+        if ([role isEqualToString:NSAccessibilityTabGroupRole])
+            return view;
+        if (button && [role isEqualToString:NSAccessibilityRadioButtonRole])
+            *button = view;
+        else if (overControl && (!button || !*button) &&
+                 ([role isEqualToString:NSAccessibilityButtonRole] || [view isKindOfClass:NSButton.class]))
+            *overControl = YES;
+    }
+    return nil;
+}
+
+static SourceDocument *NativeTabAtWindowPoint(NSWindow *window, NSPoint point, NSView **tabView = nullptr)
+{
+    NSView *button = nil;
+    BOOL overControl = NO;
+    NSView *strip = NativeTabStripAtPoint(window, point, &button, &overControl);
+    if (!strip || !button)
+        return nil;
+
+    // AppKit lists its tab buttons and windows in the same order.
+    NSArray *buttons = strip.accessibilityTabs;
+    NSArray<NSWindow *> *windows = window.tabGroup.windows;
+    NSUInteger index = [buttons indexOfObjectIdenticalTo:button];
+    if (buttons.count != windows.count || index >= windows.count)
+        return nil;
+    if (tabView)
+        *tabView = overControl ? nil : button;
+    return (SourceDocument *)windows[index].windowController.document;
+}
+
+static TabInsertion NativeTabInsertionAtPoint(NSWindow *window, NSPoint point)
+{
+    NSView *strip = NativeTabStripAtPoint(window, point, nullptr, nullptr);
+    if (!strip)
+        return {};
+
+    NSArray *tabs = strip.accessibilityTabs;
+    if (tabs.count != window.tabGroup.windows.count)
+        return {};
+
+    NSRect viewport = [strip convertRect:strip.visibleRect toView:nil];
+    NSUInteger index = 0;
+    CGFloat screenX = [window convertPointToScreen:point].x;
+    CGFloat edge = NSMinX([window convertRectToScreen:viewport]);
+    for (id tab in tabs) {
+        NSRect frame = [tab accessibilityFrame];
+        if (screenX < NSMidX(frame)) {
+            edge = NSMinX(frame);
+            break;
+        }
+        edge = NSMaxX(frame);
+        ++index;
+    }
+
+    CGFloat position = [window convertPointFromScreen:NSMakePoint(edge, 0)].x;
+    return {index, TabInsertionMarker(window, viewport, position)};
+}
+
+struct TabDrop {
+    EditorTabLocation insertion;
+    std::optional<DockSide> side;
+    NSRect preview = NSZeroRect;
+    DropPreviewStyle style = DropPreviewStyle::Outline;
+};
+
+@interface SourceWindow : NSWindow <NSDraggingSource, NSDraggingDestination>
 @property(nonatomic, weak) WindowHeader *header;
 - (void)hideNativeTabBar;
 - (IBAction)closeEditorWindow:(id)sender;
 @end
 
-@implementation SourceWindow
+static NSArray<SourceDocument *> *TabMenuDocuments(SourceDocument *document)
+{
+    SourceWindowController *host = document.tabWindowController;
+    return host ? [host tabsInGroupOfDocument:document] : EditorWindowTabs(document.editorHostWindow);
+}
+
+@implementation SourceWindow {
+    __weak SourceDocument *_pressedTab;
+    __weak NSView *_pressedTabView;
+    __weak SourceDocument *_draggedTab;
+    __weak NSDraggingSession *_tabDragSession;
+    NSPoint _tabPressPoint;
+}
 
 - (void)updateTabTitle
 {
@@ -5521,12 +8981,17 @@ static NSMutableSet<SourceWindowController *> *EmptyProjectWindows()
 
 - (BOOL)makeFirstResponder:(NSResponder *)responder
 {
-    if (AutoSavePreference().mode != AutoSaveMode::OnFocusChange || ![self.firstResponder isKindOfClass:CodeView.class])
-        return [super makeFirstResponder:responder];
-    SourceDocument *document = self.sourceController.document;
+    SourceWindowController *controller = self.sourceController;
+    BOOL saveOnBlur = AutoSavePreference().mode == AutoSaveMode::OnFocusChange &&
+        ([self.firstResponder isKindOfClass:CodeView.class] || controller.editorHoverHasFocus);
+    if (responder != self.firstResponder)
+        [[controller.focusedDocument editorView] rememberTabFocus];
     BOOL changed = [super makeFirstResponder:responder];
-    if (changed && ![self.firstResponder isKindOfClass:CodeView.class])
-        [document requestAutoSave:AutoSaveMode::OnFocusChange];
+    if (changed) {
+        if (saveOnBlur && !controller.editorHoverHasFocus && ![self.firstResponder isKindOfClass:CodeView.class])
+            [controller.focusedDocument requestAutoSave:AutoSaveMode::OnFocusChange];
+        [controller editorFocusChanged];
+    }
     return changed;
 }
 
@@ -5534,7 +8999,7 @@ static NSMutableSet<SourceWindowController *> *EmptyProjectWindows()
 {
     (void)sender;
     SourceWindowController *controller = self.sourceController;
-    SourceDocument *document = controller.document;
+    SourceDocument *document = controller.focusedDocument;
     if (document)
         [document requestTabClose];
     else
@@ -5549,7 +9014,7 @@ static NSMutableSet<SourceWindowController *> *EmptyProjectWindows()
 
 - (IBAction)selectNextTab:(id)sender
 {
-    if (self.sourceController.workspace)
+    if (self.sourceController.usesPaneTabs)
         [self.sourceController cycleProjectTabs:1];
     else
         [super selectNextTab:sender];
@@ -5557,7 +9022,7 @@ static NSMutableSet<SourceWindowController *> *EmptyProjectWindows()
 
 - (IBAction)selectPreviousTab:(id)sender
 {
-    if (self.sourceController.workspace)
+    if (self.sourceController.usesPaneTabs)
         [self.sourceController cycleProjectTabs:-1];
     else
         [super selectPreviousTab:sender];
@@ -5565,7 +9030,7 @@ static NSMutableSet<SourceWindowController *> *EmptyProjectWindows()
 
 - (IBAction)toggleTabBar:(id)sender
 {
-    if (self.sourceController.workspace)
+    if (self.sourceController.usesPaneTabs)
         [self.sourceController toggleProjectTabBar];
     else
         [super toggleTabBar:sender];
@@ -5573,18 +9038,116 @@ static NSMutableSet<SourceWindowController *> *EmptyProjectWindows()
 
 - (IBAction)moveTabToNewWindow:(id)sender
 {
-    if (self.sourceController.workspace)
-        [self.sourceController detachProjectTab];
+    if (self.sourceController.usesPaneTabs)
+        [self.sourceController detachProjectDocument:self.sourceController.document];
     else
         [super moveTabToNewWindow:sender];
 }
 
 - (IBAction)mergeAllWindows:(id)sender
 {
-    if (self.sourceController.workspace)
+    if (self.sourceController.usesPaneTabs)
         [self.sourceController mergeProjectWindows];
     else
         [super mergeAllWindows:sender];
+}
+
+- (BOOL)performTabCommand:(TabCommand)command document:(SourceDocument *)document
+{
+    NSWindow *window = document.editorHostWindow;
+    if (TabActionsBlocked(window))
+        return NO;
+
+    NSArray<SourceDocument *> *tabs = TabMenuDocuments(document);
+    NSUInteger index = tabs ? [tabs indexOfObjectIdenticalTo:document] : NSNotFound;
+    if (!CanUseTabCommand(command, document, index, tabs.count))
+        return NO;
+
+    switch (command) {
+        case TabCommand::Close:
+            [document requestTabClose];
+            break;
+        case TabCommand::CloseOthers:
+        case TabCommand::CloseRight:
+        case TabCommand::CloseAll: {
+            NSArray<SourceDocument *> *closing = tabs;
+            if (command == TabCommand::CloseOthers) {
+                NSMutableArray *others = [tabs mutableCopy];
+                [others removeObjectAtIndex:index];
+                closing = others;
+            } else if (command == TabCommand::CloseRight) {
+                closing = [tabs subarrayWithRange:NSMakeRange(index + 1, tabs.count - index - 1)];
+            }
+
+            ReviewDocumentsForClosing(closing, ^(NSSet<SourceDocument *> *discarded) {
+                if (!discarded || ![TabMenuDocuments(document) isEqualToArray:tabs])
+                    return;
+                for (SourceDocument *tab in closing)
+                    [tab close];
+            });
+            break;
+        }
+        case TabCommand::CopyPath:
+        case TabCommand::CopyRelativePath: {
+            NSString *path = command == TabCommand::CopyPath ? document.fileURL.path : TabRelativePath(document);
+            NSPasteboard *board = NSPasteboard.generalPasteboard;
+            [board clearContents];
+            [board setString:path forType:NSPasteboardTypeString];
+            break;
+        }
+        case TabCommand::RevealInFinder:
+            [NSWorkspace.sharedWorkspace activateFileViewerSelectingURLs:@[document.fileURL]];
+            break;
+        case TabCommand::SplitRight:
+            [document splitTabRight];
+            break;
+        case TabCommand::MoveToWindow:
+            if (document.tabWindowController)
+                [document.tabWindowController detachProjectDocument:document];
+            else
+                [(SourceWindow *)window moveTabToNewWindow:nil];
+            break;
+        case TabCommand::CopyToWindow:
+        case TabCommand::CopyToTab:
+            [document copyTabIntoWindow:command == TabCommand::CopyToTab ? window : nil];
+            break;
+        case TabCommand::Count:
+            return NO;
+    }
+    return YES;
+}
+
+- (IBAction)tabMenuCommand:(NSMenuItem *)item
+{
+    [self performTabCommand:TabCommand(item.tag) document:item.representedObject];
+}
+
+- (NSMenu *)contextMenuForTab:(SourceDocument *)document
+{
+    NSArray<SourceDocument *> *tabs = TabMenuDocuments(document);
+    if (!tabs)
+        return nil;
+
+    NSUInteger index = [tabs indexOfObjectIdenticalTo:document];
+    if (index == NSNotFound)
+        return nil;
+
+    NSMenu *menu = [[NSMenu alloc] init];
+    menu.autoenablesItems = NO;
+    for (NSUInteger i = 0; i < std::size(tabMenuEntries); ++i) {
+        const auto &entry = tabMenuEntries[i];
+        if (entry.separatorBefore)
+            [menu addItem:NSMenuItem.separatorItem];
+
+        NSString *key = entry.key ? [NSString stringWithCharacters:&entry.key length:1] : @"";
+        NSMenuItem *item = [menu addItemWithTitle:entry.title action:@selector(tabMenuCommand:) keyEquivalent:key];
+        item.keyEquivalentModifierMask = NSEventModifierFlagCommand | entry.modifiers;
+        item.tag = i;
+        item.target = self;
+        item.representedObject = document;
+        item.enabled = CanUseTabCommand(TabCommand(i), document, index, tabs.count);
+    }
+    return menu;
 }
 
 - (BOOL)performKeyEquivalent:(NSEvent *)event
@@ -5595,9 +9158,20 @@ static NSMutableSet<SourceWindowController *> *EmptyProjectWindows()
     NSString *characters = event.charactersIgnoringModifiers;
     unichar key = characters.length == 1 ? [characters characterAtIndex:0] : 0;
     SourceWindowController *controller = self.sourceController;
+    if (key && (modifiers & NSEventModifierFlagCommand) && controller.focusedDocument) {
+        unichar lower = key >= 'A' && key <= 'Z' ? key + ('a' - 'A') : key;
+        // Cmd+W is already handled by the File menu.
+        for (NSUInteger i = 1; i < std::size(tabMenuEntries); ++i) {
+            const auto &entry = tabMenuEntries[i];
+            if (lower == entry.key && modifiers == (NSEventModifierFlagCommand | entry.modifiers) &&
+                [self performTabCommand:TabCommand(i) document:controller.focusedDocument])
+                return YES;
+        }
+    }
+
     if (modifiers == NSEventModifierFlagCommand && key >= '1' && key <= '9' && !self.attachedSheet) {
         NSUInteger index = key - '1';
-        if (controller.workspace) {
+        if (controller.usesPaneTabs) {
             [controller selectProjectTabAtIndex:index];
         } else {
             NSWindowTabGroup *group = self.tabGroup;
@@ -5616,9 +9190,286 @@ static NSMutableSet<SourceWindowController *> *EmptyProjectWindows()
     return [super performKeyEquivalent:event];
 }
 
+- (SourceDocument *)tabAtPoint:(NSPoint)point view:(NSView **)view
+{
+    SourceWindowController *controller = self.sourceController;
+    return controller.usesPaneTabs ? [controller projectDocumentAtWindowPoint:point tabView:view] :
+        NativeTabAtWindowPoint(self, point, view);
+}
+
+- (void)beginDraggingTab:(SourceDocument *)document view:(NSView *)tab event:(NSEvent *)event
+{
+    NSRect bounds = tab.bounds;
+    NSBitmapImageRep *bitmap = [tab bitmapImageRepForCachingDisplayInRect:bounds];
+    if (!bitmap)
+        return;
+
+    [tab cacheDisplayInRect:bounds toBitmapImageRep:bitmap];
+    NSImage *snapshot = [[NSImage alloc] initWithSize:bounds.size];
+    [snapshot addRepresentation:bitmap];
+    NSImage *ghost = [NSImage imageWithSize:bounds.size flipped:NO drawingHandler:^BOOL(NSRect rect) {
+        [[NSColor.controlBackgroundColor colorWithAlphaComponent:0.72] setFill];
+        NSRectFillUsingOperation(rect, NSCompositingOperationSourceOver);
+        [snapshot drawInRect:rect fromRect:NSZeroRect operation:NSCompositingOperationSourceOver fraction:0.60];
+        return YES;
+    }];
+
+    NSPasteboardItem *marker = [[NSPasteboardItem alloc] init];
+    [marker setString:@"tab" forType:editorTabDragType];
+    NSDraggingItem *item = [[NSDraggingItem alloc] initWithPasteboardWriter:marker];
+    NSView *content = self.contentView;
+    [item setDraggingFrame:[tab convertRect:bounds toView:content] contents:ghost];
+    _draggedTab = document;
+    NSDraggingSession *session = [content beginDraggingSessionWithItems:@[item] event:event source:self];
+    session.animatesToStartingPositionsOnCancelOrFail = YES;
+    _tabDragSession = session;
+}
+
+- (BOOL)trackTabEvent:(NSEvent *)event
+{
+    if (event.type == NSEventTypeLeftMouseDown && !TabActionsBlocked(self)) {
+        NSView *tabView = nil;
+        SourceDocument *document = [self tabAtPoint:event.locationInWindow view:&tabView];
+        if (tabView && document) {
+            _pressedTab = document;
+            _pressedTabView = tabView;
+            _tabPressPoint = event.locationInWindow;
+            return YES;
+        }
+    }
+
+    SourceDocument *document = _pressedTab;
+    if (!document)
+        return NO;
+    if (event.type == NSEventTypeLeftMouseDragged) {
+        NSPoint point = event.locationInWindow;
+        if (std::hypot(point.x - _tabPressPoint.x, point.y - _tabPressPoint.y) >= 5) {
+            NSView *tab = _pressedTabView;
+            _pressedTab = nil;
+            _pressedTabView = nil;
+            if (tab.window == self && !TabActionsBlocked(self))
+                [self beginDraggingTab:document view:tab event:event];
+        }
+        return YES;
+    }
+    if (event.type == NSEventTypeLeftMouseUp ||
+        (event.type == NSEventTypeKeyDown && event.keyCode == 53)) {
+        _pressedTab = nil;
+        _pressedTabView = nil;
+        if (event.type == NSEventTypeLeftMouseUp && [self tabAtPoint:event.locationInWindow view:nullptr] == document)
+            [document showWindows];
+        return YES;
+    }
+    return NO;
+}
+
+- (NSDragOperation)draggingSession:(NSDraggingSession *)session sourceOperationMaskForDraggingContext:(NSDraggingContext)context
+{
+    (void)session;
+    return context == NSDraggingContextWithinApplication ? NSDragOperationMove : NSDragOperationNone;
+}
+
+- (BOOL)ignoreModifierKeysForDraggingSession:(NSDraggingSession *)session
+{
+    (void)session;
+    return YES;
+}
+
+- (void)draggingSession:(NSDraggingSession *)session endedAtPoint:(NSPoint)point operation:(NSDragOperation)operation
+{
+    (void)session;
+    (void)point;
+    (void)operation;
+    _draggedTab = nil;
+    _tabDragSession = nil;
+    [self.sourceController clearTabDropPreview];
+}
+
+- (SourceDocument *)tabFromDrag:(id<NSDraggingInfo>)info
+{
+    if (TabActionsBlocked(self) || ![info.draggingSource isKindOfClass:SourceWindow.class])
+        return nil;
+    SourceWindow *source = info.draggingSource;
+    SourceDocument *document = source->_draggedTab;
+    if (!document || document.workspace != self.sourceController.workspace || TabActionsBlocked(document.editorHostWindow))
+        return nil;
+    return document;
+}
+
+- (TabDrop)tabDropAtPoint:(NSPoint)point document:(SourceDocument *)document
+{
+    TabDrop drop;
+    SourceWindowController *controller = self.sourceController;
+    if (controller.usesPaneTabs) {
+        drop.insertion = [controller tabInsertionAtWindowPoint:point marker:&drop.preview];
+        if (drop.insertion.group != NSNotFound) {
+            drop.style = DropPreviewStyle::Insertion;
+            return drop;
+        }
+
+        if (controller.hasDocumentSplit) {
+            NSUInteger group = [controller editorGroupAtWindowPoint:point];
+            if (group != NSNotFound && group != [controller tabLocation:document].group) {
+                drop.insertion = {group, NSNotFound};
+                drop.preview = [controller frameForEditorGroup:group];
+            }
+            return drop;
+        }
+    } else {
+        TabInsertion insertion = NativeTabInsertionAtPoint(self, point);
+        if (insertion.index != NSNotFound) {
+            drop.insertion = {0, insertion.index};
+            drop.preview = insertion.marker;
+            drop.style = DropPreviewStyle::Insertion;
+            return drop;
+        }
+    }
+
+    NSWindow *source = document.editorHostWindow;
+    BOOL sameWindow = source == self || (source.tabGroup && source.tabGroup == self.tabGroup);
+    NSUInteger count = controller.usesPaneTabs ? controller.projectTabCount : self.tabGroup.windows.count;
+    if (!sameWindow || count > 1) {
+        drop.side = [controller editorDockSideAtPoint:point];
+        if (drop.side)
+            drop.preview = SplitDockRect([controller frameForEditorGroup:0], *drop.side);
+    }
+    return drop;
+}
+
+- (NSDragOperation)draggingEntered:(id<NSDraggingInfo>)info
+{
+    return [self draggingUpdated:info];
+}
+
+- (NSDragOperation)draggingUpdated:(id<NSDraggingInfo>)info
+{
+    SourceDocument *document = [self tabFromDrag:info];
+    TabDrop drop = document ? [self tabDropAtPoint:info.draggingLocation document:document] : TabDrop{};
+    [self.sourceController showTabDropPreview:drop.preview style:drop.style];
+    return drop.side || drop.insertion.group != NSNotFound ? NSDragOperationMove : NSDragOperationNone;
+}
+
+- (void)draggingExited:(id<NSDraggingInfo>)info
+{
+    (void)info;
+    [self.sourceController clearTabDropPreview];
+}
+
+- (void)draggingEnded:(id<NSDraggingInfo>)info
+{
+    [self draggingExited:info];
+}
+
+- (BOOL)prepareForDragOperation:(id<NSDraggingInfo>)info
+{
+    return [self draggingUpdated:info] == NSDragOperationMove;
+}
+
+- (BOOL)performDragOperation:(id<NSDraggingInfo>)info
+{
+    [self draggingExited:info];
+    SourceDocument *document = [self tabFromDrag:info];
+    return document && [self dropTab:document atPoint:info.draggingLocation];
+}
+
+- (BOOL)dropTab:(SourceDocument *)document atPoint:(NSPoint)point
+{
+    SourceWindowController *controller = self.sourceController;
+    if (TabActionsBlocked(self) || document.workspace != controller.workspace)
+        return NO;
+
+    TabDrop drop = [self tabDropAtPoint:point document:document];
+    if (!drop.side && drop.insertion.group == NSNotFound)
+        return NO;
+
+    NSArray<SourceDocument *> *tabs = EditorWindowTabs(self);
+    NSUInteger previous = tabs ? [tabs indexOfObjectIdenticalTo:document] : NSNotFound;
+    if (previous == NSNotFound && ![document joinNavigationTabInWindow:self])
+        return NO;
+
+    if (drop.side)
+        return [controller splitWithDocument:document atSide:*drop.side];
+    if (controller.usesPaneTabs)
+        return [controller moveProjectDocument:document to:drop.insertion];
+
+    NSUInteger index = drop.insertion.index - (previous != NSNotFound && previous < drop.insertion.index);
+    if (index != previous)
+        [self.tabGroup insertWindow:document.editorHostWindow atIndex:index];
+    [document showWindows];
+    return YES;
+}
+
+- (void)sendEvent:(NSEvent *)event
+{
+    if (event.type == NSEventTypeKeyDown && event.keyCode == 53 && _draggedTab) {
+        _draggedTab = nil;
+        [self.sourceController clearTabDropPreview];
+        return;
+    }
+    if (event.type == NSEventTypeLeftMouseUp && _draggedTab) {
+        // A quick release can reach the window before AppKit enters drag tracking.
+        SourceDocument *document = _draggedTab;
+        _draggedTab = nil;
+        [self.sourceController clearTabDropPreview];
+        if ([self dropTab:document atPoint:event.locationInWindow])
+            _tabDragSession.animatesToStartingPositionsOnCancelOrFail = NO;
+        return;
+    }
+
+    BOOL contextClick = event.type == NSEventTypeRightMouseDown ||
+        (event.type == NSEventTypeLeftMouseDown && (event.modifierFlags & NSEventModifierFlagControl));
+    if (contextClick && !TabActionsBlocked(self)) {
+        NSPoint point = event.locationInWindow;
+        SourceDocument *tab = [self tabAtPoint:point view:nullptr];
+        if (tab) {
+            if (NSMenu *menu = [self contextMenuForTab:tab]) {
+                [NSMenu popUpContextMenu:menu withEvent:event forView:self.contentView];
+                return;
+            }
+        }
+    }
+
+    if (!contextClick && [self trackTabEvent:event])
+        return;
+
+    if (event.type == NSEventTypeKeyDown && !self.attachedSheet) {
+        constexpr NSEventModifierFlags modifiers = NSEventModifierFlagShift | NSEventModifierFlagControl |
+            NSEventModifierFlagOption | NSEventModifierFlagCommand;
+        if ((event.modifierFlags & modifiers) == NSEventModifierFlagOption) {
+            NSString *key = event.charactersIgnoringModifiers;
+            if (key.length == 1 && [key characterAtIndex:0] == NSF8FunctionKey && [self.sourceController viewErrorAtCursor])
+                return;
+        }
+    }
+    [super sendEvent:event];
+    if (event.type == NSEventTypeFlagsChanged)
+        [self.sourceController updateLanguageHoverModifiers:event];
+}
+
 - (IBAction)toggleExplorer:(id)sender
 {
     [self.sourceController toggleWorkspaceSidebar:sender];
+}
+
+- (IBAction)toggleDocumentOutput:(id)sender
+{
+    (void)sender;
+    [self.sourceController.windowOutput toggleDockPage:DockPage::Output];
+}
+
+- (IBAction)viewError:(id)sender
+{
+    (void)sender;
+    [self.sourceController viewErrorAtCursor];
+}
+
+- (IBAction)closeEditorSplit:(id)sender
+{
+    SourceWindowController *controller = self.sourceController;
+    if (!TabActionsBlocked(self) && controller.hasDocumentSplit)
+        [controller endDocumentSplit];
+    else
+        [controller.document closeEditorSplit:sender];
 }
 
 - (BOOL)validateMenuItem:(NSMenuItem *)item
@@ -5626,21 +9477,32 @@ static NSMutableSet<SourceWindowController *> *EmptyProjectWindows()
     SourceWindowController *controller = self.sourceController;
     FolderWorkspace *workspace = controller.workspace;
     SEL action = item.action;
+    if (action == @selector(closeEditorSplit:))
+        return !TabActionsBlocked(self) && (controller.hasDocumentSplit || [controller.document validateMenuItem:item]);
+    if (action == @selector(viewError:))
+        return !self.attachedSheet && controller.hasDiagnostics;
+    if (action == @selector(toggleDocumentOutput:)) {
+        item.state = controller.windowOutput.shown ? NSControlStateValueOn : NSControlStateValueOff;
+        return !self.attachedSheet;
+    }
     if (action == @selector(toggleExplorer:)) {
         item.title = workspace.sidebarShown ? @"Hide Sidebar" : @"Show Sidebar";
         return workspace != nil;
     }
-    if (workspace) {
+    if (controller.usesPaneTabs) {
         if (action == @selector(toggleTabBar:)) {
             item.title = controller.projectTabBarShown ? @"Hide Tab Bar" : @"Show Tab Bar";
             return controller.projectTabCount == 1;
         }
-        if (action == @selector(selectNextTab:) || action == @selector(selectPreviousTab:) ||
-            action == @selector(moveTabToNewWindow:))
+        if (action == @selector(moveTabToNewWindow:))
+            return (workspace ? controller.projectTabCount > 0 : controller.projectTabCount > 1) && !TabActionsBlocked(self);
+        if (action == @selector(selectNextTab:) || action == @selector(selectPreviousTab:))
             return controller.projectTabCount > 1 && !self.attachedSheet;
         if (action == @selector(mergeAllWindows:)) {
-            for (SourceDocument *document in workspace.documents) {
-                if (document.projectWindowController && document.projectWindowController != controller)
+            NSArray *documents = workspace ? workspace.documents : NSDocumentController.sharedDocumentController.documents;
+            for (SourceDocument *document in documents) {
+                if ([document isKindOfClass:SourceDocument.class] && document.workspace == workspace &&
+                    document.editorHostWindow && document.editorHostWindow != self)
                     return YES;
             }
             return NO;
@@ -5664,7 +9526,7 @@ static NSMutableSet<SourceWindowController *> *EmptyProjectWindows()
 }
 @end
 
-@interface WorkspaceEditorPane : NSView
+@interface WorkspaceEditorPane : NSView <NSDraggingDestination>
 - (void)setThemePreview:(const ThemeRef &)palette;
 @end
 
@@ -5673,6 +9535,13 @@ static NSMutableSet<SourceWindowController *> *EmptyProjectWindows()
 }
 
 - (BOOL)isOpaque { return YES; }
+
+- (NSDragOperation)draggingEntered:(id<NSDraggingInfo>)info { return [(SourceWindow *)self.window draggingEntered:info]; }
+- (NSDragOperation)draggingUpdated:(id<NSDraggingInfo>)info { return [(SourceWindow *)self.window draggingUpdated:info]; }
+- (void)draggingExited:(id<NSDraggingInfo>)info { [(SourceWindow *)self.window draggingExited:info]; }
+- (void)draggingEnded:(id<NSDraggingInfo>)info { [(SourceWindow *)self.window draggingEnded:info]; }
+- (BOOL)prepareForDragOperation:(id<NSDraggingInfo>)info { return [(SourceWindow *)self.window prepareForDragOperation:info]; }
+- (BOOL)performDragOperation:(id<NSDraggingInfo>)info { return [(SourceWindow *)self.window performDragOperation:info]; }
 
 - (void)setThemePreview:(const ThemeRef &)palette
 {
@@ -5712,12 +9581,18 @@ static char windowOutputKey;
 @implementation SourceWindowController {
     __weak EditorWindow *_installedEditor;
     WindowOutput *_windowOutput;
+    __weak WindowOutput *_attachedOutput;
     FolderWorkspace *_workspace;
     FolderSidebar *_sidebar;
+    NSView *_body;
     NSSplitView *_editorSplit;
     NSView *_editorPane;
-    ProjectTabBar *_projectTabs;
-    std::vector<__weak SourceDocument *> _projectDocuments;
+    EditorTabGroup _groups[2];
+    NSSplitView *_documentSplit;
+    DockDropTarget *_tabDropPreview;
+    DockSide _documentSplitSide;
+    BOOL _usesPaneTabs;
+    BOOL _updatingEditorGroups;
     BOOL _hideSingleProjectTab;
     BOOL _restoringProject;
     NSTitlebarAccessoryViewController *_sidebarAccessory;
@@ -5744,14 +9619,18 @@ static char windowOutputKey;
 
     NSRect runFrame = NSMakeRect(0, 0, 28, 24);
     NSView *runContainer = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, NSMaxX(runFrame) + 4, NSHeight(runFrame))];
-    _runButton = [[NSButton alloc] initWithFrame:runFrame];
+    _runButton = MakeTitleRunControl(runFrame, @selector(runDocument:));
     _runButton.autoresizingMask = NSViewMinXMargin | NSViewHeightSizable;
-    [_runButton setButtonType:NSButtonTypeMomentaryPushIn];
-    _runButton.bordered = NO;
-    _runButton.imagePosition = NSImageOnly;
-    _runButton.action = @selector(runDocument:);
     SetRunButton(_runButton, RunCommand::Run);
     [runContainer addSubview:_runButton];
+
+    NSButton *debugButton = MakeTitleRunControl(runFrame, nullptr);
+    debugButton.autoresizingMask = NSViewMaxXMargin | NSViewHeightSizable;
+    debugButton.target = self;
+    debugButton.tag = titleDebugButtonTag;
+    debugButton.contentTintColor = NSColor.secondaryLabelColor;
+    debugButton.hidden = YES;
+    [runContainer addSubview:debugButton];
 
     NSTitlebarAccessoryViewController *runAccessory = [[NSTitlebarAccessoryViewController alloc] init];
     runAccessory.layoutAttribute = NSLayoutAttributeRight;
@@ -5784,23 +9663,28 @@ static char windowOutputKey;
     ]];
     window.header = header;
     [header updateTitle];
+    [window registerForDraggedTypes:@[editorTabDragType]];
 
-    _editorSplit = [[ExplorerSplitView alloc] initWithFrame:
-        [content convertRect:window.contentLayoutRect fromView:nil]];
+    _body = [[NSView alloc] initWithFrame:[content convertRect:window.contentLayoutRect fromView:nil]];
+    _body.translatesAutoresizingMaskIntoConstraints = NO;
+    [content addSubview:_body];
+    [NSLayoutConstraint activateConstraints:@[
+        [_body.leadingAnchor constraintEqualToAnchor:layout.leadingAnchor],
+        [_body.trailingAnchor constraintEqualToAnchor:layout.trailingAnchor],
+        [_body.topAnchor constraintEqualToAnchor:layout.topAnchor],
+        [_body.bottomAnchor constraintEqualToAnchor:layout.bottomAnchor]
+    ]];
+
+    _editorSplit = [[ExplorerSplitView alloc] initWithFrame:_body.bounds];
+    _editorSplit.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     _editorSplit.vertical = YES;
     _editorSplit.dividerStyle = NSSplitViewDividerStyleThin;
     _editorSplit.delegate = self;
     _editorPane = [[WorkspaceEditorPane alloc] initWithFrame:_editorSplit.bounds];
     _editorPane.clipsToBounds = YES;
+    [_editorPane registerForDraggedTypes:@[editorTabDragType]];
     [_editorSplit addArrangedSubview:_editorPane];
-    _editorSplit.translatesAutoresizingMaskIntoConstraints = NO;
-    [content addSubview:_editorSplit];
-    [NSLayoutConstraint activateConstraints:@[
-        [_editorSplit.leadingAnchor constraintEqualToAnchor:layout.leadingAnchor],
-        [_editorSplit.trailingAnchor constraintEqualToAnchor:layout.trailingAnchor],
-        [_editorSplit.topAnchor constraintEqualToAnchor:layout.topAnchor],
-        [_editorSplit.bottomAnchor constraintEqualToAnchor:layout.bottomAnchor]
-    ]];
+    [_body addSubview:_editorSplit];
     [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(workspaceWindowActivated:)
                                                name:NSWindowDidBecomeKeyNotification object:window];
     [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(editorWindowResignedKey:)
@@ -5820,7 +9704,7 @@ static char windowOutputKey;
 {
     (void)notification;
     _windowClosed = YES;
-    if (_workspace || self.window.tabGroup.windows.count <= 1)
+    if (_usesPaneTabs || self.window.tabGroup.windows.count <= 1)
         [[self windowOutput] stopDebug];
     [EmptyProjectWindows() removeObject:self];
 }
@@ -5828,7 +9712,7 @@ static char windowOutputKey;
 - (void)editorPreferencesChanged:(NSNotification *)notification
 {
     (void)notification;
-    if (!_installedEditor)
+    if (!self.primaryEditor)
         _editorPane.needsDisplay = YES;
 }
 
@@ -5850,9 +9734,10 @@ static char windowOutputKey;
     if (_windowClosed || nextWindow == window || nextWindow.sheetParent == window ||
         (mode != AutoSaveMode::OnFocusChange && mode != AutoSaveMode::OnWindowChange))
         return;
-    if (_workspace) {
-        for (SourceDocument *document : _projectDocuments)
-            [document requestAutoSave:mode];
+    if (_usesPaneTabs) {
+        for (const auto &group : _groups)
+            for (SourceDocument *document : group.tabs)
+                [document requestAutoSave:mode];
     } else {
         NSArray<NSWindow *> *tabs = window.tabGroup.windows;
         if (nextWindow && [tabs containsObject:nextWindow]) {
@@ -5869,9 +9754,10 @@ static char windowOutputKey;
 - (void)editorWindowEndedSheet:(NSNotification *)notification
 {
     (void)notification;
-    if (_workspace) {
-        for (SourceDocument *document : _projectDocuments)
-            [document resumePendingAutoSave];
+    if (_usesPaneTabs) {
+        for (const auto &group : _groups)
+            for (SourceDocument *document : group.tabs)
+                [document resumePendingAutoSave];
     } else {
         [(SourceDocument *)self.document resumePendingAutoSave];
     }
@@ -5882,10 +9768,12 @@ static char windowOutputKey;
     if (_installedEditor != editor) {
         [_installedEditor rememberTabFocus];
         _installedEditor.runButton = nil;
-        [_installedEditor detachWindowOutput];
+        [_installedEditor setWindowOutput:nil];
         [_installedEditor removeFromSuperview];
-        [_editorPane addSubview:editor];
     }
+    if (!_documentSplit && editor.superview != _editorPane)
+        [_editorPane addSubview:editor];
+
     editor.translatesAutoresizingMaskIntoConstraints = YES;
     editor.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     self.window.initialFirstResponder = editor.tabFocus;
@@ -5896,86 +9784,306 @@ static char windowOutputKey;
 - (WindowOutput *)windowOutput
 {
     // AppKit gives each native tab its own NSWindow, with one tab group for the window on screen.
-    NSWindowTabGroup *group = _workspace ? nil : self.window.tabGroup;
+    NSWindowTabGroup *group = _usesPaneTabs ? nil : self.window.tabGroup;
     if (!group) {
         if (!_windowOutput)
-            _windowOutput = [[WindowOutput alloc] init];
+            _windowOutput = [[WindowOutput alloc] initWithFrame:NSZeroRect];
         return _windowOutput;
     }
     WindowOutput *output = objc_getAssociatedObject(group, &windowOutputKey);
     if (!output) {
-        output = _windowOutput ? _windowOutput : [[WindowOutput alloc] init];
+        output = _windowOutput ? _windowOutput : [[WindowOutput alloc] initWithFrame:NSZeroRect];
         objc_setAssociatedObject(group, &windowOutputKey, output, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         [output observeTabGroup:group];
-        _windowOutput = nil;
     }
+    _windowOutput = nil;
     return output;
 }
 
 - (void)syncWindowOutput
 {
-    NSWindow *selected = _workspace ? nil : self.window.tabGroup.selectedWindow;
-    [_installedEditor setWindowOutput:self.windowOutput attach:!selected || selected == self.window];
+    if (_windowClosed)
+        return;
+
+    WindowOutput *output = self.windowOutput;
+    WindowOutput *mounted = _attachedOutput;
+    if (mounted != output && mounted.superview == _body) {
+        mounted.host = nil;
+        [mounted removeFromSuperview];
+        _attachedOutput = nil;
+    }
+
+    EditorWindow *primary = self.primaryEditor;
+    EditorWindow *secondary = _groups[1].editor;
+    [primary setWindowOutput:output];
+    [secondary setWindowOutput:output];
+    NSWindow *selected = _usesPaneTabs ? nil : self.window.tabGroup.selectedWindow;
+    if (selected && selected != self.window)
+        return;
+
+    _attachedOutput = output;
+    [output attachTo:_body editors:_editorSplit];
+    EditorWindow *active = [self.focusedDocument editorView];
+    output.otherEditor = active == primary ? secondary : primary;
+    if (output.host != active) {
+        output.host = active;
+        [active refreshLanguageServices];
+        [active updateLanguageDiagnostics];
+    }
+    [active resumeLanguageCheck];
     [self workspaceRunChanged:nil];
 }
 
 - (void)restoreOutputShown:(BOOL)shown
 {
     [self syncWindowOutput];
-    if (_installedEditor)
-        [_installedEditor showOutput:shown];
-    else
-        self.windowOutput.shown = shown;
+    self.windowOutput.shown = shown;
 }
 
 - (NSView *)commandPaletteHost
 {
-    return _installedEditor ? _installedEditor : _editorPane;
+    EditorWindow *editor = [self.focusedDocument editorView];
+    return editor ? editor : _editorPane;
 }
 
-- (NSUInteger)projectTabCount { return _projectDocuments.size(); }
+- (void)updateLanguageHoverModifiers:(NSEvent *)event
+{
+    [self.primaryEditor updateLanguageHoverModifiers:event];
+    [_groups[1].editor updateLanguageHoverModifiers:event];
+}
+
+- (BOOL)hasDiagnostics { return [self.focusedDocument editorView].hasDiagnostics; }
+- (BOOL)viewErrorAtCursor { return [[self.focusedDocument editorView] viewErrorAtCursor]; }
+- (BOOL)editorHoverHasFocus { return [self.focusedDocument editorView].activeEditor.hoverHasFocus; }
+
+- (BOOL)usesPaneTabs { return _usesPaneTabs; }
+- (BOOL)hasDocumentSplit { return _documentSplit != nil; }
+- (SourceDocument *)focusedDocument { return self.document; }
+
+- (NSUInteger)projectTabCount
+{
+    return _groups[0].tabs.size() + _groups[1].tabs.size();
+}
+
+- (EditorTabLocation)tabLocation:(SourceDocument *)document
+{
+    for (NSUInteger group = 0; group < std::size(_groups); ++group) {
+        const auto &tabs = _groups[group].tabs;
+        for (NSUInteger index = 0; index < tabs.size(); ++index) {
+            if (tabs[index] == document)
+                return {group, index};
+        }
+    }
+    return {};
+}
+
+static void AppendGroupTabs(NSMutableArray<SourceDocument *> *list, const EditorTabGroup &group)
+{
+    for (SourceDocument *document : group.tabs) {
+        if (document)
+            [list addObject:document];
+    }
+}
 
 - (NSArray<SourceDocument *> *)projectTabs
 {
-    NSMutableArray<SourceDocument *> *tabs = [NSMutableArray arrayWithCapacity:_projectDocuments.size()];
-    for (SourceDocument *document : _projectDocuments) {
-        if (document)
-            [tabs addObject:document];
-    }
+    NSMutableArray<SourceDocument *> *tabs = [NSMutableArray arrayWithCapacity:self.projectTabCount];
+    BOOL secondaryFirst = _documentSplit && SplitDockFirst(_documentSplitSide);
+    AppendGroupTabs(tabs, _groups[secondaryFirst ? 1 : 0]);
+    AppendGroupTabs(tabs, _groups[secondaryFirst ? 0 : 1]);
+    return tabs;
+}
+
+- (NSArray<SourceDocument *> *)tabsInGroupOfDocument:(SourceDocument *)document
+{
+    EditorTabLocation location = [self tabLocation:document];
+    if (location.group == NSNotFound)
+        return nil;
+
+    const auto &group = _groups[location.group];
+    NSMutableArray<SourceDocument *> *tabs = [NSMutableArray arrayWithCapacity:group.tabs.size()];
+    AppendGroupTabs(tabs, group);
     return tabs;
 }
 
 - (BOOL)projectTabBarShown
 {
-    return self.projectTabCount > 1 || (self.projectTabCount && !_hideSingleProjectTab);
+    return _documentSplit || self.projectTabCount > 1 || (self.projectTabCount && !_hideSingleProjectTab);
 }
 
-- (NSUInteger)projectIndexOf:(SourceDocument *)document
+- (EditorWindow *)primaryEditor
 {
-    for (NSUInteger i = 0; i < _projectDocuments.size(); ++i) {
-        if (_projectDocuments[i] == document)
-            return i;
-    }
-    return NSNotFound;
+    return _usesPaneTabs ? _groups[0].editor : _installedEditor;
+}
+
+- (NSView *)containerForGroup:(NSUInteger)group
+{
+    return _documentSplit ? _groups[group].container : _editorPane;
 }
 
 - (void)layoutEditorPane
 {
-    NSRect body = _editorPane.bounds;
-    CGFloat height = self.projectTabBarShown ? std::min(projectTabBarHeight, NSHeight(body)) : 0;
-    _projectTabs.hidden = height == 0;
-    _projectTabs.frame = NSMakeRect(0, NSMaxY(body) - height, NSWidth(body), height);
-    body.size.height -= height;
-    _installedEditor.frame = body;
+    if (!_usesPaneTabs) {
+        _installedEditor.frame = _editorPane.bounds;
+        return;
+    }
+
+    if (_documentSplit && !NSEqualRects(_documentSplit.frame, _editorPane.bounds)) {
+        _documentSplit.frame = _editorPane.bounds;
+        [_documentSplit adjustSubviews];
+    }
+
+    NSUInteger count = _documentSplit ? 2 : 1;
+    for (NSUInteger index = 0; index < count; ++index) {
+        auto &group = _groups[index];
+        NSRect body = [self containerForGroup:index].bounds;
+        CGFloat height = self.projectTabBarShown ? std::min(projectTabBarHeight, NSHeight(body)) : 0;
+        body.size.height -= height;
+        group.bar.hidden = height == 0;
+        group.bar.frame = NSMakeRect(0, NSMaxY(body), NSWidth(body), height);
+        group.editor.frame = body;
+    }
+}
+
+- (BOOL)moveFocusInDocumentSplitFrom:(EditorWindow *)from key:(unichar)key
+{
+    if (!_documentSplit)
+        return NO;
+
+    BOOL first = from == _groups[0].editor;
+    SourceDocument *other = _groups[first ? 1 : 0].selected;
+    if (key == 'c' || key == 'q' || key == 'o') {
+        SourceDocument *keep = key == 'o' ? self.focusedDocument : other;
+        [self endDocumentSplit];
+        [self selectProjectDocument:keep];
+        return YES;
+    }
+
+    bool horizontal = key == 'h' || key == 'l';
+    bool vertical = key == 'j' || key == 'k';
+    if (horizontal || vertical) {
+        bool forward = key == 'l' || key == 'j';
+        bool toward = forward == (first != SplitDockFirst(_documentSplitSide));
+        if (DockIsSide(_documentSplitSide) == horizontal && toward)
+            [self selectProjectDocument:other];
+        return YES;
+    }
+    if (key == 'w' || key == 'W' || key == 'p')
+        return [self selectProjectDocument:other];
+    return NO;
+}
+
+- (void)activateTabDocument:(SourceDocument *)document
+{
+    SourceDocument *previous = self.document;
+    EditorWindow *editor = [document editorView];
+    if (document != previous) {
+        [previous requestAutoSave:AutoSaveMode::OnFocusChange];
+        [previous editorView].runButton = nil;
+        [document addWindowController:self];
+        [self synchronizeWindowTitleWithDocumentName];
+        self.window.documentEdited = document.isDocumentEdited;
+    }
+
+    editor.runButton = _runButton;
+    _runButton.target = document;
+    self.window.initialFirstResponder = editor.tabFocus;
+    [EmptyProjectWindows() removeObject:self];
+    [self syncWindowOutput];
+    if (document != previous) {
+        _workspace.selectedDocument = document;
+        [self revealCurrentFile];
+    }
+}
+
+- (void)editorFocusChanged
+{
+    if (_updatingEditorGroups)
+        return;
+
+    NSResponder *responder = self.window.firstResponder;
+    if (_documentSplit && [responder isKindOfClass:NSView.class]) {
+        for (const auto &group : _groups) {
+            if (group.editor && self.document != group.selected && [(NSView *)responder isDescendantOf:group.editor]) {
+                [self activateTabDocument:group.selected];
+                return;
+            }
+        }
+    }
+    [[self.focusedDocument editorView] updateEditorStatus];
+}
+
+- (NSUInteger)editorGroupAtWindowPoint:(NSPoint)point
+{
+    NSUInteger count = _documentSplit ? 2 : 1;
+    for (NSUInteger group = 0; group < count; ++group) {
+        EditorWindow *editor = _usesPaneTabs ? _groups[group].editor : _installedEditor;
+        if (editor && NSPointInRect(point, [editor convertRect:editor.bounds toView:nil]))
+            return group;
+    }
+    return NSNotFound;
+}
+
+- (NSRect)frameForEditorGroup:(NSUInteger)group
+{
+    NSView *view = [self containerForGroup:group];
+    NSRect frame = view.bounds;
+    if (!_documentSplit && _usesPaneTabs && self.projectTabBarShown)
+        frame.size.height -= std::min(projectTabBarHeight, NSHeight(frame));
+    return [view convertRect:frame toView:nil];
+}
+
+- (std::optional<DockSide>)editorDockSideAtPoint:(NSPoint)point
+{
+    EditorWindow *editor = self.primaryEditor;
+    if (!editor)
+        return {};
+    NSRect frame = [editor convertRect:editor.bounds toView:nil];
+    return NSPointInRect(point, frame) ? DockSideAtPoint(frame, point) : std::nullopt;
+}
+
+- (void)showTabDropPreview:(NSRect)rect style:(DropPreviewStyle)style
+{
+    if (NSIsEmptyRect(rect)) {
+        _tabDropPreview.hidden = YES;
+        return;
+    }
+
+    NSView *container = style == DropPreviewStyle::Insertion && !_usesPaneTabs ? self.window.contentView.superview : _editorPane;
+    if (!_tabDropPreview)
+        _tabDropPreview = [[DockDropTarget alloc] init];
+    if (_tabDropPreview.superview != container) {
+        [_tabDropPreview removeFromSuperview];
+        [container addSubview:_tabDropPreview positioned:NSWindowAbove relativeTo:nil];
+    }
+
+    NSRect frame = [container convertRect:rect fromView:nil];
+    if (_tabDropPreview.style != style || !NSEqualRects(_tabDropPreview.frame, frame)) {
+        _tabDropPreview.style = style;
+        _tabDropPreview.frame = frame;
+        _tabDropPreview.needsDisplay = YES;
+    }
+    _tabDropPreview.hidden = NO;
+}
+
+- (void)clearTabDropPreview
+{
+    [_tabDropPreview removeFromSuperview];
+    _tabDropPreview = nil;
 }
 
 - (void)refreshProjectTabs
 {
-    if (!_projectTabs) {
-        [self layoutEditorPane];
-        return;
+    NSUInteger count = _documentSplit ? 2 : 1;
+    for (NSUInteger index = 0; index < count; ++index) {
+        auto &group = _groups[index];
+        if (!group.bar)
+            continue;
+
+        NSMutableArray<SourceDocument *> *tabs = [NSMutableArray arrayWithCapacity:group.tabs.size()];
+        AppendGroupTabs(tabs, group);
+        [group.bar showDocuments:tabs selected:group.selected];
     }
-    [_projectTabs showDocuments:self.projectTabs selected:self.document];
     [self layoutEditorPane];
 }
 
@@ -5985,87 +10093,245 @@ static char windowOutputKey;
     [self refreshProjectTabs];
 }
 
+- (ProjectTabBar *)makeTabBar:(NSUInteger)index
+{
+    ProjectTabBar *bar = [[ProjectTabBar alloc] initWithFrame:NSZeroRect];
+    bar.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
+    __weak SourceWindowController *controller = self;
+    bar.selectDocument = ^(SourceDocument *document) { [controller selectProjectDocument:document]; };
+    bar.closeDocument = ^(SourceDocument *document) { [controller requestCloseProjectDocument:document]; };
+    bar.activateGroup = ^{
+        SourceWindowController *window = controller;
+        if (window)
+            [window selectProjectDocument:window->_groups[index].selected];
+    };
+    return bar;
+}
+
+- (void)presentEditorGroups:(SourceDocument *)active
+{
+    _updatingEditorGroups = YES;
+    for (auto &group : _groups) {
+        EditorWindow *previous = group.editor;
+        if (previous && previous != [group.selected editorView]) {
+            [previous rememberTabFocus];
+            previous.runButton = nil;
+            [previous setWindowOutput:nil];
+            [previous removeFromSuperview];
+            group.editor = nil;
+        }
+    }
+
+    if (!_groups[1].tabs.empty() && !_documentSplit) {
+        NSRect bounds = _editorPane.bounds;
+        _documentSplit = [[NSSplitView alloc] initWithFrame:bounds];
+        _documentSplit.dividerStyle = NSSplitViewDividerStyleThin;
+        // AppKit needs nonzero pane sizes to position the divider.
+        for (auto &group : _groups)
+            group.container = [[NSView alloc] initWithFrame:bounds];
+        [_editorPane addSubview:_documentSplit positioned:NSWindowBelow relativeTo:nil];
+        ArrangeEditorSplit(_documentSplit, _groups[0].container, _groups[1].container, _documentSplitSide, 0.5);
+    } else if (_groups[1].tabs.empty() && _documentSplit) {
+        [_documentSplit removeFromSuperview];
+        _documentSplit = nil;
+        [_groups[1].bar removeFromSuperview];
+        _groups[1].bar = nil;
+    }
+
+    NSUInteger count = _documentSplit ? 2 : 1;
+    for (NSUInteger index = 0; index < count; ++index) {
+        auto &group = _groups[index];
+        NSView *container = [self containerForGroup:index];
+        if (!group.bar)
+            group.bar = [self makeTabBar:index];
+        if (group.bar.superview != container)
+            [container addSubview:group.bar];
+
+        EditorWindow *editor = [group.selected loadEditor];
+        group.editor = editor;
+        if (editor && editor.superview != container) {
+            editor.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+            [container addSubview:editor positioned:NSWindowBelow relativeTo:group.bar];
+        }
+    }
+    if (!_documentSplit) {
+        for (auto &group : _groups)
+            group.container = nil;
+    }
+
+    [self refreshProjectTabs];
+    if (active)
+        [self activateTabDocument:active];
+    else
+        [self syncWindowOutput];
+    for (const auto &group : _groups)
+        [group.selected applySessionView:nil];
+
+    if (active)
+        [self.window makeFirstResponder:[active editorView].tabFocus];
+    _updatingEditorGroups = NO;
+    [[active editorView] updateEditorStatus];
+}
+
+- (void)manageNativeTabs
+{
+    if (_usesPaneTabs)
+        return;
+
+    NSArray<SourceDocument *> *tabs = EditorWindowTabs(self.window);
+    NSWindowTabGroup *native = self.window.tabGroup;
+    _windowOutput = self.windowOutput;
+    [_windowOutput observeTabGroup:nil];
+    if (native)
+        objc_setAssociatedObject(native, &windowOutputKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    _usesPaneTabs = YES;
+
+    for (SourceDocument *document in tabs) {
+        NSWindowController *previous = document.windowControllers.firstObject;
+        if (previous && previous != self) {
+            [[document editorView] setWindowOutput:nil];
+            [native removeWindow:previous.window];
+            [document removeWindowController:previous];
+            [previous close];
+        }
+        _groups[0].tabs.push_back(document);
+        [document setTabWindowController:self];
+    }
+
+    [((SourceWindow *)self.window) hideNativeTabBar];
+    self.window.tabbingMode = NSWindowTabbingModeDisallowed;
+    _groups[0].selected = self.document;
+    _groups[0].editor = _installedEditor;
+    _installedEditor = nil;
+}
+
+- (void)collapseEmptyGroup
+{
+    if (_groups[0].tabs.empty() && !_groups[1].tabs.empty()) {
+        _groups[0].tabs.swap(_groups[1].tabs);
+        _groups[0].selected = _groups[1].selected;
+        _groups[1].selected = nil;
+    }
+}
+
+- (void)endDocumentSplit
+{
+    if (!_documentSplit)
+        return;
+
+    SourceDocument *active = self.focusedDocument;
+    _groups[0].tabs.insert(_groups[0].tabs.end(), _groups[1].tabs.begin(), _groups[1].tabs.end());
+    _groups[1].tabs.clear();
+    _groups[0].selected = active;
+    _groups[1].selected = nil;
+    [self presentEditorGroups:active];
+}
+
+- (BOOL)splitWithDocument:(SourceDocument *)document atSide:(DockSide)side
+{
+    if (_documentSplit || !document)
+        return NO;
+
+    NSUInteger count = _usesPaneTabs ? self.projectTabCount : self.window.tabGroup.windows.count;
+    if (count < 2)
+        return NO;
+
+    [self manageNativeTabs];
+    [self.primaryEditor closeTabSplit];
+    [[document editorView] closeTabSplit];
+    _documentSplitSide = side;
+    return [self moveProjectDocument:document to:{1, 0}];
+}
+
+- (void)addProjectDocument:(SourceDocument *)document inGroup:(NSUInteger)group
+{
+    if ([self tabLocation:document].group != NSNotFound)
+        return;
+
+    _groups[group].tabs.push_back(document);
+    [document setTabWindowController:self];
+    [self refreshProjectTabs];
+}
+
 - (void)addProjectDocument:(SourceDocument *)document
 {
-    if ([self projectIndexOf:document] == NSNotFound) {
-        _projectDocuments.push_back(document);
-        [document setProjectWindowController:self];
-    }
-    [self refreshProjectTabs];
+    NSUInteger group = [self tabLocation:self.document].group;
+    [self addProjectDocument:document inGroup:group == 1 ? 1 : 0];
 }
 
 - (BOOL)selectProjectDocument:(SourceDocument *)document
 {
-    if (self.document == document)
-        return YES;
-    if (self.window.attachedSheet || [self projectIndexOf:document] == NSNotFound)
+    EditorTabLocation location = [self tabLocation:document];
+    if (location.group == NSNotFound || self.window.attachedSheet)
         return NO;
-    [self activateProjectDocument:document];
+
+    auto &group = _groups[location.group];
+    if (group.selected != document || !group.editor) {
+        group.selected = document;
+        [self presentEditorGroups:document];
+    } else {
+        [self activateTabDocument:document];
+        [self.window makeFirstResponder:group.editor.tabFocus];
+    }
     return YES;
 }
 
 - (void)selectProjectTabAtIndex:(NSUInteger)index
 {
-    if (index < _projectDocuments.size()) {
-        if (SourceDocument *document = _projectDocuments[index])
-            [self selectProjectDocument:document];
-    }
-}
-
-- (void)activateProjectDocument:(SourceDocument *)document
-{
-    [_installedEditor rememberTabFocus];
-    [(SourceDocument *)self.document requestAutoSave:AutoSaveMode::OnFocusChange];
-    [self.window makeFirstResponder:nil];
-    [document addWindowController:self];
-    [EmptyProjectWindows() removeObject:self];
-    [document installEditor:self];
-    [self synchronizeWindowTitleWithDocumentName];
-    self.window.documentEdited = document.isDocumentEdited;
-    [self.window makeFirstResponder:_installedEditor.tabFocus];
-    _workspace.selectedDocument = document;
+    NSArray<SourceDocument *> *tabs = self.projectTabs;
+    if (index < tabs.count)
+        [self selectProjectDocument:tabs[index]];
 }
 
 - (BOOL)replaceProjectDocument:(SourceDocument *)document withDocument:(SourceDocument *)replacement
 {
-    NSUInteger index = [self projectIndexOf:document];
-    if (index == NSNotFound || self.window.attachedSheet)
+    EditorTabLocation location = [self tabLocation:document];
+    if (location.group == NSNotFound || self.window.attachedSheet)
         return NO;
-    _projectDocuments[index] = replacement;
-    [document setProjectWindowController:nil];
-    [replacement setProjectWindowController:self];
+
+    _groups[location.group].tabs[location.index] = replacement;
+    [document setTabWindowController:nil];
+    [replacement setTabWindowController:self];
     return [self selectProjectDocument:replacement];
 }
 
 - (void)removeProjectDocument:(SourceDocument *)document
 {
-    NSUInteger index = [self projectIndexOf:document];
-    if (index == NSNotFound)
+    EditorTabLocation location = [self tabLocation:document];
+    if (location.group == NSNotFound)
         return;
-    _projectDocuments.erase(_projectDocuments.begin() + index);
-    [document setProjectWindowController:nil];
-    if (self.document == document && !_projectDocuments.empty()) {
-        SourceDocument *next = _projectDocuments[std::min(index, _projectDocuments.size() - 1)];
-        [self activateProjectDocument:next];
-    }
-    [self refreshProjectTabs];
-}
 
-- (void)closeProjectDocument:(SourceDocument *)document
-{
-    if (!_windowClosed && self.document == document && self.projectTabCount == 1) {
-        // An empty project window has no document to retain its controller.
-        [EmptyProjectWindows() addObject:self];
-        [document removeWindowController:self];
-        [self.window makeFirstResponder:nil];
-        self.window.initialFirstResponder = nil;
-        _installedEditor.runButton = nil;
-        [_installedEditor detachWindowOutput];
-        [_installedEditor removeFromSuperview];
-        _installedEditor = nil;
-        [self showEmptyProject];
+    auto &group = _groups[location.group];
+    group.tabs.erase(group.tabs.begin() + location.index);
+    BOOL wasSelected = group.selected == document;
+    [document setTabWindowController:nil];
+    if (!wasSelected) {
+        [self refreshProjectTabs];
+        return;
     }
-    [self removeProjectDocument:document];
+    group.selected = group.tabs.empty() ? nil : group.tabs[std::min(location.index, group.tabs.size() - 1)];
+
+    SourceDocument *active = self.document;
+    if (active == document) {
+        active = group.selected;
+        if (!active)
+            active = _groups[1 - location.group].selected;
+        if (!active) {
+            if (!_windowClosed)
+                [EmptyProjectWindows() addObject:self];
+            [document removeWindowController:self];
+        }
+    }
+
+    [self collapseEmptyGroup];
+    [self presentEditorGroups:active];
+
+    if (!active && !_windowClosed) {
+        if (_workspace)
+            [self showEmptyProject];
+        else
+            [self.window close];
+    }
 }
 
 - (void)showEmptyProject
@@ -6081,7 +10347,7 @@ static char windowOutputKey;
 
 - (void)requestCloseProjectDocument:(SourceDocument *)document
 {
-    if (self.window.attachedSheet || [self projectIndexOf:document] == NSNotFound)
+    if (self.window.attachedSheet || [self tabLocation:document].group == NSNotFound)
         return;
     [document requestTabClose];
 }
@@ -6090,55 +10356,106 @@ static char windowOutputKey;
 {
     if (_windowClosed || self.window.attachedSheet)
         return;
+
     NSArray<SourceDocument *> *documents = EditorWindowTabs(self.window);
     ReviewDocumentsForClosing(documents, ^(NSSet<SourceDocument *> *discarded) {
         if (!discarded || ![EditorWindowTabs(self.window) isEqualToArray:documents])
             return;
-        if (self->_workspace) {
-            // Close the host with its active document instead of keeping an empty project window.
-            self->_projectDocuments.clear();
+
+        if (self->_usesPaneTabs) {
             for (SourceDocument *document in documents)
-                [document setProjectWindowController:nil];
+                [document setTabWindowController:nil];
+            [(SourceDocument *)self.document removeWindowController:self];
+            [self.window close];
+        } else if (!documents.count) {
+            [self.window close];
         }
+
         for (SourceDocument *document in documents)
             [document close];
-        if (!documents.count)
-            [self.window close];
     });
 }
 
 - (void)cycleProjectTabs:(NSInteger)direction
 {
-    NSUInteger current = [self projectIndexOf:self.document], count = _projectDocuments.size();
-    if (current == NSNotFound || count < 2)
+    EditorTabLocation current = [self tabLocation:self.document];
+    if (current.group == NSNotFound)
         return;
-    NSUInteger next = (current + (direction < 0 ? count - 1 : 1)) % count;
-    [self selectProjectTabAtIndex:next];
+
+    const auto &tabs = _groups[current.group].tabs;
+    if (tabs.size() > 1) {
+        NSUInteger next = (current.index + (direction < 0 ? tabs.size() - 1 : 1)) % tabs.size();
+        [self selectProjectDocument:tabs[next]];
+    } else if (_documentSplit) {
+        [self selectProjectDocument:_groups[1 - current.group].selected];
+    }
 }
 
 - (void)toggleProjectTabBar
 {
     if (self.projectTabCount != 1)
         return;
+
     _hideSingleProjectTab = !_hideSingleProjectTab;
     [self layoutEditorPane];
 }
 
-- (void)moveProjectDocument:(SourceDocument *)document toIndex:(NSUInteger)index
+- (BOOL)moveProjectDocument:(SourceDocument *)document to:(EditorTabLocation)destination
 {
-    NSUInteger previous = [self projectIndexOf:document];
-    if (previous == NSNotFound || index >= _projectDocuments.size() || previous == index)
-        return;
-    _projectDocuments.erase(_projectDocuments.begin() + previous);
-    _projectDocuments.insert(_projectDocuments.begin() + index, document);
-    [self refreshProjectTabs];
+    EditorTabLocation source = [self tabLocation:document];
+    if (source.group == NSNotFound || destination.group >= std::size(_groups))
+        return NO;
+
+    auto &from = _groups[source.group];
+    auto &to = _groups[destination.group];
+    NSUInteger index = std::min(destination.index, to.tabs.size());
+    if (source.group == destination.group && index > source.index)
+        --index;
+
+    BOOL changedGroup = source.group != destination.group;
+    if (!changedGroup && index == source.index)
+        return [self selectProjectDocument:document];
+
+    from.tabs.erase(from.tabs.begin() + source.index);
+    to.tabs.insert(to.tabs.begin() + index, document);
+    if (changedGroup && from.selected == document)
+        from.selected = from.tabs.empty() ? nil : from.tabs[std::min(source.index, from.tabs.size() - 1)];
+
+    to.selected = document;
+    [self collapseEmptyGroup];
+    [self presentEditorGroups:document];
+    return YES;
 }
 
-- (void)detachProjectTab
+- (SourceDocument *)projectDocumentAtWindowPoint:(NSPoint)point tabView:(NSView **)tabView
 {
-    if (self.projectTabCount < 2 || self.window.attachedSheet)
+    for (const auto &group : _groups) {
+        if (SourceDocument *document = [group.bar documentAtWindowPoint:point tabView:tabView])
+            return document;
+    }
+    return nil;
+}
+
+- (EditorTabLocation)tabInsertionAtWindowPoint:(NSPoint)point marker:(NSRect *)marker
+{
+    for (NSUInteger group = 0; group < std::size(_groups); ++group) {
+        ProjectTabBar *bar = _groups[group].bar;
+        if (bar) {
+            TabInsertion insertion = [bar insertionAtWindowPoint:point];
+            if (insertion.index != NSNotFound) {
+                *marker = insertion.marker;
+                return {group, insertion.index};
+            }
+        }
+    }
+    return {};
+}
+
+- (void)detachProjectDocument:(SourceDocument *)document
+{
+    if (TabActionsBlocked(self.window) || [self tabLocation:document].group == NSNotFound)
         return;
-    SourceDocument *document = self.document;
+
     NSRect frame = self.window.frame;
     [self removeProjectDocument:document];
     [document makeWindowControllers];
@@ -6150,10 +10467,13 @@ static char windowOutputKey;
 {
     if (self.window.attachedSheet)
         return;
+
+    NSArray *documents = _workspace ? _workspace.documents : NSDocumentController.sharedDocumentController.documents;
     SourceDocument *selected = self.document;
-    for (SourceDocument *document in _workspace.documents) {
-        if (document.projectWindowController && document.projectWindowController != self &&
-            [document joinTabsInWindow:self.window] && !selected)
+    for (SourceDocument *document in documents) {
+        if ([document isKindOfClass:SourceDocument.class] && document.workspace == _workspace &&
+            document.editorHostWindow && document.editorHostWindow != self.window &&
+            [document joinNavigationTabInWindow:self.window] && !selected)
             selected = document;
     }
     if (!self.document && selected)
@@ -6181,7 +10501,6 @@ static char windowOutputKey;
 
 - (void)configureWorkspace:(FolderWorkspace *)workspace
 {
-    SourceDocument *document = self.document;
     if (workspace != _workspace) {
         NSNotificationCenter *center = NSNotificationCenter.defaultCenter;
         if (_workspace) {
@@ -6191,12 +10510,6 @@ static char windowOutputKey;
         }
         [_sidebar removeFromSuperview];
         _sidebar = nil;
-        [_projectTabs removeFromSuperview];
-        _projectTabs = nil;
-        for (SourceDocument *open : _projectDocuments)
-            [open setProjectWindowController:nil];
-        _projectDocuments.clear();
-        _hideSingleProjectTab = NO;
         _workspace = workspace;
         NSArray *accessories = self.window.titlebarAccessoryViewControllers;
         NSUInteger index = [accessories indexOfObjectIdenticalTo:_sidebarAccessory];
@@ -6205,19 +10518,9 @@ static char windowOutputKey;
                            name:FolderSidebarChanged object:_workspace];
             [center addObserver:self selector:@selector(projectDocumentsChanged:)
                            name:FolderDocumentsChanged object:_workspace];
-            [center addObserver:self selector:@selector(workspaceRunChanged:)
-                           name:FolderRunChanged object:_workspace];
-            _projectTabs = [[ProjectTabBar alloc] initWithFrame:NSZeroRect];
-            _projectTabs.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
-            [_editorPane addSubview:_projectTabs];
-            __weak SourceWindowController *controller = self;
-            _projectTabs.selectDocument = ^(SourceDocument *selected) { [controller selectProjectDocument:selected]; };
-            _projectTabs.closeDocument = ^(SourceDocument *selected) { [controller requestCloseProjectDocument:selected]; };
-            _projectTabs.moveDocument = ^(SourceDocument *moved, NSUInteger index) {
-                [controller moveProjectDocument:moved toIndex:index];
-            };
-            if (document)
-                [self addProjectDocument:document];
+            [center addObserver:self selector:@selector(workspaceRunChanged:) name:FolderRunChanged object:_workspace];
+            [self manageNativeTabs];
+            [self presentEditorGroups:self.document];
             if (index == NSNotFound)
                 [self.window addTitlebarAccessoryViewController:_sidebarAccessory];
         } else if (index != NSNotFound) {
@@ -6233,12 +10536,25 @@ static char windowOutputKey;
 - (void)workspaceRunChanged:(NSNotification *)notification
 {
     (void)notification;
-    if (_installedEditor) {
-        [_installedEditor refreshRunButton];
+    if (EditorWindow *editor = [self.focusedDocument editorView]) {
+        [editor refreshRunButton];
     } else {
         _runButton.enabled = NO;
         SetRunButton(_runButton, RunCommand::Run);
+        SetTitleDebugButton(_runButton, DebugPhase::Finished);
     }
+}
+
+- (IBAction)pauseDebugging:(id)sender
+{
+    (void)sender;
+    [[self.focusedDocument editorView] performDebugCommand:DebugCommand::Pause];
+}
+
+- (IBAction)stopDebugging:(id)sender
+{
+    (void)sender;
+    [[self.focusedDocument editorView] performDebugCommand:DebugCommand::Stop];
 }
 
 - (void)updateExplorerLayout
@@ -6251,7 +10567,7 @@ static char windowOutputKey;
             __weak SourceWindowController *controller = self;
             _sidebar.explorer.openFile = ^(NSURL *url) {
                 if (NSWindow *window = controller.window) {
-                    OpenRelatedFile(url, window, ^(NSDocument *, BOOL, NSError *error) {
+                    OpenSourceTab(url, window, ^(NSDocument *, BOOL, NSError *error) {
                         if (error)
                             [window presentError:error];
                     });
@@ -6266,22 +10582,23 @@ static char windowOutputKey;
     } else {
         NSResponder *focus = self.window.firstResponder;
         if (_sidebar && [focus isKindOfClass:NSView.class] && [(NSView *)focus isDescendantOf:_sidebar])
-            [self.window makeFirstResponder:_installedEditor.activeEditor];
+            [self.window makeFirstResponder:[self.focusedDocument editorView].activeEditor];
         [_sidebar removeFromSuperview];
     }
     _sidebarButton.accessibilityLabel = shown ? @"Hide Sidebar" : @"Show Sidebar";
     _sidebarButton.toolTip = shown ? @"Hide Sidebar (⌘B)" : @"Show Sidebar (⌘B)";
     [_editorSplit adjustSubviews];
-    if (_sidebar.superview && NSWidth(_editorSplit.bounds) >= 140) {
-        CGFloat width = std::clamp(_workspace.sidebarWidth, 140.0, [self maximumExplorerWidth]);
+    if (_sidebar.superview && NSWidth(_editorSplit.bounds) >= minimumExplorerWidth) {
+        CGFloat width = std::clamp(_workspace.sidebarWidth, minimumExplorerWidth, [self maximumExplorerWidth]);
         [_editorSplit setPosition:width ofDividerAtIndex:0];
     }
     _layingOutExplorer = NO;
+    _attachedOutput.needsLayout = YES;
 }
 
 - (void)showFolderSearchReplacing:(BOOL)replace
 {
-    CodeView *editor = _installedEditor.activeEditor;
+    CodeView *editor = [self.focusedDocument editorView].activeEditor;
     NSString *selection = nil;
     if (editor && self.window.firstResponder == editor) {
         NSRange range = [editor selectedCharacterRange];
@@ -6301,6 +10618,8 @@ static char windowOutputKey;
         return;
     FolderWorkspace *workspace = _workspace;
     if (document.workspace == workspace && document.editorHostWindow) {
+        if (![document joinNavigationTabInWindow:self.window])
+            return;
         [document showWindows];
         if (![document revealFolderSearchMatch:range pattern:pattern])
             [_sidebar refreshSearch];
@@ -6319,7 +10638,7 @@ static char windowOutputKey;
         return;
     }
     __weak SourceWindowController *controller = self;
-    OpenRelatedFile(currentFile, self.window, ^(NSDocument *opened, BOOL, NSError *error) {
+    OpenSourceTab(currentFile, self.window, ^(NSDocument *opened, BOOL, NSError *error) {
         SourceWindowController *current = controller;
         if (!current || current.windowClosed || current.workspace != workspace)
             return;
@@ -6362,7 +10681,7 @@ static char windowOutputKey;
 
 - (CGFloat)maximumExplorerWidth
 {
-    return std::clamp(NSWidth(_editorSplit.bounds) - 280, 140.0, 420.0);
+    return std::clamp(NSWidth(_editorSplit.bounds) - 280, minimumExplorerWidth, 420.0);
 }
 
 - (void)splitView:(NSSplitView *)split resizeSubviewsWithOldSize:(NSSize)oldSize
@@ -6370,7 +10689,7 @@ static char windowOutputKey;
     (void)oldSize;
     NSRect body = split.bounds;
     if (_sidebar.superview == split) {
-        CGFloat width = std::min(NSWidth(body), std::clamp(_workspace.sidebarWidth, 140.0, [self maximumExplorerWidth]));
+        CGFloat width = std::min(NSWidth(body), std::clamp(_workspace.sidebarWidth, minimumExplorerWidth, [self maximumExplorerWidth]));
         _sidebar.frame = NSMakeRect(0, 0, width, NSHeight(body));
         CGFloat start = std::min(NSWidth(body), width + split.dividerThickness);
         body.origin.x = start;
@@ -6384,7 +10703,7 @@ static char windowOutputKey;
 {
     (void)split;
     (void)index;
-    return std::max(minimum, 140.0);
+    return std::max(minimum, minimumExplorerWidth);
 }
 
 - (CGFloat)splitView:(NSSplitView *)split constrainMaxCoordinate:(CGFloat)maximum ofSubviewAt:(NSInteger)index
@@ -6607,7 +10926,7 @@ NSWindow *RestoreWorkspaceWindow(FolderWorkspace *workspace, NSArray<SourceDocum
     BOOL _closing;
     BOOL _reviewingClose;
     void (^_afterSaveForClose)(void);
-    __weak SourceWindowController *_projectWindowController;
+    __weak SourceWindowController *_tabWindowController;
 }
 
 - (BOOL)hasUTF8BOM { return _hasBOM; }
@@ -6623,6 +10942,11 @@ NSWindow *RestoreWorkspaceWindow(FolderWorkspace *workspace, NSArray<SourceDocum
 
 - (NSInteger)languageMode { return _editorWindow.languageMode; }
 - (BOOL)automaticLanguageMode { return _editorWindow.automaticLanguageMode; }
+
+- (NSArray<NSMenuItem *> *)languagePaletteCommands
+{
+    return _editorWindow ? [_editorWindow languagePaletteCommands] : @[];
+}
 
 - (IBAction)changeLanguageMode:(NSMenuItem *)sender
 {
@@ -6892,11 +11216,6 @@ NSWindow *RestoreWorkspaceWindow(FolderWorkspace *workspace, NSArray<SourceDocum
     return YES;
 }
 
-- (NSDictionary *)sessionState
-{
-    return [self sessionStateDiscardingChanges:NO];
-}
-
 - (NSDictionary *)sessionStateDiscardingChanges:(BOOL)discard
 {
     [self checkCoalescedEditsAfterAutoSave];
@@ -6957,14 +11276,23 @@ NSWindow *RestoreWorkspaceWindow(FolderWorkspace *workspace, NSArray<SourceDocum
     NSWindow *window = self.editorHostWindow;
     [window.contentView layoutSubtreeIfNeeded];
     [_editorWindow restoreSessionView:_pendingSessionView];
-    window.initialFirstResponder = _editorWindow.tabFocus;
+    if (_editorWindow.window == window && FocusedEditorDocument(window) == self)
+        window.initialFirstResponder = _editorWindow.tabFocus;
     _pendingSessionView = nil;
+}
+
+- (void)updateTabAppearance
+{
+    if (_workspace)
+        [_workspace documentChanged];
+    else
+        [_tabWindowController refreshProjectTabs];
 }
 
 - (void)markSessionDraftEdited
 {
     [super updateChangeCount:NSChangeDone];
-    [_workspace documentChanged];
+    [self updateTabAppearance];
 }
 
 - (NSData *)dataForSourceText:(NSString *)text error:(NSError **)error
@@ -6983,6 +11311,11 @@ NSWindow *RestoreWorkspaceWindow(FolderWorkspace *workspace, NSArray<SourceDocum
 
 - (BOOL)applyFolderSearchEdits:(Vim::EditBatch)batch error:(NSError **)error
 {
+    return [self applySourceEdits:std::move(batch) undoName:@"Replace in Files" error:error];
+}
+
+- (BOOL)applySourceEdits:(Vim::EditBatch)batch undoName:(NSString *)name error:(NSError **)error
+{
     NSURL *file = self.fileURL;
     NSString *failure = nil;
     if (_closing || _fileSavesInProgress || _reviewingClose || _editorWindow.hasMarkedEditorText) {
@@ -6991,7 +11324,7 @@ NSWindow *RestoreWorkspaceWindow(FolderWorkspace *workspace, NSArray<SourceDocum
         failure = @"The file is locked.";
     } else if (_editorWindow) {
         if (_editorWindow.activeEditor.editable &&
-            [_editorWindow.activeEditor applyDocumentEdits:std::move(batch) undoName:@"Replace in Files"])
+            [_editorWindow.activeEditor applyDocumentEdits:std::move(batch) undoName:name options:{}])
             return YES;
         failure = @"The document cannot be edited.";
     } else if (!_savedFileStamp.valid || ReadFileStamp(file) != _savedFileStamp || ![file isEqual:CanonicalFileURL(file)]) {
@@ -7048,7 +11381,7 @@ NSWindow *RestoreWorkspaceWindow(FolderWorkspace *workspace, NSArray<SourceDocum
     if (batch.edits.empty())
         return;
     if (_editorWindow)
-        [_editorWindow.activeEditor applyDocumentEdits:std::move(batch) undoName:@"Save Cleanup"];
+        [_editorWindow.activeEditor applyDocumentEdits:std::move(batch) undoName:@"Save Cleanup" options:{}];
     else
         _initialText = TextByApplyingEdits(self.sourceText, batch);
 }
@@ -7056,8 +11389,9 @@ NSWindow *RestoreWorkspaceWindow(FolderWorkspace *workspace, NSArray<SourceDocum
 - (BOOL)isUnusedUntitled
 {
     NSWindow *window = self.editorHostWindow;
+    SourceWindowController *controller = (SourceWindowController *)window.windowController;
     if (self.fileURL || self.isDocumentEdited || _isExample || !window || _editorWindow.isRunSource ||
-        window.attachedSheet || _editorWindow.editor.string.length ||
+        window.attachedSheet || controller.hasDocumentSplit || _editorWindow.hasSplit || _editorWindow.editor.string.length ||
         _editorWindow.activeEditor.hasMarkedText)
         return NO;
 
@@ -7066,7 +11400,7 @@ NSWindow *RestoreWorkspaceWindow(FolderWorkspace *workspace, NSArray<SourceDocum
 
 - (NSWindow *)editorHostWindow
 {
-    SourceWindowController *project = _projectWindowController;
+    SourceWindowController *project = _tabWindowController;
     return project ? project.window : self.windowControllers.firstObject.window;
 }
 
@@ -7075,11 +11409,12 @@ NSWindow *RestoreWorkspaceWindow(FolderWorkspace *workspace, NSArray<SourceDocum
     if (_reviewingClose)
         return nil;
     NSWindow *window = [super windowForSheet];
-    return window ? window : _projectWindowController.window;
+    return window ? window : _tabWindowController.window;
 }
 
-- (SourceWindowController *)projectWindowController { return _projectWindowController; }
-- (void)setProjectWindowController:(SourceWindowController *)controller { _projectWindowController = controller; }
+- (SourceWindowController *)tabWindowController { return _tabWindowController; }
+- (void)setTabWindowController:(SourceWindowController *)controller { _tabWindowController = controller; }
+- (EditorWindow *)editorView { return _editorWindow; }
 
 - (void)setWorkspace:(FolderWorkspace *)workspace
 {
@@ -7087,7 +11422,7 @@ NSWindow *RestoreWorkspaceWindow(FolderWorkspace *workspace, NSArray<SourceDocum
         return;
     if (_workspace.runningDocument == self)
         [_editorWindow stopRun];
-    [_projectWindowController removeProjectDocument:self];
+    [_tabWindowController removeProjectDocument:self];
     [_workspace removeDocument:self];
     _workspace = workspace;
     [_workspace addDocument:self];
@@ -7099,9 +11434,10 @@ NSWindow *RestoreWorkspaceWindow(FolderWorkspace *workspace, NSArray<SourceDocum
     window.tabbingMode = workspace ? NSWindowTabbingModeDisallowed : NSWindowTabbingModeAutomatic;
     window.tabbingIdentifier = workspace ? workspace.tabbingIdentifier : @"RetinaCodeDocuments";
     [(SourceWindowController *)window.windowController updateWorkspace];
+    [_editorWindow refreshLanguageServices];
 }
 
-- (void)installEditor:(SourceWindowController *)controller
+- (EditorWindow *)loadEditor
 {
     if (!_editorWindow) {
         Language language = [self inferredLanguageForText:_initialText];
@@ -7111,6 +11447,12 @@ NSWindow *RestoreWorkspaceWindow(FolderWorkspace *workspace, NSArray<SourceDocum
         [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(autoSavePreferencesChanged:)
                                                    name:AutoSavePreferencesChanged object:nil];
     }
+    return _editorWindow;
+}
+
+- (void)installEditor:(SourceWindowController *)controller
+{
+    [self loadEditor];
     controller.runButton.target = self;
     _editorWindow.runButton = controller.runButton;
     [controller installEditorView:_editorWindow];
@@ -7130,7 +11472,7 @@ NSWindow *RestoreWorkspaceWindow(FolderWorkspace *workspace, NSArray<SourceDocum
     if (![old isKindOfClass:SourceWindowController.class])
         return NO;
     SourceWindowController *controller = (SourceWindowController *)old;
-    if (document.projectWindowController == controller)
+    if (document.tabWindowController == controller)
         return [controller replaceProjectDocument:document withDocument:self];
     NSWindow *window = controller.window;
     [window makeFirstResponder:nil];
@@ -7149,12 +11491,12 @@ NSWindow *RestoreWorkspaceWindow(FolderWorkspace *workspace, NSArray<SourceDocum
     if (window.attachedSheet || ![target isKindOfClass:SourceWindowController.class] || target.windowClosed ||
         target.workspace != self.workspace)
         return NO;
-    if (_workspace) {
-        if (_projectWindowController == target)
-            return YES;
-        if (self.editorHostWindow.attachedSheet)
-            return NO;
-        [_projectWindowController removeProjectDocument:self];
+
+    if (_tabWindowController == target || self.editorHostWindow == window)
+        return YES;
+
+    [_tabWindowController removeProjectDocument:self];
+    if (target.usesPaneTabs) {
         NSWindowController *previous = self.windowControllers.firstObject;
         if (previous && previous != target) {
             [self removeWindowController:previous];
@@ -7163,18 +11505,55 @@ NSWindow *RestoreWorkspaceWindow(FolderWorkspace *workspace, NSArray<SourceDocum
         [target addProjectDocument:self];
         return YES;
     }
-    if (self.windowControllers.count)
-        return NO;
-    [self makeWindowControllers];
-    [window addTabbedWindow:self.editorHostWindow ordered:NSWindowAbove];
+
+    NSWindow *tab = self.editorHostWindow;
+    if (!tab) {
+        [self makeWindowControllers];
+        tab = self.editorHostWindow;
+    }
+    NSWindowTabGroup *previousGroup = tab.tabGroup;
+    if (previousGroup && previousGroup == window.tabGroup)
+        return YES;
+    if (previousGroup.windows.count > 1)
+        [previousGroup removeWindow:tab];
+    [window addTabbedWindow:tab ordered:NSWindowAbove];
     [target syncWindowOutput];
-    [(SourceWindowController *)self.editorHostWindow.windowController syncWindowOutput];
+    [(SourceWindowController *)tab.windowController syncWindowOutput];
     return YES;
+}
+
+- (BOOL)joinNavigationTabInWindow:(NSWindow *)window
+{
+    SourceWindowController *target = (SourceWindowController *)window.windowController;
+    if (![target isKindOfClass:SourceWindowController.class] || target.windowClosed || window.attachedSheet ||
+        window.tabGroup.selectedWindow.attachedSheet)
+        return NO;
+
+    NSWindow *previous = self.editorHostWindow;
+    if (previous == window || (previous.tabGroup && previous.tabGroup == window.tabGroup))
+        return YES;
+    if (_closing || _reviewingClose || _fileSavesInProgress || previous.attachedSheet ||
+        previous.tabGroup.selectedWindow.attachedSheet)
+        return NO;
+    if (previous) {
+        SourceWindowController *controller = (SourceWindowController *)previous.windowController;
+        WindowOutput *output = controller.windowOutput;
+        if (output.runner || output.debugging)
+            return NO;
+        if (_tabWindowController) {
+            [_tabWindowController removeProjectDocument:self];
+        } else if (target.usesPaneTabs) {
+            [self removeWindowController:controller];
+            [controller close];
+        }
+    }
+    self.workspace = target.workspace;
+    return [self joinTabsInWindow:window];
 }
 
 - (void)makeWindowControllers
 {
-    if (self.windowControllers.count || _projectWindowController)
+    if (self.windowControllers.count || _tabWindowController)
         return;
     SourceWindowController *controller = MakeSourceWindowController(_workspace);
     [self addWindowController:controller];
@@ -7183,7 +11562,7 @@ NSWindow *RestoreWorkspaceWindow(FolderWorkspace *workspace, NSArray<SourceDocum
 
 - (void)showWindows
 {
-    if (_projectWindowController && ![_projectWindowController selectProjectDocument:self])
+    if (_tabWindowController && ![_tabWindowController selectProjectDocument:self])
         return;
     self.workspace.selectedDocument = self;
     NSWindow *window = self.editorHostWindow;
@@ -7201,6 +11580,57 @@ NSWindow *RestoreWorkspaceWindow(FolderWorkspace *workspace, NSArray<SourceDocum
                            contextInfo:nullptr];
 }
 
+- (void)splitTabRight
+{
+    [self showWindows];
+    [_editorWindow splitTabAtSide:DockSide::Right];
+}
+
+- (IBAction)closeEditorSplit:(id)sender
+{
+    (void)sender;
+    if (!TabActionsBlocked(self.editorHostWindow))
+        [_editorWindow closeTabSplit];
+}
+
+- (void)copyTabIntoWindow:(NSWindow *)window
+{
+    SourceDocument *copy = [[SourceDocument alloc] init];
+    copy.fileType = self.fileType;
+    copy->_initialText = [self.sourceText copy];
+    copy->_hasBOM = _hasBOM;
+
+    NSString *name = self.displayName;
+    NSString *extension = name.pathExtension;
+    name = [[name stringByDeletingPathExtension] stringByAppendingString:@" Copy"];
+    copy.displayName = extension.length ? [name stringByAppendingPathExtension:extension] : name;
+
+    NSDictionary *view = _editorWindow ? [_editorWindow sessionView] : _pendingSessionView;
+    Language language = _editorWindow ? Language(_editorWindow.languageMode) : [self inferredLanguageForText:copy->_initialText];
+    NSNumber *automatic = SessionNumber(view[@"languageAutomatic"]);
+    if ((!automatic || automatic.boolValue) && [copy inferredLanguageForText:copy->_initialText] != language) {
+        NSMutableDictionary *overrides = view ? [view mutableCopy] : [NSMutableDictionary dictionary];
+        overrides[@"language"] = @(NSInteger(language));
+        overrides[@"languageAutomatic"] = @NO;
+        view = overrides;
+    }
+    copy->_pendingSessionView = view;
+    copy.workspace = WorkspaceForEditorWindow(window);
+
+    BOOL automaticTabbing = NSWindow.allowsAutomaticWindowTabbing;
+    NSWindow.allowsAutomaticWindowTabbing = NO;
+    [NSDocumentController.sharedDocumentController addDocument:copy];
+    SourceWindowController *host = self.tabWindowController;
+    if (host && host.window == window)
+        [host addProjectDocument:copy inGroup:[host tabLocation:self].group];
+    else if (![copy joinTabsInWindow:window])
+        [copy makeWindowControllers];
+
+    [copy markSessionDraftEdited];
+    [copy showWindows];
+    NSWindow.allowsAutomaticWindowTabbing = automaticTabbing;
+}
+
 - (void)tabDocument:(NSDocument *)document shouldClose:(BOOL)close contextInfo:(void *)context
 {
     (void)document;
@@ -7212,7 +11642,7 @@ NSWindow *RestoreWorkspaceWindow(FolderWorkspace *workspace, NSArray<SourceDocum
 - (void)shouldCloseWindowController:(NSWindowController *)controller delegate:(id)delegate
                 shouldCloseSelector:(SEL)selector contextInfo:(void *)context
 {
-    SourceWindowController *project = _projectWindowController;
+    SourceWindowController *project = _tabWindowController;
     if (!project || project != controller || !delegate || !selector) {
         [super shouldCloseWindowController:controller delegate:delegate shouldCloseSelector:selector contextInfo:context];
         return;
@@ -7231,9 +11661,10 @@ NSWindow *RestoreWorkspaceWindow(FolderWorkspace *workspace, NSArray<SourceDocum
     if (_editorWindow && ![url isEqual:before]) {
         [_editorWindow refreshDebugLocation];
         [_editorWindow refreshDetectedLanguage];
-        [_editorWindow scheduleRustCheck];
+        [_editorWindow refreshLanguageServices];
+        [_editorWindow scheduleLanguageCheck];
         [_workspace refresh];
-        [_workspace documentChanged];
+        [self updateTabAppearance];
         if (self.editorHostWindow.windowController.document == self)
             [(SourceWindowController *)self.editorHostWindow.windowController revealCurrentFile];
     }
@@ -7264,7 +11695,8 @@ NSWindow *RestoreWorkspaceWindow(FolderWorkspace *workspace, NSArray<SourceDocum
         if (!self.isDocumentEdited)
             [self updateChangeCount:NSChangeDone];
     }
-    [_editorWindow scheduleRustCheck];
+    [_editorWindow scheduleLanguageCheck];
+    [_editorWindow refreshLanguageServices];
     NSWindowController *controller = self.windowControllers.firstObject;
     [controller synchronizeWindowTitleWithDocumentName];
 }
@@ -7274,7 +11706,7 @@ NSWindow *RestoreWorkspaceWindow(FolderWorkspace *workspace, NSArray<SourceDocum
     BOOL edited = self.isDocumentEdited;
     [super updateChangeCount:change];
     if (edited != self.isDocumentEdited) {
-        [_workspace documentChanged];
+        [self updateTabAppearance];
         if (!self.isDocumentEdited)
             [self cancelAutoSave];
         else if (!_autoSaveTimer && AutoSavePreference().mode == AutoSaveMode::AfterDelay)
@@ -7295,7 +11727,7 @@ NSWindow *RestoreWorkspaceWindow(FolderWorkspace *workspace, NSArray<SourceDocum
         _explorerFileIdentifier = nil;
     }
     if (edited != self.isDocumentEdited)
-        [_workspace documentChanged];
+        [self updateTabAppearance];
 }
 
 - (IBAction)selectTheme:(NSMenuItem *)sender
@@ -7313,11 +11745,6 @@ NSWindow *RestoreWorkspaceWindow(FolderWorkspace *workspace, NSArray<SourceDocum
     [_editorWindow performDebugCommand:static_cast<DebugCommand>(sender.tag)];
 }
 
-- (IBAction)toggleDocumentOutput:(id)sender
-{
-    [_editorWindow toggleOutput:sender];
-}
-
 - (IBAction)toggleExplorer:(id)sender
 {
     (void)sender;
@@ -7329,13 +11756,24 @@ NSWindow *RestoreWorkspaceWindow(FolderWorkspace *workspace, NSArray<SourceDocum
     [_editorWindow revealRunLocation:location];
 }
 
+- (void)revealLanguagePosition:(LSPPosition)position
+{
+    CodeView *editor = _editorWindow.activeEditor;
+    NSUInteger offset = [editor.syntax languageOffset:position];
+    if (offset != NSNotFound)
+        [editor visitDefinitionAtOffset:offset];
+}
+
+- (NSUInteger)languageVersion { return _editorWindow.editor.syntax.languageDocument.version; }
+
 - (void)cancelRun { [_editorWindow stopRun]; }
 - (NSUInteger)beginBuildDiagnostics { return [_editorWindow beginBuildDiagnostics]; }
 - (NSUInteger)diagnosticVersion { return _editorWindow.editor.syntax.textVersion; }
 
-- (void)applyBuildMessages:(const std::vector<RunMessage> &)messages version:(NSUInteger)version owner:(BOOL)owner
+- (void)applyBuildMessages:(const std::vector<RunMessage> &)messages version:(NSUInteger)version
+                     owner:(BOOL)owner fromOutput:(BOOL)fromOutput
 {
-    [_editorWindow applyBuildMessages:messages version:version owner:owner];
+    [_editorWindow applyBuildMessages:messages version:version owner:owner fromOutput:fromOutput];
 }
 
 - (void)close
@@ -7345,8 +11783,9 @@ NSWindow *RestoreWorkspaceWindow(FolderWorkspace *workspace, NSArray<SourceDocum
     _closing = YES;
     [self cancelAutoSave];
     [_editorWindow stopRun];
-    [_editorWindow cancelRustCheck];
-    [_projectWindowController closeProjectDocument:self];
+    [_editorWindow cancelLanguageCheck];
+    [_editorWindow closeLanguageServices];
+    [_tabWindowController removeProjectDocument:self];
     [_workspace removeDocument:self];
     [super close];
 }
@@ -7394,10 +11833,8 @@ NSWindow *RestoreWorkspaceWindow(FolderWorkspace *workspace, NSArray<SourceDocum
         item.title = RunCommandTitle(_editorWindow.runCommand);
         return _editorWindow.canRunCommand;
     }
-    if (action == @selector(toggleDocumentOutput:)) {
-        item.state = _editorWindow.outputShown ? NSControlStateValueOn : NSControlStateValueOff;
-        return _editorWindow != nil;
-    }
+    if (action == @selector(closeEditorSplit:))
+        return _editorWindow.hasSplit && !TabActionsBlocked(self.editorHostWindow);
     if (action == @selector(toggleExplorer:)) {
         item.title = _workspace.sidebarShown ? @"Hide Sidebar" : @"Show Sidebar";
         return _workspace != nil;
@@ -7456,6 +11893,7 @@ completionHandler:(void (^)(NSError *))completion
         self->_saveCleanupChangeToken = nil;
         if (!error) {
             [self rememberSavedFile:self.fileURL];
+            [self->_editorWindow.editor.syntax.languageDocument saved];
             if (!self.isDocumentEdited)
                 [self cancelAutoSave];
         }
@@ -7582,7 +12020,7 @@ completionHandler:(void (^)(NSError *))completion
             return;
         case Action::Open:
             if (url) {
-                OpenRelatedFile(url, self.editorHostWindow, ^(NSDocument *, BOOL, NSError *error) {
+                OpenSourceTab(url, self.editorHostWindow, ^(NSDocument *, BOOL, NSError *error) {
                     if (error)
                         [self presentError:error];
                 });
@@ -7601,7 +12039,7 @@ completionHandler:(void (^)(NSError *))completion
             return;
         case Action::JumpFileMark:
             if (argument.length)
-                [VimTextView jumpToVimFileMark:[argument characterAtIndex:0] exact:force];
+                [VimTextView jumpToVimFileMark:[argument characterAtIndex:0] exact:force inWindow:self.editorHostWindow];
             return;
         case Action::SourceMappings: {
             if (!url)

@@ -7,16 +7,35 @@ namespace Vim {
 struct CursorEdit {
     Range range;
     std::u16string text;
+    Offset newStart = 0;
 };
+
+enum class EditOrder { Cursors, Server };
 
 struct EditBatch {
     std::vector<CursorEdit> edits;
-    std::vector<Offset> starts;
 
     explicit EditBatch(std::vector<CursorEdit> changes = {});
+    bool assign(std::vector<CursorEdit> changes, EditOrder order);
     Offset map(Offset position, bool after = true) const;
     const CursorEdit *find(Offset first) const;
     bool overlaps(Range range) const;
+};
+
+struct EditMap {
+    Range range{};
+    Offset inserted = 0;
+    const EditBatch *batch = nullptr;
+
+    Offset map(Offset position, bool after = true) const
+    {
+        return batch ? batch->map(position, after) : OffsetAfterEdit(position, range, inserted);
+    }
+
+    bool overlaps(Range part) const
+    {
+        return batch ? batch->overlaps(part) : range.first < part.last && part.first < range.last;
+    }
 };
 
 struct CursorRun {
@@ -32,8 +51,7 @@ using FindInText = std::optional<Match> (*)(Text, Text, Range, bool, bool, bool)
 CursorRun FeedCursors(std::span<State *> states, State &primary, const Host &host,
                       Registers &registers, Key key, Text text, bool smart,
                       ClusterInText cluster, FindInText find);
-void MoveCursorOffsets(State &state, const EditBatch &batch, bool after = true);
-void MoveCursorOffsets(State &state, Range range, Offset length);
-std::vector<Text> ClipboardLines(Text text, Offset count);
+void MoveCursorOffsets(State &state, const EditMap &edit, bool after = true);
+std::vector<Text> ClipboardParts(Text text, Offset count, const Register *clipboard = nullptr);
 
 } // namespace Vim

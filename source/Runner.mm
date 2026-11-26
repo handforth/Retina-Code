@@ -1,5 +1,5 @@
 #import "Runner.h"
-#include "Color.h"
+#include "ChildProcess.hpp"
 #import "Preferences.h"
 #import "Workspace.h"
 
@@ -10,22 +10,13 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
-#include <deque>
 #include <iterator>
-#include <memory>
+#include <optional>
 #include <mutex>
 #include <string>
-#include <unordered_set>
 
-#include <crt_externs.h>
 #include <fcntl.h>
-#include <poll.h>
-#include <signal.h>
-#include <spawn.h>
-#include <sys/wait.h>
-#include <termios.h>
 #include <unistd.h>
-#include <util.h>
 
 using Clock = std::chrono::steady_clock;
 using namespace std::chrono_literals;
@@ -36,17 +27,20 @@ static bool ExistingFile(NSURL *url)
     return [url getResourceValue:&regular forKey:NSURLIsRegularFileKey error:nil] && regular.boolValue;
 }
 
+static std::string_view FileSystemPath(NSURL *url)
+{
+    const char *path = url.fileSystemRepresentation;
+    return path ? std::string_view(path) : std::string_view{};
+}
+
 NSURL *ParentManifest(NSURL *directory, NSURL *limit, NSString *name)
 {
-    while (directory.path.length) {
-        NSURL *manifest = [directory URLByAppendingPathComponent:name];
-        if (ExistingFile(manifest))
-            return manifest;
-        if ([directory.path isEqualToString:limit.path] || [directory.path isEqualToString:@"/"])
-            break;
-        directory = directory.URLByDeletingLastPathComponent;
-    }
-    return nil;
+    std::string path;
+    const char *basename = name.fileSystemRepresentation;
+    if (!basename || !FindParentFile(path, FileSystemPath(directory), FileSystemPath(limit), basename))
+        return nil;
+
+    return [NSURL fileURLWithFileSystemRepresentation:path.c_str() isDirectory:NO relativeToURL:nil];
 }
 
 static NSURL *DotNetProject(NSURL *directory, NSURL *limit, NSString *extension)
@@ -81,15 +75,16 @@ RunProject LocateRunProject(Language language, NSURL *file, NSURL *folder)
     NSURL *directory = file ? file.URLByDeletingLastPathComponent : folder;
     NSURL *limit = folder;
 
-    if (language == Language::Rust || (language == Language::Plain && !file && folder)) {
+    bool workspaceOnly = language == Language::Plain && !file && folder;
+    if (language == Language::Rust || workspaceOnly) {
         if (NSURL *manifest = ParentManifest(directory, limit, @"Cargo.toml"))
             return {RunKind::Cargo, folder ? folder : manifest.URLByDeletingLastPathComponent, manifest};
     }
-    if (language == Language::Go && file) {
+    if (language == Language::Go || workspaceOnly) {
         if (NSURL *manifest = ParentManifest(directory, limit, @"go.mod"))
             return {RunKind::GoModule, manifest.URLByDeletingLastPathComponent, manifest};
     }
-    if (language == Language::Swift && file) {
+    if (language == Language::Swift || workspaceOnly) {
         if (NSURL *manifest = ParentManifest(directory, limit, @"Package.swift"))
             return {RunKind::SwiftPackage, manifest.URLByDeletingLastPathComponent, manifest};
     }
@@ -347,42 +342,60 @@ static NativeSources SelectNativeSources(NSURL *folder, NSURL *file, const std::
     return {{}, nil, uncertain ? uncertain : @"Open a C or C++ source file with a main() in this folder, or open a runnable script.\n"};
 }
 
-static NSString *ToolName(Language language)
+struct RunTools {
+    NSString *tool = nil;
+    NSString *suffix = nil;
+    NSString *check = nil;
+};
+
+static RunTools ToolsForRun(Language language)
 {
     switch (language) {
-        case Language::C: case Language::ObjectiveC: return @"clang";
-        case Language::Cpp: case Language::ObjectiveCpp: return @"clang++";
-        case Language::Python: return @"python3";
-        case Language::Rust: return @"rustc";
-        case Language::JavaScript: case Language::TypeScript: return @"node";
-        case Language::JSX: case Language::TSX: return @"tsx";
-        case Language::CSharp: case Language::FSharp: case Language::VisualBasic: return @"dotnet";
-        case Language::Java: return @"java";
-        case Language::Kotlin: return @"kotlinc";
-        case Language::Swift: return @"swiftc";
-        case Language::Go: return @"go";
-        case Language::Odin: return @"odin";
-        case Language::Zig: return @"zig";
-        case Language::Dart: return @"dart";
-        case Language::Ruby: return @"ruby";
-        case Language::PHP: return @"php";
-        case Language::Perl: return @"perl";
-        case Language::Lua: return @"lua";
-        case Language::Luau: return @"luau";
-        case Language::Bash: return @"bash";
-        case Language::Zsh: return @"zsh";
-        case Language::Fish: return @"fish";
-        case Language::PowerShell: return @"pwsh";
-        case Language::R: return @"Rscript";
-        case Language::Julia: return @"julia";
-        case Language::Scala: return @"scala";
-        case Language::Groovy: return @"groovy";
-        case Language::Haskell: return @"runghc";
-        case Language::Elixir: return @"elixir";
-        case Language::Clojure: return @"clojure";
-        case Language::CommonLisp: return @"sbcl";
-        default: return nil;
+    case Language::C: return {@"clang", @".c", @"clang"};
+    case Language::Cpp: return {@"clang++", @".cpp", @"clang++"};
+    case Language::Python: return {@"python3", @".py", @"python3"};
+    case Language::Rust: return {@"rustc", @".rs"};
+    case Language::JavaScript: return {@"node", @".js", @"node"};
+    case Language::TypeScript: return {@"node", @".ts"};
+    case Language::JSX: return {@"tsx", @".jsx"};
+    case Language::TSX: return {@"tsx", @".tsx"};
+    case Language::ObjectiveC: return {@"clang", @".m", @"clang"};
+    case Language::ObjectiveCpp: return {@"clang++", @".mm", @"clang++"};
+    case Language::CSharp: return {@"dotnet", @".cs"};
+    case Language::Java: return {@"java", @".java"};
+    case Language::Kotlin: return {@"kotlinc", @".kt"};
+    case Language::Swift: return {@"swiftc", @".swift", @"swiftc"};
+    case Language::Go: return {@"go", @".go", @"gofmt"};
+    case Language::Zig: return {@"zig", @".zig", @"zig"};
+    case Language::Dart: return {@"dart", @".dart"};
+    case Language::Ruby: return {@"ruby", @".rb", @"ruby"};
+    case Language::PHP: return {@"php", @".php", @"php"};
+    case Language::Perl: return {@"perl", @".pl"};
+    case Language::Lua: return {@"lua", @".lua", @"luac"};
+    case Language::Luau: return {@"luau", @".luau"};
+    case Language::Bash: return {@"bash", @".sh", @"bash"};
+    case Language::Zsh: return {@"zsh", @".zsh", @"zsh"};
+    case Language::Fish: return {@"fish", @".fish", @"fish"};
+    case Language::PowerShell: return {@"pwsh", @".ps1"};
+    case Language::R: return {@"Rscript", @".R"};
+    case Language::Julia: return {@"julia", @".jl"};
+    case Language::Scala: return {@"scala", @".scala"};
+    case Language::Groovy: return {@"groovy", @".groovy"};
+    case Language::Haskell: return {@"runghc", @".hs"};
+    case Language::FSharp: return {@"dotnet", @".fsx"};
+    case Language::Elixir: return {@"elixir", @".exs"};
+    case Language::Clojure: return {@"clojure", @".clj"};
+    case Language::VisualBasic: return {@"dotnet", nil};
+    case Language::Assembly: return {@"clang", @".s"};
+    case Language::Odin: return {@"odin", @".odin", @"odin"};
+    case Language::CommonLisp: return {@"sbcl", @".lisp"};
+    default: return {};
     }
+}
+
+static NSString *ToolName(Language language)
+{
+    return ToolsForRun(language).tool;
 }
 
 bool RunnableLanguage(Language language)
@@ -394,84 +407,76 @@ bool DebuggableLanguage(Language language, NSURL *file)
 {
     return CFamily(language) || language == Language::Rust || language == Language::Swift ||
            language == Language::Go || language == Language::Odin || language == Language::Zig ||
+           language == Language::CommonLisp || language == Language::Python ||
            (language == Language::Assembly && [file.pathExtension.lowercaseString isEqualToString:@"s"]);
 }
 
 static NSString *SourceSuffix(Language language, NSURL *file)
 {
-    NSString *ext = file.pathExtension.lowercaseString;
     switch (language) {
-        case Language::C: return @".c";
-        case Language::Cpp: return @".cpp";
-        case Language::ObjectiveC: return @".m";
-        case Language::ObjectiveCpp: return @".mm";
-        case Language::Python: return @".py";
-        case Language::Rust: return @".rs";
-        case Language::JavaScript:
-            return [@[@"mjs", @"cjs"] containsObject:ext] ? [@"." stringByAppendingString:ext] : @".js";
-        case Language::TypeScript:
-            return [@[@"mts", @"cts"] containsObject:ext] ? [@"." stringByAppendingString:ext] : @".ts";
-        case Language::JSX: return @".jsx";
-        case Language::TSX: return @".tsx";
-        case Language::CSharp: return [ext isEqualToString:@"csx"] ? @".csx" : @".cs";
-        case Language::FSharp: return @".fsx";
-        case Language::Java: return @".java";
-        case Language::Kotlin: return [ext isEqualToString:@"kts"] ? @".kts" : @".kt";
-        case Language::Swift: return @".swift";
-        case Language::Go: return @".go";
-        case Language::Odin: return @".odin";
-        case Language::Zig: return @".zig";
-        case Language::Dart: return @".dart";
-        case Language::Ruby: return @".rb";
-        case Language::PHP: return @".php";
-        case Language::Perl: return @".pl";
-        case Language::Lua: return @".lua";
-        case Language::Luau: return @".luau";
-        case Language::Bash: return @".sh";
-        case Language::Zsh: return @".zsh";
-        case Language::Fish: return @".fish";
-        case Language::PowerShell: return @".ps1";
-        case Language::R: return @".R";
-        case Language::Julia: return @".jl";
-        case Language::Scala: return [ext isEqualToString:@"sc"] ? @".sc" : @".scala";
-        case Language::Groovy: return @".groovy";
-        case Language::Haskell: return @".hs";
-        case Language::Elixir: return @".exs";
-        case Language::Clojure: return @".clj";
-        case Language::CommonLisp: return @".lisp";
-        default: return @"";
+    case Language::Assembly:
+        if ([file.pathExtension isEqualToString:@"S"])
+            return @".S";
+        break;
+    case Language::JavaScript: case Language::TypeScript: {
+        NSString *extension = file.pathExtension.lowercaseString;
+        if (language == Language::JavaScript ? [extension isEqualToString:@"mjs"] || [extension isEqualToString:@"cjs"] :
+                                              [extension isEqualToString:@"mts"] || [extension isEqualToString:@"cts"])
+            return [@"." stringByAppendingString:extension];
+        break;
     }
+    case Language::CSharp:
+        if ([file.pathExtension.lowercaseString isEqualToString:@"csx"])
+            return @".csx";
+        break;
+    case Language::Kotlin:
+        if ([file.pathExtension.lowercaseString isEqualToString:@"kts"])
+            return @".kts";
+        break;
+    case Language::Scala:
+        if ([file.pathExtension.lowercaseString isEqualToString:@"sc"])
+            return @".sc";
+        break;
+    default: break;
+    }
+
+    NSString *suffix = ToolsForRun(language).suffix;
+    return suffix ? suffix : @"";
 }
 
 static NSString *ExecutableAt(NSString *folder, NSString *name)
 {
-    if (!folder.isAbsolutePath)
+    const char *directory = folder.fileSystemRepresentation;
+    std::string path;
+    const char *basename = name.fileSystemRepresentation;
+    if (!directory || !basename || !ExecutableIn(path, directory, basename))
         return nil;
-    NSString *candidate = [folder stringByAppendingPathComponent:name];
-    BOOL directory = NO;
-    NSFileManager *files = NSFileManager.defaultManager;
-    return [files fileExistsAtPath:candidate isDirectory:&directory] && !directory &&
-        [files isExecutableFileAtPath:candidate] ? candidate : nil;
+
+    return [NSFileManager.defaultManager stringWithFileSystemRepresentation:path.data() length:path.size()];
 }
 
 NSString *FindTool(NSString *name, Language language)
 {
-    NSString *path = NSProcessInfo.processInfo.environment[@"PATH"];
-    for (NSString *folder in [path componentsSeparatedByString:@":"]) {
-        if (NSString *tool = ExecutableAt(folder, name))
-            return tool;
-    }
-    for (NSString *folder in @[@"/opt/homebrew/bin", @"/usr/local/bin", @"/usr/bin", @"/bin"]) {
-        if (NSString *tool = ExecutableAt(folder, name))
-            return tool;
-    }
+    std::string path;
+    const char *basename = name.fileSystemRepresentation;
+    if (!basename)
+        return nil;
+
+    const char *search = getenv("PATH");
+    std::string_view command = basename;
+    if (ExecutableOnPath(path, search ? search : "", command))
+        return [NSFileManager.defaultManager stringWithFileSystemRepresentation:path.data() length:path.size()];
+
     if (language == Language::Go)
         return ExecutableAt(@"/usr/local/go/bin", name);
     if (language == Language::Rust)
         return ExecutableAt([NSHomeDirectory() stringByAppendingPathComponent:@".cargo/bin"], name);
     if (language == Language::Odin) {
-        if (NSString *tool = ExecutableAt(NSProcessInfo.processInfo.environment[@"ODIN_ROOT"], name))
-            return tool;
+        if (const char *root = getenv("ODIN_ROOT")) {
+            if (ExecutableIn(path, root, command))
+                return [NSFileManager.defaultManager stringWithFileSystemRepresentation:path.data() length:path.size()];
+        }
+
         for (NSString *folder in @[@"opt/odin", @".local/bin", @"bin"]) {
             if (NSString *tool = ExecutableAt([NSHomeDirectory() stringByAppendingPathComponent:folder], name))
                 return tool;
@@ -497,6 +502,16 @@ static NSString *FindTSX(NSURL *directory, NSURL *folder)
         directory = directory.URLByDeletingLastPathComponent;
     }
     return FindTool(@"tsx", Language::TypeScript);
+}
+
+static NSString *FindPython(NSURL *folder)
+{
+    for (NSString *environment : {@".venv/bin", @"venv/bin"}) {
+        if (NSString *tool = ExecutableAt([folder.path stringByAppendingPathComponent:environment], @"python"))
+            return tool;
+    }
+
+    return nil;
 }
 
 static NSError *RunError(int code)
@@ -526,11 +541,19 @@ struct RunFiles {
 
 - (instancetype)initWithFile:(NSURL *)file directory:(NSURL *)directory
 {
+    return [self initWithFile:file directory:directory backend:DebugBackend::LLDB interpreter:nil];
+}
+
+- (instancetype)initWithFile:(NSURL *)file directory:(NSURL *)directory backend:(DebugBackend)backend interpreter:(NSString *)interpreter
+{
     self = [super init];
     if (self) {
         _file = file;
         _directory = directory;
+        _backend = backend;
+        _interpreter = interpreter;
     }
+
     return self;
 }
 
@@ -631,203 +654,23 @@ static NSString *ConsoleString(std::string_view bytes)
     return text;
 }
 
-static void AddOutputColors(std::vector<OutputColorSpan> &spans, NSRange range, OutputColors colors)
+static std::string_view UTF8View(NSString *text)
 {
-    if (!range.length || colors == OutputColors{})
-        return;
-    if (!spans.empty() && spans.back().colors == colors && NSMaxRange(spans.back().range) == range.location)
-        spans.back().range.length += range.length;
-    else
-        spans.push_back({range, colors});
+    const char *bytes = text.UTF8String;
+    return bytes ? std::string_view(bytes, [text lengthOfBytesUsingEncoding:NSUTF8StringEncoding]) : std::string_view{};
 }
 
-static std::string_view TakeColorParameter(std::string_view &parameters, char separator)
+static RunMessage DecodeConsoleString(NSString *source)
 {
-    size_t end = parameters.find(separator);
-    std::string_view parameter = parameters.substr(0, end);
-    if (end == std::string_view::npos)
-        parameters = {};
-    else
-        parameters.remove_prefix(end + 1);
-    return parameter;
+    TerminalDecoder decoder{};
+    DecodedOutput output;
+    DecodeTerminal(decoder, UTF8View(source), output);
+    RunMessage message{};
+    message.text = ConsoleString(output.text);
+    message.colorSpans = std::move(output.spans);
+    message.usesTerminalColors = decoder.sawSGR;
+    return message;
 }
-
-static int ColorParameter(std::string_view text)
-{
-    if (text.empty())
-        return -1;
-    int number = 0;
-    for (char digit : text) {
-        if (digit < '0' || digit > '9')
-            return -1;
-        number = number * 10 + (digit - '0');
-        if (number > 255)
-            return -1;
-    }
-    return number;
-}
-
-static uint32_t ExtendedOutputColor(std::string_view &parameters, char separator)
-{
-    int kind = ColorParameter(TakeColorParameter(parameters, separator));
-    if (kind == 5) {
-        int value = ColorParameter(TakeColorParameter(parameters, separator));
-        return value < 0 ? defaultOutputColor : outputPaletteStart + uint32_t(value);
-    }
-    if (kind != 2)
-        return defaultOutputColor;
-    // Colon notation can include a color space field before the RGB components.
-    if (separator == ':' && std::count(parameters.begin(), parameters.end(), ':') >= 3)
-        TakeColorParameter(parameters, separator);
-    int red = ColorParameter(TakeColorParameter(parameters, separator));
-    int green = ColorParameter(TakeColorParameter(parameters, separator));
-    int blue = ColorParameter(TakeColorParameter(parameters, separator));
-    if (red < 0 || green < 0 || blue < 0)
-        return defaultOutputColor;
-    return rgb(red, green, blue);
-}
-
-struct TerminalDecoder {
-    enum class State { Text, Escape, EscapeSuffix, CSI, ControlString, StringEscape };
-    State state = State::Text;
-    std::array<char, 64> parameters;
-    size_t parameterCount = 0;
-    OutputColors colors;
-    bool sawSGR = false;
-
-    void applySGR(std::string_view values)
-    {
-        sawSGR = true;
-        do {
-            std::string_view value = TakeColorParameter(values, ';');
-            bool colon = value.find(':') != std::string_view::npos;
-            auto mode = TakeColorParameter(value, ':');
-            int code = mode.empty() ? 0 : ColorParameter(mode);
-            if (code == 0) {
-                colors = {};
-            } else if (code == 39) {
-                colors.foreground = defaultOutputColor;
-            } else if (code == 49) {
-                colors.background = defaultOutputColor;
-            } else if (code == 38 || code == 48) {
-                uint32_t color = colon ? ExtendedOutputColor(value, ':') : ExtendedOutputColor(values, ';');
-                if (color != defaultOutputColor)
-                    (code == 38 ? colors.foreground : colors.background) = color;
-            } else if (code >= 30 && code <= 37) {
-                colors.foreground = outputPaletteStart + uint32_t(code - 30);
-            } else if (code >= 40 && code <= 47) {
-                colors.background = outputPaletteStart + uint32_t(code - 40);
-            } else if (code >= 90 && code <= 97) {
-                colors.foreground = outputPaletteStart + uint32_t(code - 82);
-            } else if (code >= 100 && code <= 107) {
-                colors.background = outputPaletteStart + uint32_t(code - 92);
-            }
-        } while (values.data()); // An empty parameter still means reset.
-    }
-
-    void readControl(unichar character)
-    {
-        switch (state) {
-            case State::Text:
-                if (character == 0x1B)
-                    state = State::Escape;
-                break;
-            case State::Escape:
-                if (character == '[') {
-                    state = State::CSI;
-                    parameterCount = 0;
-                } else if (character == ']' || character == 'P' || character == 'X' || character == '^' || character == '_') {
-                    state = State::ControlString;
-                } else if (character >= 0x20 && character <= 0x2F) {
-                    state = State::EscapeSuffix;
-                } else if (character != 0x1B) {
-                    state = State::Text;
-                }
-                break;
-            case State::EscapeSuffix:
-                if (character == 0x1B)
-                    state = State::Escape;
-                else if (character < 0x20 || character > 0x2F)
-                    state = State::Text;
-                break;
-            case State::CSI:
-                if (character == 0x1B) {
-                    state = State::Escape;
-                } else if (character >= 0x40 && character <= 0x7E) {
-                    if (character == 'm' && parameterCount <= parameters.size())
-                        applySGR({parameters.data(), parameterCount});
-                    state = State::Text;
-                } else if (parameterCount < parameters.size() &&
-                           ((character >= '0' && character <= '9') || character == ';' || character == ':')) {
-                    parameters[parameterCount++] = char(character);
-                } else {
-                    parameterCount = parameters.size() + 1;
-                }
-                break;
-            case State::ControlString:
-                if (character == '\a')
-                    state = State::Text;
-                else if (character == 0x1B)
-                    state = State::StringEscape;
-                break;
-            case State::StringEscape:
-                if (character == '\\' || character == '\a')
-                    state = State::Text;
-                else if (character != 0x1B)
-                    state = State::ControlString;
-                break;
-        }
-    }
-
-    RunMessage decode(NSString *source)
-    {
-        static NSCharacterSet *const controlCharacters = [] {
-            auto set = [NSMutableCharacterSet characterSetWithRange:NSMakeRange(0, 32)];
-            [set removeCharactersInString:@"\t\n"];
-            [set addCharactersInString:@"\u007F"];
-            return [set copy];
-        }();
-        RunMessage result{};
-        NSUInteger length = source.length;
-        NSMutableString *text = nil;
-        for (NSUInteger at = 0; at < length;) {
-            if (state == State::Text) {
-                NSRange search = NSMakeRange(at, length - at);
-                NSRange control = [source rangeOfCharacterFromSet:controlCharacters options:0 range:search];
-                NSUInteger end = control.location == NSNotFound ? length : control.location;
-                if (!at && end == length) {
-                    result.text = source;
-                    AddOutputColors(result.colorSpans, NSMakeRange(0, length), colors);
-                    break;
-                }
-                if (!text)
-                    text = [NSMutableString stringWithCapacity:length];
-                if (end > at) {
-                    AddOutputColors(result.colorSpans, NSMakeRange(text.length, end - at), colors);
-                    [text appendString:[source substringWithRange:NSMakeRange(at, end - at)]];
-                    at = end;
-                }
-                if (at == length)
-                    break;
-            }
-            unichar character = [source characterAtIndex:at++];
-            if (character == '\n') {
-                // A malformed escape must not swallow the next line of the log.
-                state = State::Text;
-                if (!text)
-                    text = [NSMutableString stringWithCapacity:length];
-                AddOutputColors(result.colorSpans, NSMakeRange(text.length, 1), colors);
-                [text appendString:@"\n"];
-            } else {
-                readControl(character);
-            }
-        }
-        if (text)
-            result.text = text;
-        result.usesTerminalColors = sawSGR;
-        return result;
-    }
-};
 
 static void ReplaceOutputText(RunMessage &message, NSRange range, NSString *replacement)
 {
@@ -842,7 +685,7 @@ static void ReplaceOutputText(RunMessage &message, NSRange range, NSString *repl
     };
     for (auto &span : message.colorSpans) {
         NSUInteger start = offset(span.range.location);
-        span.range = NSMakeRange(start, offset(NSMaxRange(span.range)) - start);
+        span.range = {uint32_t(start), uint32_t(offset(span.range.location + span.range.length) - start)};
     }
     std::erase_if(message.colorSpans, [](const OutputColorSpan &span) { return !span.range.length; });
     message.text = [message.text stringByReplacingCharactersInRange:range withString:replacement];
@@ -856,268 +699,269 @@ struct DiagnosticContext {
     bool byteColumns;
     Language language = Language::C;
     NSURL *mirror = nil;
+    bool runtimeLocations = false;
 };
 
-static OutputTone ToneForLine(NSString *line, bool stderrLine)
+static NSURL *OriginalCheckFile(NSURL *file, NSURL *mirror)
 {
-    auto starts = [&](NSString *prefix) {
-        return [line rangeOfString:prefix options:NSCaseInsensitiveSearch | NSAnchoredSearch].location != NSNotFound;
-    };
-    if (starts(@"warning:") || starts(@"warning[") ||
-        (stderrLine && [line rangeOfString:@"warning:" options:NSCaseInsensitiveSearch].location != NSNotFound) ||
-        [line hasSuffix:@" warning generated.\n"] || [line hasSuffix:@" warnings generated.\n"])
-        return OutputTone::Warning;
-    if (starts(@"note:") || starts(@"help:") || starts(@"In file included from "))
-        return OutputTone::Text;
-    return stderrLine || starts(@"error:") || starts(@"fatal error:") ? OutputTone::Error : OutputTone::Text;
+    if (PathIsInFolder(file.path, mirror.path) && file.path.length > mirror.path.length)
+        file = [NSURL fileURLWithPath:[file.path substringFromIndex:mirror.path.length]];
+    return CanonicalFileURL(file);
 }
 
-static RunMessage CompilerMessage(RunMessage message, const DiagnosticContext &context, bool stderrLine)
+static RunMessage CompilerMessage(RunMessage message, std::string_view text, const DiagnosticContext &context, bool stderrLine)
 {
-    NSString *line = message.text;
-    static NSRegularExpression *diagnostic = [NSRegularExpression regularExpressionWithPattern:
-        @"^(.+?):([0-9]+)(?::([0-9]+))?:((?:\\{[^}]*\\}:)*)[ \\t]*((?:(?:fatal|syntax) )?error|warning|note|help)(?:\\[[^\\]]*\\])?:"
-        options:NSRegularExpressionCaseInsensitive error:nil];
-    static NSRegularExpression *goDiagnostic = [NSRegularExpression regularExpressionWithPattern:
-        @"^(.+?\\.go):([0-9]+)(?::([0-9]+))?:[ \\t]*(.+)" options:0 error:nil];
-    static NSRegularExpression *dotnetDiagnostic = [NSRegularExpression regularExpressionWithPattern:
-        @"^(.+?)\\(([0-9]+),([0-9]+)(?:,[0-9]+,[0-9]+)?\\):[ \\t]*(error|warning)\\b"
-        options:NSRegularExpressionCaseInsensitive error:nil];
-    static NSRegularExpression *kotlinDiagnostic = [NSRegularExpression regularExpressionWithPattern:
-        @"^[ewi]:[ \\t]*(.+?):([0-9]+):([0-9]+)(?::)?[ \\t]+(.+)"
-        options:0 error:nil];
-    enum class Format { Standard, Go, DotNet, Kotlin };
-    Format format = Format::Standard;
-    NSRange whole = NSMakeRange(0, line.length);
-    auto match = [diagnostic firstMatchInString:line options:0 range:whole];
-    if (!match && context.language == Language::Go) {
-        format = Format::Go;
-        match = [goDiagnostic firstMatchInString:line options:0 range:whole];
-    } else if (!match && (context.language == Language::CSharp || context.language == Language::FSharp ||
-                          context.language == Language::VisualBasic)) {
-        format = Format::DotNet;
-        match = [dotnetDiagnostic firstMatchInString:line options:0 range:whole];
-    } else if (!match && context.language == Language::Kotlin) {
-        format = Format::Kotlin;
-        match = [kotlinDiagnostic firstMatchInString:line options:0 range:whole];
-    }
-    if (!match) {
-        message.tone = ToneForLine(line, stderrLine);
-        return message;
-    }
-    auto field = [&](NSUInteger index) -> NSString * {
-        NSRange range = [match rangeAtIndex:index];
-        return range.location == NSNotFound ? @"" : [line substringWithRange:range];
-    };
-    NSString *path = field(1);
-    NSString *severity = format == Format::Standard ? field(5).lowercaseString :
-        format == Format::DotNet ? field(4).lowercaseString :
-        format == Format::Kotlin && [line hasPrefix:@"w:"] ? @"warning" :
-        format == Format::Kotlin && [line hasPrefix:@"i:"] ? @"note" : @"error";
-    message.tone = [severity hasSuffix:@"error"] ? OutputTone::Error :
-                      [severity isEqualToString:@"warning"] ? OutputTone::Warning : OutputTone::Text;
-    if ([path hasPrefix:@"<"])
+    CompilerFormat format = CompilerFormat::Standard;
+    if (context.language == Language::Go)
+        format = CompilerFormat::Go;
+    else if (context.language == Language::CSharp || context.language == Language::FSharp || context.language == Language::VisualBasic)
+        format = CompilerFormat::DotNet;
+    else if (context.language == Language::Kotlin)
+        format = CompilerFormat::Kotlin;
+
+    CompilerLocation match;
+    bool runtime = context.runtimeLocations && stderrLine && ParseRuntimeLocation(text, context.language == Language::Python, match);
+    if (!runtime && !ParseCompilerLocation(text, format, match))
         return message;
 
+    if (!runtime)
+        message.tone = match.tone;
+
+    if (match.path.starts_with('<'))
+        return message;
+
+    NSString *path = ConsoleString(match.path);
     NSURL *url = [path hasPrefix:@"file://"] ? [NSURL URLWithString:path] :
         [NSURL fileURLWithPath:path isDirectory:NO relativeToURL:context.directory].URLByStandardizingPath;
     if (!url.isFileURL)
         return message;
+    if (context.mirror)
+        url = OriginalCheckFile(url, context.mirror);
+
     bool current = [url isEqual:context.input.URLByStandardizingPath] ||
                    [url.URLByResolvingSymlinksInPath isEqual:context.input.URLByResolvingSymlinksInPath];
-    RunLocation location = {current ? context.original : url, NSUInteger(field(2).integerValue),
-                            NSUInteger(field(3).integerValue), 0, 0, current, context.byteColumns};
-    NSString *spans = format == Format::Standard ? field(4) : nil;
-    if (spans.length) {
-        static NSRegularExpression *ranges = [NSRegularExpression regularExpressionWithPattern:
-            @"\\{([0-9]+):([0-9]+)-([0-9]+):([0-9]+)\\}" options:0 error:nil];
-        for (NSTextCheckingResult *span in [ranges matchesInString:spans options:0 range:NSMakeRange(0, spans.length)]) {
-            auto value = [&](NSUInteger i) { return NSUInteger([spans substringWithRange:[span rangeAtIndex:i]].integerValue); };
-            if (value(1) == location.line && value(3) == location.line &&
-                value(2) <= location.column && value(4) > location.column) {
-                location.firstColumn = value(2);
-                location.endColumn = value(4);
-                break;
+    message.location = {current ? context.original : url, match.line, match.column,
+                        match.firstColumn, match.endColumn, current, context.byteColumns,
+                        runtime && JavaScriptFamily(context.language)};
+    if (runtime) {
+        NSRange range = [message.text rangeOfString:path options:NSLiteralSearch];
+        if (range.location != NSNotFound) {
+            if (current && context.name.length && ![path isEqualToString:context.name]) {
+                ReplaceOutputText(message, range, context.name);
+                range.length = context.name.length;
             }
+
+            NSUInteger end = range.location;
+            [message.text getLineStart:nullptr end:nullptr contentsEnd:&end forRange:NSMakeRange(range.location, 0)];
+            message.linkRange = NSMakeRange(range.location, end - range.location);
         }
+        return message;
     }
-    NSString *label = current ? context.name : path;
-    NSUInteger start = [match rangeAtIndex:format == Format::Standard ? 5 : 4].location;
-    NSMutableString *display = [NSMutableString stringWithFormat:@"%@:%lu", label, (unsigned long)location.line];
-    if (location.column)
-        [display appendFormat:@":%lu", (unsigned long)location.column];
-    NSString *details = [line substringFromIndex:start];
-    if (format == Format::Go || format == Format::Kotlin) {
+
+    NSString *label = current && context.name.length ? context.name : context.mirror ? url.path : path;
+    NSMutableString *display = [NSMutableString stringWithFormat:@"%@:%lu", label, (unsigned long)match.line];
+    if (match.column)
+        [display appendFormat:@":%lu", (unsigned long)match.column];
+
+    NSString *details = ConsoleString(text.substr(match.details));
+    size_t prefix = message.text.length - details.length;
+    if (match.addSeverity) {
+        NSString *severity = match.tone == OutputTone::Warning ? @"warning" : match.tone == OutputTone::Text ? @"note" : @"error";
         details = [NSString stringWithFormat:@"%@: %@", severity, details];
         [display appendFormat:@": %@: ", severity];
     } else {
         [display appendString:@": "];
     }
-    ReplaceOutputText(message, NSMakeRange(0, start), display);
-    message.location = location;
-    if (message.tone == OutputTone::Error)
+
+    ReplaceOutputText(message, NSMakeRange(0, prefix), display);
+    if (message.tone != OutputTone::Text) {
         message.diagnostic = [details stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        if (CFamily(context.language) && [message.diagnostic hasSuffix:@"]"]) {
+            NSRange option = [message.diagnostic rangeOfString:@"[-W" options:NSBackwardsSearch];
+            if (option.location != NSNotFound) {
+                NSUInteger start = option.location + 1;
+                NSString *flag = [message.diagnostic substringWithRange:NSMakeRange(start, message.diagnostic.length - start - 1)];
+                message.diagnosticLabel = [NSString stringWithFormat:@"clang(%@)", flag];
+            }
+        }
+    }
+
     return message;
 }
 
+struct RunDelivery {
+    std::mutex mutex;
+    std::vector<RunMessage> ready, spare;
+    bool scheduled = false;
+    bool delivering = false;
+};
+
 struct RunLog {
+    SourceRunner *owner = nil;
+    RunDelivery *delivery = nullptr;
     RunOutput output;
-    std::deque<RunMessage> messages;
-    NSMutableString *mergedTail = nil;
-    std::shared_ptr<std::atomic_uint> deliveries = std::make_shared<std::atomic_uint>(0);
+    std::vector<RunMessage> messages;
+    std::vector<NSUInteger> seenDiagnostics;
     Clock::time_point nextUpdate{};
+    NSUInteger lineLimit = OutputScrollbackLinesPreference();
+    NSUInteger characterLimit = OutputScrollbackCharacterLimit(lineLimit);
     NSUInteger characters = 0;
+    size_t first = 0;
     int programExitCode = -1;
     bool buildError = false;
     bool discarded = false;
     bool checking = false;
+    bool locatedOnly = false;
     NSUInteger errors = 0;
-    std::unordered_set<NSUInteger> seenDiagnostics;
-
-    void append(RunMessage message)
-    {
-        NSUInteger length = message.text.length;
-        if (!length)
-            return;
-        if (checking) {
-            if (message.tone == OutputTone::Text)
-                return;
-            NSUInteger key = message.text.hash ^ (message.location.file.path.hash << 1);
-            if (seenDiagnostics.size() < outputScrollbackLines && !seenDiagnostics.insert(key).second)
-                return;
-            if (message.tone == OutputTone::Error)
-                ++errors;
-        }
-        NSUInteger lines = OutputScrollbackLinesPreference();
-        NSUInteger characterLimit = OutputScrollbackCharacterLimit(lines);
-        if (length > characterLimit) {
-            NSUInteger start = length - characterLimit;
-            if (CFStringIsSurrogateLowCharacter([message.text characterAtIndex:start]) &&
-                CFStringIsSurrogateHighCharacter([message.text characterAtIndex:start - 1]))
-                ++start;
-            ReplaceOutputText(message, NSMakeRange(0, start), @"");
-            if (message.linkRange.location != NSNotFound) {
-                if (message.linkRange.location < start)
-                    message.linkRange = {};
-                else
-                    message.linkRange.location -= start;
-            }
-            length = message.text.length;
-            messages.clear();
-            characters = 0;
-            discarded = true;
-        }
-        if (message.diagnostic.length > 2048) {
-            NSUInteger end = CFStringIsSurrogateHighCharacter([message.diagnostic characterAtIndex:2047]) ? 2047 : 2048;
-            message.diagnostic = [[message.diagnostic substringToIndex:end] stringByAppendingString:@"…"];
-        }
-        // Coalesce plain lines within a delivery instead of making a text run for every line.
-        if (!message.location.line && !messages.empty() && !messages.back().location.line &&
-            messages.back().tone == message.tone && messages.back().usesTerminalColors == message.usesTerminalColors &&
-            messages.back().text.length + length <= 8192) {
-            auto &tail = messages.back();
-            NSUInteger start = tail.text.length;
-            if (!mergedTail) {
-                mergedTail = [tail.text mutableCopy];
-                tail.text = mergedTail;
-            }
-            [mergedTail appendString:message.text];
-            for (const auto &span : message.colorSpans)
-                AddOutputColors(tail.colorSpans, NSMakeRange(start + span.range.location, span.range.length), span.colors);
-        } else {
-            mergedTail = nil;
-            messages.push_back(std::move(message));
-        }
-        characters += length;
-        // A queued record can be a fragment or several lines. The pane counts complete lines.
-        NSUInteger messageLimit = std::max(lines, outputScrollbackLines);
-        while (characters > characterLimit || messages.size() > messageLimit) {
-            characters -= messages.front().text.length;
-            messages.pop_front();
-            discarded = true;
-        }
-    }
-
-    void status(NSString *text, OutputTone tone = OutputTone::Text)
-    {
-        append({text, tone, {}});
-    }
-
-    void send(bool now = false)
-    {
-        auto time = Clock::now();
-        if (checking || messages.empty() || (!now && (time < nextUpdate || deliveries->load(std::memory_order_relaxed))))
-            return;
-        messages.front().earlierOutputDiscarded = discarded;
-        auto batch = std::make_shared<const std::vector<RunMessage>>(std::make_move_iterator(messages.begin()),
-                                                                    std::make_move_iterator(messages.end()));
-        messages.clear();
-        mergedTail = nil;
-        characters = 0;
-        discarded = false;
-        auto active = deliveries;
-        active->fetch_add(1, std::memory_order_relaxed);
-        RunOutput handler = output;
-        dispatch_async(dispatch_get_main_queue(), ^{
-            @autoreleasepool {
-                handler(*batch);
-            }
-            active->fetch_sub(1, std::memory_order_relaxed);
-        });
-        nextUpdate = time + 24ms;
-    }
+    NSUInteger warnings = 0;
 };
 
-static int PrepareDescriptors(int (&ends)[2])
+static void LogAppend(RunLog &log, RunMessage message)
 {
-    for (int &fd : ends) {
-        if (fd <= STDERR_FILENO) {
-            int spare = fcntl(fd, F_DUPFD_CLOEXEC, STDERR_FILENO + 1);
-            if (spare < 0)
-                return errno;
-            close(fd);
-            fd = spare;
-        } else if (fcntl(fd, F_SETFD, FD_CLOEXEC) < 0) {
-            return errno;
+    NSUInteger length = message.text.length;
+    if (!length)
+        return;
+
+    if (log.checking) {
+        if (message.tone == OutputTone::Text || (log.locatedOnly && !message.location.line))
+            return;
+
+        auto &seen = log.seenDiagnostics;
+        if (seen.size() < outputScrollbackLines) {
+            NSUInteger key = message.text.hash ^ (message.location.file.path.hash << 1);
+            auto position = std::lower_bound(seen.begin(), seen.end(), key);
+            if (position != seen.end() && *position == key)
+                return;
+
+            seen.insert(position, key);
         }
+
+        if (message.tone == OutputTone::Error)
+            ++log.errors;
+        else
+            ++log.warnings;
     }
-    return 0;
+
+    auto &messages = log.messages;
+    if (length > log.characterLimit) {
+        NSUInteger start = length - log.characterLimit;
+        if (CFStringIsSurrogateLowCharacter([message.text characterAtIndex:start]) &&
+            CFStringIsSurrogateHighCharacter([message.text characterAtIndex:start - 1]))
+            ++start;
+
+        ReplaceOutputText(message, NSMakeRange(0, start), @"");
+        if (message.linkRange.location != NSNotFound) {
+            if (message.linkRange.location < start)
+                message.linkRange = {};
+            else
+                message.linkRange.location -= start;
+        }
+
+        length = message.text.length;
+        messages.clear();
+        log.first = 0;
+        log.characters = 0;
+        log.discarded = true;
+    }
+
+    if (message.diagnostic.length > 2048) {
+        NSUInteger end = CFStringIsSurrogateHighCharacter([message.diagnostic characterAtIndex:2047]) ? 2047 : 2048;
+        message.diagnostic = [[message.diagnostic substringToIndex:end] stringByAppendingString:@"…"];
+    }
+
+    messages.push_back(std::move(message));
+    log.characters += length;
+    NSUInteger limit = std::max(log.lineLimit, outputScrollbackLines);
+    while (log.first < messages.size() && (log.characters > log.characterLimit || messages.size() - log.first > limit)) {
+        auto &front = messages[log.first++];
+        log.characters -= front.text.length;
+        front = {};
+        log.discarded = true;
+    }
+
+    if (log.first && log.first >= messages.size() / 2) {
+        messages.erase(messages.begin(), messages.begin() + log.first);
+        log.first = 0;
+    }
 }
 
-struct ProgramInput {
-    std::mutex mutex;
-    std::string queued;
-    bool open = false;
+static void LogStatus(RunLog &log, NSString *text, OutputTone tone = OutputTone::Text)
+{
+    LogAppend(log, {text, tone, {}});
+}
 
-    void setOpen(bool enabled)
+static void SendLog(RunLog &log, bool now = false)
+{
+    auto time = Clock::now();
+    if (!log.delivery || log.messages.empty() || (!now && time < log.nextUpdate && log.characters < 96 * 1024))
+        return;
+
+    RunDelivery *delivery = log.delivery;
+    bool schedule = false;
     {
-        std::lock_guard lock(mutex);
-        open = enabled;
-        if (!open)
-            queued.clear();
+        std::lock_guard lock(delivery->mutex);
+        if (!now && (delivery->scheduled || delivery->delivering))
+            return;
+
+        log.messages.erase(log.messages.begin(), log.messages.begin() + log.first);
+        log.messages.front().earlierOutputDiscarded = log.discarded;
+        if (delivery->ready.empty() || log.discarded) {
+            delivery->ready.swap(log.messages);
+        } else {
+            delivery->ready.insert(delivery->ready.end(), std::make_move_iterator(log.messages.begin()), std::make_move_iterator(log.messages.end()));
+        }
+
+        log.messages.clear();
+        if (delivery->spare.capacity() > log.messages.capacity())
+            delivery->spare.swap(log.messages);
+
+        schedule = !delivery->scheduled;
+        delivery->scheduled = true;
     }
 
-    void take(std::string &pending)
-    {
-        std::lock_guard lock(mutex);
-        pending.swap(queued);
-    }
-};
+    log.first = 0;
+    log.characters = 0;
+    log.discarded = false;
+    log.nextUpdate = time + 24ms;
+    log.lineLimit = OutputScrollbackLinesPreference();
+    log.characterLimit = OutputScrollbackCharacterLimit(log.lineLimit);
+    if (!schedule)
+        return;
+
+    SourceRunner *owner = log.owner;
+    RunOutput handler = log.output;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @autoreleasepool {
+            (void)owner; // Keep the runner and its delivery buffers alive.
+            std::vector<RunMessage> batch;
+            {
+                std::lock_guard lock(delivery->mutex);
+                batch.swap(delivery->ready);
+                delivery->scheduled = false;
+                delivery->delivering = true;
+            }
+
+            if (handler)
+                handler(batch);
+
+            batch.clear();
+            {
+                std::lock_guard lock(delivery->mutex);
+                if (batch.capacity() > delivery->spare.capacity())
+                    delivery->spare.swap(batch);
+                delivery->delivering = false;
+            }
+        }
+    });
+}
 
 static NSDictionary *JSONDictionary(std::string_view bytes)
 {
     if (bytes.empty() || bytes.front() != '{')
         return nil;
-    NSData *data = [NSData dataWithBytes:bytes.data() length:bytes.size()];
+    NSData *data = [NSData dataWithBytesNoCopy:const_cast<char *>(bytes.data()) length:bytes.size() freeWhenDone:NO];
     id object = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
     return [object isKindOfClass:NSDictionary.class] ? object : nil;
-}
-
-static NSURL *OriginalRustFile(NSURL *file, NSURL *mirror)
-{
-    if (PathIsInFolder(file.path, mirror.path) && file.path.length > mirror.path.length)
-        file = [NSURL fileURLWithPath:[file.path substringFromIndex:mirror.path.length]];
-    return CanonicalFileURL(file);
 }
 
 static RunMessage RustDiagnostic(NSDictionary *message, const DiagnosticContext &context, NSString *manifest = nil)
@@ -1134,7 +978,7 @@ static RunMessage RustDiagnostic(NSDictionary *message, const DiagnosticContext 
     NSString *rendered = message[@"rendered"];
     RunMessage result{};
     if ([rendered isKindOfClass:NSString.class])
-        result = TerminalDecoder{}.decode(rendered);
+        result = DecodeConsoleString(rendered);
     rendered = result.text.length ? result.text : nil;
     if (!rendered) {
         result.text = [NSString stringWithFormat:@"%@: %@\n", level, details];
@@ -1143,8 +987,12 @@ static RunMessage RustDiagnostic(NSDictionary *message, const DiagnosticContext 
         rendered = result.text = [rendered stringByAppendingString:@"\n"];
     }
     result.tone = tone;
-    if (tone == OutputTone::Error)
+    if (tone != OutputTone::Text) {
         result.diagnostic = details;
+        id code = message[@"code"];
+        if ([code isKindOfClass:NSDictionary.class] && [code[@"code"] isKindOfClass:NSString.class])
+            result.diagnosticLabel = [NSString stringWithFormat:@"rustc(%@)", code[@"code"]];
+    }
 
     NSArray *spans = message[@"spans"];
     if (![spans isKindOfClass:NSArray.class])
@@ -1165,11 +1013,11 @@ static RunMessage RustDiagnostic(NSDictionary *message, const DiagnosticContext 
         NSURL *package = [NSURL fileURLWithPath:manifest].URLByDeletingLastPathComponent;
         file = [NSURL fileURLWithPath:path isDirectory:NO relativeToURL:package].URLByStandardizingPath;
     }
-    file = OriginalRustFile(file, context.mirror);
+    file = OriginalCheckFile(file, context.mirror);
     NSUInteger line = [primary[@"line_start"] unsignedIntegerValue];
     NSUInteger column = [primary[@"column_start"] unsignedIntegerValue];
     NSUInteger end = [primary[@"line_end"] unsignedIntegerValue] == line ? [primary[@"column_end"] unsignedIntegerValue] : 0;
-    bool current = [file.path isEqualToString:OriginalRustFile(context.input, context.mirror).path];
+    bool current = [file.path isEqualToString:OriginalCheckFile(context.input, context.mirror).path];
     result.location = {current ? context.original : file, line, column, end > column ? column : 0, end, current, false};
     NSString *label = current && context.name.length ? context.name : path;
     if (PathIsInFolder(label, context.mirror.path))
@@ -1212,44 +1060,18 @@ static void AppendRustDiagnostic(RunLog &log, NSDictionary *message, const Diagn
             [text hasSuffix:@" warnings emitted"])
             return;
     }
-    log.append(RustDiagnostic(message, context, manifest));
-}
-
-template<typename Emit>
-static std::string_view ReceiveDiagnosticRecords(std::string_view bytes, std::string &record, bool &dropping, Emit emit)
-{
-    constexpr size_t limit = 2 * 1024 * 1024;
-    while (!bytes.empty()) {
-        size_t newline = bytes.find('\n');
-        size_t count = newline == std::string_view::npos ? bytes.size() : newline + 1;
-        // A malformed or unusually large compiler record cannot grow the reader indefinitely.
-        if (count > limit - record.size()) {
-            record.clear();
-            dropping = true;
-        }
-        if (!dropping)
-            record.append(bytes.substr(0, count));
-        bytes.remove_prefix(count);
-        if (newline == std::string_view::npos)
-            break;
-        bool keepReading = dropping || emit(record);
-        record.clear();
-        dropping = false;
-        if (!keepReading)
-            break;
-    }
-    return bytes;
+    LogAppend(log, RustDiagnostic(message, context, manifest));
 }
 
 struct CargoSession {
     DiagnosticContext diagnostics;
     ProgramInput *input;
     void (^ready)(void);
-    std::string record;
-    bool dropping = false;
+    RunRecords records;
     bool finished = false;
     bool built = false;
     TerminalDecoder terminal{};
+    DecodedOutput output{};
     NSMutableOrderedSet<NSString *> *executables = nil;
     bool testsOnly = false;
 
@@ -1261,9 +1083,9 @@ struct CargoSession {
             finished = true;
             built = [data[@"success"] boolValue];
             if (built && input) {
-                log.status(@"Build successful\n\n");
-                log.send(true);
-                input->setOpen(true);
+                LogStatus(log, @"Build successful\n\n");
+                SendLog(log, true);
+                SetProgramInput(*input, true);
                 if (ready)
                     dispatch_async(dispatch_get_main_queue(), ready);
             }
@@ -1279,188 +1101,213 @@ struct CargoSession {
                    ([kind containsObject:@"bin"] || [kind containsObject:@"example"]))))
                 [executables addObject:path];
         } else if (!reason.length && !bytes.empty()) {
-            log.append(terminal.decode(ConsoleString(bytes)));
+            ClearDecodedOutput(output);
+            DecodeTerminal(terminal, bytes, output);
+            RunMessage message{};
+            message.text = ConsoleString(output.text);
+            message.colorSpans.assign(output.spans.begin(), output.spans.end());
+            message.usesTerminalColors = terminal.sawSGR;
+            LogAppend(log, std::move(message));
         }
     }
 
     std::string_view receive(std::string_view bytes, RunLog &log)
     {
-        return ReceiveDiagnosticRecords(bytes, record, dropping, [&](std::string_view line) {
-            emit(line, log);
-            return !finished;
-        });
+        struct ReadContext {
+            CargoSession *cargo;
+            RunLog *log;
+        } context{this, &log};
+
+        return ReadRunRecords(records, bytes, 2 * 1024 * 1024, [](void *context, std::string_view line) {
+            auto &read = *static_cast<ReadContext *>(context);
+            read.cargo->emit(line, *read.log);
+            return !read.cargo->finished;
+        }, &context);
     }
+};
+
+struct OutputRun {
+    size_t byte, character;
+    OutputTone tone;
+    bool usesColors;
 };
 
 struct RunStream {
-    int ends[2] = {-1, -1};
-    std::string pending;
+    RunRecords records;
+    TerminalDecoder terminal{};
+    DecodedOutput output;
+    std::vector<OutputRun> runs;
     OutputTone lineTone = OutputTone::Text;
     bool continued = false;
-    bool droppingRecord = false;
-    TerminalDecoder terminal{};
-
-    ~RunStream()
-    {
-        for (int fd : ends) {
-            if (fd >= 0)
-                close(fd);
-        }
-    }
-
-    int open()
-    {
-        if (pipe(ends) != 0)
-            return errno;
-        return PrepareDescriptors(ends);
-    }
-
-    int openTerminal()
-    {
-        struct winsize size = {24, 80, 0, 0};
-        if (openpty(&ends[0], &ends[1], nullptr, nullptr, &size) != 0)
-            return errno;
-        int error = PrepareDescriptors(ends);
-        if (error)
-            return error;
-        struct termios attributes;
-        if (tcgetattr(ends[1], &attributes) != 0)
-            return errno;
-        // The editable line in Output already echoes what the user types.
-        attributes.c_lflag &= ~(ECHO | ECHONL);
-        if (tcsetattr(ends[1], TCSANOW, &attributes) != 0 || fcntl(ends[0], F_SETFL, O_NONBLOCK) < 0)
-            return errno;
-        return 0;
-    }
-
-    void emit(std::string_view bytes, const DiagnosticContext *diagnostics, bool stderrLine, RunLog &log)
-    {
-        if (stderrLine && diagnostics && diagnostics->language == Language::Rust) {
-            if (NSDictionary *record = JSONDictionary(bytes)) {
-                AppendRustDiagnostic(log, record, *diagnostics);
-                return;
-            }
-        }
-        RunMessage message = terminal.decode(ConsoleString(bytes));
-        if (!message.text.length)
-            return;
-        if (diagnostics && !continued) {
-            message = CompilerMessage(std::move(message), *diagnostics, stderrLine);
-            log.buildError |= message.tone == OutputTone::Error && message.location.line != 0;
-            lineTone = message.tone;
-        } else {
-            if (!continued)
-                lineTone = ToneForLine(message.text, stderrLine);
-            message.tone = lineTone;
-        }
-        log.append(std::move(message));
-        continued = bytes.back() != '\n';
-    }
-
-    void flushPartial(bool stderrLine, RunLog &log, const DiagnosticContext *diagnostics = nullptr)
-    {
-        if (pending.empty())
-            return;
-        // Leave an incomplete UTF-8 character for the next read.
-        size_t end = pending.size(), start = end - 1;
-        while (start && (uint8_t(pending[start]) & 0xC0) == 0x80)
-            --start;
-        uint8_t lead = pending[start];
-        size_t width = lead < 0xC2 ? 1 : lead < 0xE0 ? 2 : lead < 0xF0 ? 3 : lead < 0xF5 ? 4 : 1;
-        if (end - start < width)
-            end = start;
-        if (end) {
-            emit(std::string_view(pending).substr(0, end), diagnostics, stderrLine, log);
-            pending.erase(0, end);
-        }
-    }
-
-    void receive(const char *bytes, size_t length, const DiagnosticContext *diagnostics, bool stderrLine, RunLog &log)
-    {
-        if (stderrLine && diagnostics && diagnostics->language == Language::Rust) {
-            ReceiveDiagnosticRecords({bytes, length}, pending, droppingRecord, [&](std::string_view line) {
-                emit(line, diagnostics, stderrLine, log);
-                return true;
-            });
-            return;
-        }
-        pending.append(bytes, length);
-        size_t start = 0;
-        for (;;) {
-            size_t end = pending.find('\n', start);
-            if (end == std::string::npos)
-                break;
-            emit(std::string_view(pending).substr(start, end + 1 - start), diagnostics, stderrLine, log);
-            start = end + 1;
-        }
-        pending.erase(0, start);
-        if (pending.size() >= 16 * 1024)
-            flushPartial(stderrLine, log, diagnostics);
-    }
 };
 
-static int SpawnDirectory(posix_spawn_file_actions_t *actions, NSURL *directory)
+static void FlushRunText(RunStream &stream, RunLog &log)
 {
-#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 260000
-    if (@available(macOS 26.0, *))
-        return posix_spawn_file_actions_addchdir(actions, directory.fileSystemRepresentation);
-#endif
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-    return posix_spawn_file_actions_addchdir_np(actions, directory.fileSystemRepresentation);
-#pragma clang diagnostic pop
+    auto &output = stream.output;
+    size_t span_index = 0;
+    for (size_t i = 0; i < stream.runs.size(); ++i) {
+        const auto &run = stream.runs[i];
+        size_t end_byte = i + 1 < stream.runs.size() ? stream.runs[i + 1].byte : output.text.size();
+        size_t end = i + 1 < stream.runs.size() ? stream.runs[i + 1].character : output.characters;
+        RunMessage message{ConsoleString(std::string_view(output.text).substr(run.byte, end_byte - run.byte)), run.tone, {}};
+        message.usesTerminalColors = run.usesColors;
+        while (span_index < output.spans.size() && output.spans[span_index].range.location < end) {
+            const auto &span = output.spans[span_index];
+            size_t first = std::max(size_t(span.range.location), run.character);
+            size_t last = span.range.location + span.range.length;
+            message.colorSpans.push_back({{uint32_t(first - run.character), uint32_t(std::min(last, end) - first)}, span.colors});
+            if (last > end)
+                break;
+
+            ++span_index;
+        }
+
+        LogAppend(log, std::move(message));
+    }
+
+    ClearDecodedOutput(output);
+    stream.runs.clear();
 }
 
-static int Spawn(pid_t *pid, NSString *tool, NSArray<NSString *> *arguments, NSURL *directory,
-                 RunStream (&pipes)[2], bool interactive)
+static void EmitRunLine(RunStream &stream, std::string_view bytes, const DiagnosticContext *diagnostics, bool stderrLine, RunLog &log)
 {
-    int error = interactive ? pipes[0].openTerminal() : pipes[0].open();
-    if (!error)
-        error = pipes[1].open();
-    if (error)
-        return error;
-    posix_spawn_file_actions_t actions = nullptr;
-    posix_spawnattr_t attributes = nullptr;
-    error = posix_spawn_file_actions_init(&actions);
-    if (!error)
-        error = posix_spawnattr_init(&attributes);
-    if (!error)
-        error = SpawnDirectory(&actions, directory);
-    if (!error)
-        error = interactive ? posix_spawn_file_actions_adddup2(&actions, pipes[0].ends[1], STDIN_FILENO) :
-                              posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
-    if (!error)
-        error = posix_spawn_file_actions_adddup2(&actions, pipes[0].ends[1], STDOUT_FILENO);
-    if (!error)
-        error = posix_spawn_file_actions_adddup2(&actions, pipes[1].ends[1], STDERR_FILENO);
-    if (!error)
-        error = posix_spawnattr_setpgroup(&attributes, 0);
-    if (!error) {
-        // A dispatch worker can have SIGCHLD blocked. Toolchains need to reap their own children.
-        sigset_t allowedSignals;
-        sigemptyset(&allowedSignals);
-        error = posix_spawnattr_setsigmask(&attributes, &allowedSignals);
+    if (stderrLine && diagnostics && diagnostics->language == Language::Rust) {
+        if (NSDictionary *record = JSONDictionary(bytes)) {
+            AppendRustDiagnostic(log, record, *diagnostics);
+            return;
+        }
     }
-    if (!error)
-        error = posix_spawnattr_setflags(&attributes, POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_SETSIGMASK |
-                                                     POSIX_SPAWN_CLOEXEC_DEFAULT);
-    if (!error) {
-        std::vector<const char *> argv{tool.fileSystemRepresentation};
-        for (NSString *argument in arguments)
-            argv.push_back(argument.fileSystemRepresentation);
-        argv.push_back(nullptr);
-        error = posix_spawn(pid, argv.front(), &actions, &attributes,
-                            const_cast<char **>(argv.data()), *_NSGetEnviron());
+
+    if (diagnostics && !stream.continued && !stream.runs.empty())
+        FlushRunText(stream, log);
+
+    auto &output = stream.output;
+    size_t start = output.text.size();
+    size_t character = output.characters;
+    DecodeTerminal(stream.terminal, bytes, output);
+    if (output.text.size() == start)
+        return;
+
+    if (!stream.continued)
+        stream.lineTone = ConsoleTone(std::string_view(output.text).substr(start), stderrLine);
+
+    if (diagnostics && !stream.continued) {
+        RunMessage message{ConsoleString(output.text), stream.lineTone, {}};
+        message.usesTerminalColors = stream.terminal.sawSGR;
+        message.colorSpans.assign(output.spans.begin(), output.spans.end());
+        message = CompilerMessage(std::move(message), output.text, *diagnostics, stderrLine);
+        log.buildError |= message.tone == OutputTone::Error && message.location.line != 0 && message.diagnostic.length != 0;
+        stream.lineTone = message.tone;
+        LogAppend(log, std::move(message));
+        ClearDecodedOutput(output);
+    } else {
+        if (stream.runs.empty() || stream.runs.back().tone != stream.lineTone ||
+            stream.runs.back().usesColors != stream.terminal.sawSGR)
+            stream.runs.push_back({start, character, stream.lineTone, stream.terminal.sawSGR});
     }
-    if (attributes)
-        posix_spawnattr_destroy(&attributes);
-    if (actions)
-        posix_spawn_file_actions_destroy(&actions);
-    for (RunStream &pipe : pipes) {
-        close(pipe.ends[1]);
-        pipe.ends[1] = -1;
+
+    stream.continued = !bytes.empty() && bytes.back() != '\n';
+}
+
+static void FlushRunPartial(RunStream &stream, const DiagnosticContext *diagnostics, bool stderrLine, RunLog &log)
+{
+    size_t count = CompleteUTF8Prefix(stream.records.partial);
+    if (!count)
+        return;
+
+    EmitRunLine(stream, std::string_view(stream.records.partial).substr(0, count), diagnostics, stderrLine, log);
+    stream.records.partial.erase(0, count);
+    FlushRunText(stream, log);
+}
+
+static void ReceiveRunText(RunStream &stream, std::string_view bytes, const DiagnosticContext *diagnostics, bool stderrLine, RunLog &log)
+{
+    struct ReadContext {
+        RunStream *stream;
+        const DiagnosticContext *diagnostics;
+        bool stderrLine;
+        RunLog *log;
+    } context{&stream, diagnostics, stderrLine, &log};
+
+    bool structured = stderrLine && diagnostics && diagnostics->language == Language::Rust;
+    ReadRunRecords(stream.records, bytes, structured ? 2 * 1024 * 1024 : SIZE_MAX, [](void *context, std::string_view line) {
+        auto &read = *static_cast<ReadContext *>(context);
+        EmitRunLine(*read.stream, line, read.diagnostics, read.stderrLine, *read.log);
+        return true;
+    }, &context);
+
+    if (stream.output.characters >= 8192)
+        FlushRunText(stream, log);
+
+    if (!structured && stream.records.partial.size() >= 16 * 1024)
+        FlushRunPartial(stream, diagnostics, stderrLine, log);
+}
+
+struct RunReadout {
+    RunStream streams[2];
+    const DiagnosticContext *diagnostics;
+    RunLog *log;
+    ProgramInput *input;
+    void (^ready)(void);
+    CargoSession *cargo;
+    std::string *captures[2];
+    size_t lastStream = 2;
+};
+
+static void ReadChildOutput(void *context, ChildEvent event, std::string_view bytes)
+{
+    @autoreleasepool {
+        auto &run = *static_cast<RunReadout *>(context);
+        auto &log = *run.log;
+        switch (event) {
+        case ChildEvent::Started:
+            if (run.input && !run.cargo) {
+                SetProgramInput(*run.input, true);
+                if (run.ready)
+                    dispatch_async(dispatch_get_main_queue(), run.ready);
+            }
+            return;
+
+        case ChildEvent::Output:
+        case ChildEvent::ErrorOutput: {
+            size_t index = event == ChildEvent::Output ? 0 : 1;
+            if (auto *buffer = run.captures[index]) {
+                size_t limit = index == 0 ? 8 * 1024 * 1024 : 64 * 1024;
+                if (buffer->size() < limit)
+                    buffer->append(bytes.substr(0, limit - buffer->size()));
+
+                return;
+            }
+
+            if (index != run.lastStream && run.lastStream < 2)
+                FlushRunText(run.streams[run.lastStream], log);
+
+            run.lastStream = index;
+            if (!index && run.cargo && !run.cargo->finished)
+                bytes = run.cargo->receive(bytes, log);
+
+            if (!bytes.empty())
+                ReceiveRunText(run.streams[index], bytes, run.diagnostics, index == 1, log);
+
+            return;
+        }
+
+        case ChildEvent::Idle:
+            if (!run.diagnostics || run.input) {
+                for (size_t i = 0; i < 2; ++i)
+                    FlushRunPartial(run.streams[i], nullptr, i == 1, log);
+            }
+            break;
+
+        case ChildEvent::Update:
+            break;
+        }
+
+        if (run.lastStream < 2 && (event == ChildEvent::Idle || Clock::now() >= log.nextUpdate))
+            FlushRunText(run.streams[run.lastStream], log);
+
+        SendLog(log);
     }
-    return error;
 }
 
 static int RunCommand(NSString *tool, NSArray<NSString *> *arguments, NSURL *directory,
@@ -1468,116 +1315,44 @@ static int RunCommand(NSString *tool, NSArray<NSString *> *arguments, NSURL *dir
                       ProgramInput *input = nullptr, void (^ready)(void) = nil,
                       CargoSession *cargo = nullptr, std::string *capture = nullptr, std::string *captureErrors = nullptr)
 {
-    if (stop.load(std::memory_order_relaxed))
-        return -1;
-    RunStream streams[2];
-    pid_t child = 0;
-    int error = Spawn(&child, tool, arguments, directory, streams, input != nullptr);
-    if (error) {
-        log.status([NSString stringWithFormat:@"%@: %@\n", tool.lastPathComponent, RunError(error).localizedDescription],
-                   OutputTone::Error);
-        return -1;
-    }
-    if (input && !cargo) {
-        input->setOpen(true);
-        if (ready)
-            dispatch_async(dispatch_get_main_queue(), ready);
+    const char *local[32];
+    std::vector<const char *> large;
+    const char **argv = local;
+    if (arguments.count + 2 > std::size(local)) {
+        large.resize(arguments.count + 2);
+        argv = large.data();
     }
 
-    std::array<pollfd, 2> watches = {{{streams[0].ends[0], POLLIN, 0}, {streams[1].ends[0], POLLIN, 0}}};
-    std::string outgoing;
-    int status = 0;
-    auto exited = Clock::time_point::max();
-    auto forceStop = Clock::time_point::max();
-    bool stopping = false;
-    for (;;) {
-        if (!stopping && stop.load(std::memory_order_relaxed)) {
-            stopping = true;
-            kill(-child, SIGTERM);
-            forceStop = Clock::now() + 300ms;
-        }
-        if (Clock::now() >= forceStop) {
-            kill(-child, SIGKILL);
-            forceStop = Clock::time_point::max();
-        }
-        bool reaped = exited != Clock::time_point::max();
-        if (input && !stopping && !reaped && outgoing.empty())
-            input->take(outgoing);
-        watches[0].events = POLLIN | (!stopping && !reaped && !outgoing.empty() ? POLLOUT : 0);
-        int count = poll(watches.data(), watches.size(), reaped ? 0 : 40);
-        if (count < 0 && errno != EINTR) {
-            error = errno;
-            if (!reaped) {
-                kill(-child, SIGKILL);
-                while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
-            }
-            break;
-        }
-        if (reaped && (count == 0 || Clock::now() - exited > 150ms))
-            break;
-        if (count > 0 && (watches[0].revents & POLLOUT)) {
-            ssize_t written = write(watches[0].fd, outgoing.data(), outgoing.size());
-            if (written > 0)
-                outgoing.erase(0, size_t(written));
-            else if (written < 0 && errno != EAGAIN && errno != EINTR) {
-                outgoing.clear();
-                input->setOpen(false);
-            }
-        }
-        @autoreleasepool {
-            for (size_t i = 0; count > 0 && i < watches.size(); ++i) {
-                if (!(watches[i].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL)))
-                    continue;
-                char bytes[8192];
-                ssize_t length = read(watches[i].fd, bytes, sizeof(bytes));
-                if (length > 0) {
-                    std::string_view received(bytes, size_t(length));
-                    if (auto *buffer = i == 0 ? capture : captureErrors) {
-                        const size_t limit = i == 0 ? 8 * 1024 * 1024 : 64 * 1024;
-                        if (buffer->size() < limit)
-                            buffer->append(received.substr(0, limit - buffer->size()));
-                        continue;
-                    }
-                    if (i == 0 && cargo && !cargo->finished)
-                        received = cargo->receive(received, log);
-                    if (!received.empty())
-                        streams[i].receive(received.data(), received.size(), diagnostics, i == 1, log);
-                } else if (!length || (errno != EINTR && errno != EAGAIN)) {
-                    watches[i].fd = -1;
-                }
-            }
-            if ((!diagnostics || input) && count == 0) {
-                for (size_t i = 0; i < watches.size(); ++i)
-                    streams[i].flushPartial(i == 1, log);
-            }
-            log.send();
-        }
-        if (!reaped) {
-            pid_t result = waitpid(child, &status, WNOHANG);
-            if (result == child)
-                exited = Clock::now();
-            else if (result < 0 && errno != EINTR) {
-                error = errno;
-                break;
-            }
-        }
-    }
-    if (input)
-        input->setOpen(false);
-    if (stopping)
-        kill(-child, SIGKILL);
-    for (size_t i = 0; i < watches.size(); ++i) {
-        auto &stream = streams[i];
-        if (!stream.pending.empty() || stream.continued) {
-            stream.pending.push_back('\n');
-            stream.emit(stream.pending, diagnostics, i == 1, log);
-        }
-    }
-    if (error) {
-        log.status([NSString stringWithFormat:@"%@\n", RunError(error).localizedDescription], OutputTone::Error);
+    argv[0] = tool.fileSystemRepresentation;
+    size_t index = 1;
+    for (NSString *argument in arguments)
+        argv[index++] = argument.fileSystemRepresentation;
+    argv[index] = nullptr;
+    RunReadout read{{}, diagnostics, &log, input, ready, cargo, {capture, captureErrors}};
+    auto result = RunChild(argv, directory.fileSystemRepresentation, stop, input, ReadChildOutput, &read);
+    if (result.startError) {
+        LogStatus(log, [NSString stringWithFormat:@"%@: %@\n", tool.lastPathComponent, RunError(result.startError).localizedDescription],
+                  OutputTone::Error);
         return -1;
     }
-    return WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
+
+    if (read.lastStream < 2)
+        FlushRunText(read.streams[read.lastStream], log);
+
+    for (size_t i = 0; i < 2; ++i) {
+        auto &stream = read.streams[i];
+        if (!stream.records.partial.empty() || stream.continued) {
+            stream.records.partial += '\n';
+            EmitRunLine(stream, stream.records.partial, diagnostics, i == 1, log);
+        }
+
+        FlushRunText(stream, log);
+    }
+
+    if (result.ioError)
+        LogStatus(log, [NSString stringWithFormat:@"%@\n", RunError(result.ioError).localizedDescription], OutputTone::Error);
+
+    return result.code;
 }
 
 static void RunProgram(NSString *program, NSArray<NSString *> *arguments, NSURL *directory,
@@ -1586,7 +1361,7 @@ static void RunProgram(NSString *program, NSArray<NSString *> *arguments, NSURL 
 {
     int result = RunCommand(program, arguments, directory, diagnostics, stop, log, &input, ready);
     if (result > 0 && diagnostics && log.buildError)
-        log.status(@"Build failed.\n", OutputTone::Error);
+        LogStatus(log, @"Build failed.\n", OutputTone::Error);
     else
         log.programExitCode = result;
 }
@@ -1595,7 +1370,7 @@ static NSString *GetTool(NSString *name, Language language, RunLog &log)
 {
     NSString *tool = FindTool(name, language);
     if (!tool)
-        log.status([NSString stringWithFormat:@"%@ was not found.\n", name], OutputTone::Error);
+        LogStatus(log, [NSString stringWithFormat:@"%@ was not found.\n", name], OutputTone::Error);
     return tool;
 }
 
@@ -1625,7 +1400,7 @@ static NSURL *BuildNativeProject(NSURL *folder, NSURL *file, NSString *name, Run
     if (stop.load(std::memory_order_relaxed))
         return nil;
     if (sources.files.empty()) {
-        log.status(sources.error, OutputTone::Error);
+        LogStatus(log, sources.error, OutputTone::Error);
         return nil;
     }
 
@@ -1649,7 +1424,7 @@ static NSURL *BuildNativeProject(NSURL *folder, NSURL *file, NSString *name, Run
     NSError *error = nil;
     files.folder = TemporaryFolder(&error);
     if (!files.folder) {
-        log.status([NSString stringWithFormat:@"%@\n", error.localizedDescription], OutputTone::Error);
+        LogStatus(log, [NSString stringWithFormat:@"%@\n", error.localizedDescription], OutputTone::Error);
         return nil;
     }
     NSURL *program = [files.folder URLByAppendingPathComponent:@"program"];
@@ -1657,8 +1432,8 @@ static NSURL *BuildNativeProject(NSURL *folder, NSURL *file, NSString *name, Run
         @"-I", [folder URLByAppendingPathComponent:@"include" isDirectory:YES].path, @"-I", folder.path];
     NSURL *active = CanonicalFileURL(file);
     DiagnosticContext diagnostics{active, active, folder, name, true};
-    log.status(@"Building...\n");
-    log.send(true);
+    LogStatus(log, @"Building...\n");
+    SendLog(log, true);
 
     int result = 0;
     if (mixed) {
@@ -1696,11 +1471,11 @@ static NSURL *BuildNativeProject(NSURL *folder, NSURL *file, NSString *name, Run
     if (stop.load(std::memory_order_relaxed))
         return nil;
     if (result) {
-        log.status(@"Build failed.\n", OutputTone::Error);
+        LogStatus(log, @"Build failed.\n", OutputTone::Error);
         return nil;
     }
-    log.status(@"Build successful\n\n");
-    log.send(true);
+    LogStatus(log, @"Build successful\n\n");
+    SendLog(log, true);
     return program;
 }
 
@@ -1761,40 +1536,71 @@ static void AddCargoTarget(NSMutableArray<NSString *> *arguments, NSDictionary *
         [arguments addObjectsFromArray:@[@"--bin", currentDefault]];
 }
 
-static void RunCargo(NSURL *manifest, NSURL *file, const std::atomic_bool &stop, RunLog &log,
-                     ProgramInput &input, void (^ready)(void))
+static NSURL *RunCargo(NSURL *manifest, NSURL *file, const std::atomic_bool &stop, RunLog &log,
+                      ProgramInput *input, void (^ready)(void))
 {
     NSString *tool = GetTool(@"cargo", Language::Rust, log);
     if (!tool)
-        return;
+        return nil;
+
+    bool debugging = !input;
     NSURL *directory = manifest.URLByDeletingLastPathComponent;
-    log.status(@"Building...\n");
-    log.send(true);
+    LogStatus(log, debugging ? @"Building…\n" : @"Building...\n");
+    SendLog(log, true);
 
     std::string information;
     int result = RunCommand(tool, @[@"metadata", @"--no-deps", @"--format-version", @"1",
         @"--manifest-path", manifest.path], directory, nullptr, stop, log, nullptr, nil, nullptr, &information);
     if (stop.load(std::memory_order_relaxed))
-        return;
+        return nil;
+
     NSDictionary *metadata = result ? nil : JSONDictionary(information);
     if (!metadata) {
-        log.status(@"Could not read the Cargo project.\n", OutputTone::Error);
-        return;
+        LogStatus(log, @"Could not read the Cargo project.\n", OutputTone::Error);
+        return nil;
     }
+
     NSString *root = metadata[@"workspace_root"];
     NSURL *workspace = root.length ? [NSURL fileURLWithPath:root isDirectory:YES] : directory;
-    NSMutableArray<NSString *> *arguments = [@[@"run", @"--quiet", @"--color", @"always",
-        @"--message-format=json,json-diagnostic-rendered-ansi", @"--manifest-path", manifest.path] mutableCopy];
-    AddCargoTarget(arguments, metadata, manifest, file);
-    NSURL *active = CanonicalFileURL(file);
-    CargoSession cargo{{active, active, workspace, nil, false, Language::Rust}, &input, ready, {}};
-    result = RunCommand(tool, arguments, directory, nullptr, stop, log, &input, ready, &cargo);
+    NSMutableArray<NSString *> *arguments = [@[debugging ? @"build" : @"run", @"--quiet", @"--color", @"always",
+        @"--message-format=json,json-diagnostic-rendered-ansi"] mutableCopy];
+    if (debugging) {
+        [arguments addObjectsFromArray:@[@"--config", @"profile.dev.debug=2", @"--config", @"profile.dev.opt-level=0",
+                                         @"--config", @"profile.dev.strip=false"]];
+    }
+
+    [arguments addObjectsFromArray:@[@"--manifest-path", manifest.path]];
+    AddCargoTarget(arguments, metadata, manifest, file, debugging);
+    NSURL *active = debugging ? file : CanonicalFileURL(file);
+    CargoSession cargo{{active, active, workspace, debugging ? file.lastPathComponent : nil, false, Language::Rust}, input, ready, {}};
+    if (debugging) {
+        cargo.executables = [NSMutableOrderedSet orderedSet];
+        cargo.testsOnly = [arguments containsObject:@"--test"];
+    }
+
+    result = RunCommand(tool, arguments, directory, nullptr, stop, log, input, ready, &cargo);
     if (stop.load(std::memory_order_relaxed))
-        return;
-    if (cargo.built)
+        return nil;
+
+    if (!cargo.built || (debugging && result)) {
+        LogStatus(log, @"Build failed.\n", OutputTone::Error);
+        return nil;
+    }
+
+    if (!debugging) {
         log.programExitCode = result;
-    else
-        log.status(@"Build failed.\n", OutputTone::Error);
+        return nil;
+    }
+
+    if (cargo.executables.count != 1) {
+        NSString *message = cargo.executables.count ? @"Open the main file of the Cargo target you want to debug.\n" :
+                                                     @"Cargo did not produce an executable.\n";
+        LogStatus(log, message, OutputTone::Error);
+        return nil;
+    }
+
+    LogStatus(log, @"Build successful\n\n");
+    return [NSURL fileURLWithPath:cargo.executables.firstObject];
 }
 
 static void AddCheckBranch(NSMutableSet<NSString *> *branches, NSString *path, NSString *root)
@@ -1842,6 +1648,29 @@ static bool MirrorCheckDirectory(NSString *source, NSURL *destination, NSSet<NSS
     return true;
 }
 
+static bool WriteCheckMirror(NSURL *mirror, NSString *root, NSSet<NSString *> *branches, NSDictionary<NSString *, NSData *> *edits,
+                             const std::atomic_bool &stop, NSError **error)
+{
+    NSFileManager *files = NSFileManager.defaultManager;
+    if ([files fileExistsAtPath:mirror.path] && ![files removeItemAtURL:mirror error:error])
+        return false;
+    if (!MirrorCheckDirectory(root, MirroredCheckURL(mirror, root), branches, edits, stop, error))
+        return false;
+    NSString *mirrorPath = CanonicalFileURL(mirror).path;
+    for (NSString *path in edits) {
+        if (stop.load(std::memory_order_relaxed))
+            return false;
+        NSURL *file = MirroredCheckURL(mirror, path);
+        if (!PathIsInFolder(CanonicalFileURL(file).path, mirrorPath)) {
+            *error = RunError(EACCES);
+            return false;
+        }
+        if (![files createDirectoryAtURL:file.URLByDeletingLastPathComponent withIntermediateDirectories:YES
+                              attributes:nil error:error] || ![edits[path] writeToURL:file options:0 error:error])
+            return false;
+    }
+    return true;
+}
 static bool PrepareCargoCheck(NSURL *mirror, NSString *workspace, NSArray *packages,
                               const std::vector<CheckSource> &sources, const std::atomic_bool &stop, NSError **error)
 {
@@ -1893,40 +1722,22 @@ static bool PrepareCargoCheck(NSURL *mirror, NSString *workspace, NSArray *packa
         }
     }
 
-    NSFileManager *files = NSFileManager.defaultManager;
-    if ([files fileExistsAtPath:mirror.path] && ![files removeItemAtURL:mirror error:error])
-        return false;
-    if (!MirrorCheckDirectory(root, MirroredCheckURL(mirror, root), branches, edits, stop, error))
-        return false;
-    NSString *mirrorPath = CanonicalFileURL(mirror).path;
-    for (NSString *path in edits) {
-        if (stop.load(std::memory_order_relaxed))
-            return false;
-        NSURL *file = MirroredCheckURL(mirror, path);
-        if (!PathIsInFolder(CanonicalFileURL(file).path, mirrorPath)) {
-            *error = RunError(EACCES);
-            return false;
-        }
-        if (![files createDirectoryAtURL:file.URLByDeletingLastPathComponent withIntermediateDirectories:YES
-                              attributes:nil error:error] || ![edits[path] writeToURL:file options:0 error:error])
-            return false;
-    }
-    return true;
+    return WriteCheckMirror(mirror, root, branches, edits, stop, error);
 }
 
 static void CargoCheckStatus(RunLog &log, int status, std::string_view errors, NSURL *mirror)
 {
     if (status && !log.errors) {
         if (errors.empty()) {
-            log.status(@"Cargo check failed.\n", OutputTone::Error);
+            LogStatus(log, @"Cargo check failed.\n", OutputTone::Error);
             return;
         }
         NSString *text = ConsoleString(errors);
         if (mirror)
             text = [text stringByReplacingOccurrencesOfString:mirror.path withString:@""];
-        RunMessage message = TerminalDecoder{}.decode(text);
+        RunMessage message = DecodeConsoleString(text);
         message.tone = OutputTone::Error;
-        log.append(std::move(message));
+        LogAppend(log, std::move(message));
     }
 }
 
@@ -1949,7 +1760,7 @@ static void CheckCargo(NSURL *manifest, NSURL *file, NSString *name, const std::
     NSDictionary *project = JSONDictionary(metadata);
     NSString *root = project[@"workspace_root"];
     if (![root isKindOfClass:NSString.class] || !root.isAbsolutePath) {
-        log.status(@"Could not read the Cargo workspace.\n", OutputTone::Error);
+        LogStatus(log, @"Could not read the Cargo workspace.\n", OutputTone::Error);
         return;
     }
     NSURL *workspace = CanonicalFileURL([NSURL fileURLWithPath:root isDirectory:YES]);
@@ -1959,7 +1770,7 @@ static void CheckCargo(NSURL *manifest, NSURL *file, NSString *name, const std::
     if (!scratch || !PrepareCargoCheck(mirror, workspace.path, project[@"packages"], sources, stop, &error)) {
         if (!stop.load(std::memory_order_relaxed)) {
             NSString *message = error ? error.localizedDescription : @"Could not prepare the Cargo workspace.";
-            log.status([message stringByAppendingString:@"\n"], OutputTone::Error);
+            LogStatus(log, [message stringByAppendingString:@"\n"], OutputTone::Error);
         }
         return;
     }
@@ -1992,7 +1803,7 @@ static void CheckRustFile(NSURL *file, NSString *name, NSString *text, const std
     }
     if (!files.folder || !input) {
         NSString *message = error ? error.localizedDescription : @"Could not prepare the Rust source.";
-        log.status([message stringByAppendingString:@"\n"], OutputTone::Error);
+        LogStatus(log, [message stringByAppendingString:@"\n"], OutputTone::Error);
         return;
     }
     DiagnosticContext diagnostics{input, file, directory ? directory : files.folder, name, false, Language::Rust};
@@ -2000,24 +1811,35 @@ static void CheckRustFile(NSURL *file, NSString *name, NSString *text, const std
         @"--error-format=json", @"--json=diagnostic-rendered-ansi", input.path, @"--out-dir", files.folder.path],
         diagnostics.directory, &diagnostics, stop, log);
     if (status && !log.errors && !stop.load(std::memory_order_relaxed))
-        log.status(@"Rust check failed.\n", OutputTone::Error);
+        LogStatus(log, @"Rust check failed.\n", OutputTone::Error);
 }
 
 static bool BuildProgram(NSString *tool, NSArray<NSString *> *arguments, NSURL *directory,
                          const DiagnosticContext &diagnostics, const std::atomic_bool &stop, RunLog &log)
 {
-    log.status(@"Building...\n");
-    log.send(true);
+    LogStatus(log, @"Building...\n");
+    SendLog(log, true);
     int result = RunCommand(tool, arguments, directory, &diagnostics, stop, log);
     if (stop.load(std::memory_order_relaxed))
         return false;
     if (result) {
-        log.status(@"Build failed.\n", OutputTone::Error);
+        LogStatus(log, @"Build failed.\n", OutputTone::Error);
         return false;
     }
-    log.status(@"Build successful\n\n");
-    log.send(true);
+    LogStatus(log, @"Build successful\n\n");
+    SendLog(log, true);
     return true;
+}
+
+static NSArray<NSString *> *GoBuildArguments(NSString *target, NSString *program, bool tests, bool debugging)
+{
+    if (debugging) {
+        // Apple LLDB needs uncompressed Go DWARF for source breakpoints and watches.
+        return tests ? @[@"test", @"-c", @"-gcflags=all=-N -l", @"-ldflags=-compressdwarf=false", @"-o", program, target] :
+                       @[@"build", @"-gcflags=all=-N -l", @"-ldflags=-compressdwarf=false", @"-o", program, target];
+    }
+
+    return tests ? @[@"test", @"-c", @"-o", program, target] : @[@"build", @"-o", program, target];
 }
 
 static void RunGoModule(RunProject project, NSURL *file, const std::atomic_bool &stop,
@@ -2030,25 +1852,22 @@ static void RunGoModule(RunProject project, NSURL *file, const std::atomic_bool 
     if (!PathIsInFolder(directory.path, project.folder.path))
         directory = project.folder;
     DiagnosticContext diagnostics{file, file, directory, file.lastPathComponent, true, Language::Go};
-    if ([file.lastPathComponent hasSuffix:@"_test.go"]) {
-        RunProgram(tool, @[@"test", @"-v", @"."], directory, stop, log, input, ready, &diagnostics);
-        return;
-    }
-
+    bool tests = [file.lastPathComponent hasSuffix:@"_test.go"];
     RunFiles files;
     NSError *error = nil;
     files.folder = TemporaryFolder(&error);
     if (!files.folder) {
-        log.status([NSString stringWithFormat:@"%@\n", error.localizedDescription], OutputTone::Error);
+        LogStatus(log, [NSString stringWithFormat:@"%@\n", error.localizedDescription], OutputTone::Error);
         return;
     }
     NSString *program = [files.folder URLByAppendingPathComponent:@"program"].path;
-    if (!BuildProgram(tool, @[@"build", @"-o", program, @"."], directory, diagnostics, stop, log))
+    if (!BuildProgram(tool, GoBuildArguments(@".", program, tests, false), directory, diagnostics, stop, log))
         return;
+
     if ([NSFileManager.defaultManager isExecutableFileAtPath:program])
-        RunProgram(program, @[], directory, stop, log, input, ready);
+        RunProgram(program, tests ? @[@"-test.v"] : @[], directory, stop, log, input, ready);
     else
-        log.status(@"Open a Go file in a main package or a _test.go file to run tests.\n", OutputTone::Error);
+        LogStatus(log, @"Open a Go file in a main package or a _test.go file to run tests.\n", OutputTone::Error);
 }
 
 static NSString *SwiftProduct(NSDictionary *package, NSURL *folder, NSURL *file)
@@ -2092,7 +1911,7 @@ static NSURL *BuildSwiftPackage(RunProject project, NSURL *file, const std::atom
     NSDictionary *package = JSONDictionary(manifest);
     NSString *product = SwiftProduct(package, project.folder, file);
     if (!product.length) {
-        log.status(@"Open a source file in an executable Swift package target.\n", OutputTone::Error);
+        LogStatus(log, @"Open a source file in an executable Swift package target.\n", OutputTone::Error);
         return nil;
     }
     NSArray *arguments = @[@"build", @"--product", product, @"-Xswiftc", @"-color-diagnostics"];
@@ -2112,7 +1931,7 @@ static NSURL *BuildSwiftPackage(RunProject project, NSURL *file, const std::atom
     NSString *program = ExecutableAt(path, product);
     if (program)
         return [NSURL fileURLWithPath:program];
-    log.status(@"Swift did not produce an executable.\n", OutputTone::Error);
+    LogStatus(log, @"Swift did not produce an executable.\n", OutputTone::Error);
     return nil;
 }
 
@@ -2155,7 +1974,7 @@ static void BuildAndRunDotNet(NSString *tool, NSURL *source, NSURL *directory,
     NSError *error = nil;
     files.folder = TemporaryFolder(&error);
     if (!files.folder) {
-        log.status([NSString stringWithFormat:@"%@\n", error.localizedDescription], OutputTone::Error);
+        LogStatus(log, [NSString stringWithFormat:@"%@\n", error.localizedDescription], OutputTone::Error);
         return;
     }
     NSArray<NSString *> *arguments = @[@"build", source.path, @"--output", files.folder.path,
@@ -2171,7 +1990,7 @@ static void BuildAndRunDotNet(NSString *tool, NSURL *source, NSURL *directory,
     if (assembly)
         RunProgram(tool, @[assembly], directory, stop, log, input, ready);
     else
-        log.status(@"The .NET build did not produce a single executable application.\n", OutputTone::Error);
+        LogStatus(log, @"The .NET build did not produce a single executable application.\n", OutputTone::Error);
 }
 
 static void RunDotNetProject(RunProject project, Language language, NSURL *file, const std::atomic_bool &stop,
@@ -2211,11 +2030,9 @@ static NSArray<NSString *> *NativeSourceArguments(Language language, NSString *p
         args = @[@"-color-diagnostics", path, @"-o", program];
         return debugging ? [args arrayByAddingObjectsFromArray:@[@"-g", @"-Onone"]] : args;
     }
-    if (language == Language::Go) {
-        if (debugging)
-            return @[@"build", @"-gcflags=all=-N -l", @"-o", program, path];
-        return @[@"build", @"-o", program, path];
-    }
+    if (language == Language::Go)
+        return GoBuildArguments(path, program, false, debugging);
+
     if (language == Language::Odin) {
         args = @[@"build", package ? path.stringByDeletingLastPathComponent : path,
                  [@"-out:" stringByAppendingString:program], @"-error-pos-style:unix", @"-terse-errors"];
@@ -2231,32 +2048,306 @@ static NSArray<NSString *> *NativeSourceArguments(Language language, NSString *p
     return Objective(language) ? [args arrayByAddingObjectsFromArray:@[@"-framework", @"Foundation"]] : args;
 }
 
+bool CheckableLanguage(Language language)
+{
+    return language == Language::Rust || language == Language::JSON || language == Language::JSONC ||
+           language == Language::CommonLisp || ToolsForRun(language).check != nil;
+}
+
+static void LogSyntaxIssue(RunLog &log, SyntaxIssue issue, NSURL *file, NSString *name, bool utf16 = false)
+{
+    if (!issue.line || issue.message.empty())
+        return;
+
+    NSString *label = issue.column ? [NSString stringWithFormat:@"%@:%zu:%zu", name, issue.line, issue.column] :
+                                     [NSString stringWithFormat:@"%@:%zu", name, issue.line];
+    NSString *details = ConsoleString(issue.message);
+    RunMessage message{[NSString stringWithFormat:@"%@: error: %@\n", label, details], OutputTone::Error,
+                       {file, issue.line, issue.column, 0, 0, true, false, utf16}, details};
+    message.linkRange = NSMakeRange(0, label.length);
+    LogAppend(log, std::move(message));
+}
+
+static SyntaxIssue CheckLispText(NSString *text, const std::atomic_bool &stop)
+{
+    LexState state;
+    std::u16string line;
+    std::vector<Token> tokens;
+    SyntaxIssue open{};
+    size_t depth = 0;
+    for (NSUInteger start = 0, row = 1; start < text.length; ++row) {
+        if (stop.load(std::memory_order_relaxed))
+            return {};
+
+        NSUInteger end, content;
+        [text getLineStart:nullptr end:&end contentsEnd:&content forRange:NSMakeRange(start, 0)];
+        line.resize(content - start);
+        [text getCharacters:reinterpret_cast<unichar *>(line.data()) range:NSMakeRange(start, line.size())];
+        start = end;
+        if (row == 1 && !line.empty() && line.front() == u'\uFEFF')
+            line.erase(0, 1);
+
+        TokenizeLine(line, Language::CommonLisp, state, tokens);
+        size_t token = 0;
+        for (size_t column = 0; column < line.size(); ++column) {
+            char16_t ch = line[column];
+            if (ch != u'(' && ch != u')')
+                continue;
+
+            while (token < tokens.size() && tokens[token].start + tokens[token].length <= column)
+                ++token;
+
+            if (token < tokens.size() && tokens[token].start <= column && tokens[token].nonCode)
+                continue;
+
+            if (ch == u'(') {
+                if (depth++ == 0)
+                    open = {row, column + 1, "Unclosed list."};
+            } else {
+                if (!depth)
+                    return {row, column + 1, "Unmatched ')'."};
+
+                --depth;
+            }
+        }
+    }
+
+    return depth ? open : SyntaxIssue{};
+}
+
+static NSString *JavaScriptCheckSuffix(NSURL *file)
+{
+    NSString *ext = file.pathExtension.lowercaseString;
+    if ([ext isEqualToString:@"mjs"] || [ext isEqualToString:@"cjs"])
+        return [@"." stringByAppendingString:ext];
+
+    NSURL *manifest = ParentManifest(file.URLByDeletingLastPathComponent, nil, @"package.json");
+    NSData *data = manifest ? [NSData dataWithContentsOfURL:manifest options:NSDataReadingMappedIfSafe error:nil] : nil;
+    if (data.length && data.length <= 1024 * 1024) {
+        id json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+        id type = [json isKindOfClass:NSDictionary.class] ? json[@"type"] : nil;
+        if ([type isEqual:@"module"])
+            return @".mjs";
+        if ([type isEqual:@"commonjs"])
+            return @".cjs";
+    }
+
+    return @".js";
+}
+
+static NSURL *CheckOdinDirectory(NSURL *folder, RunProject project, const std::vector<CheckSource> &sources,
+                                 const std::atomic_bool &stop, RunFiles &files)
+{
+    NSMutableDictionary<NSString *, NSData *> *edits = nil;
+    for (const auto &source : sources) {
+        if (!source.saved && [source.file.URLByDeletingLastPathComponent.path isEqualToString:folder.path]) {
+            NSData *data = [source.text dataUsingEncoding:NSUTF8StringEncoding];
+            if (!data)
+                return nil;
+            if (!edits)
+                edits = [NSMutableDictionary dictionary];
+
+            edits[source.file.path] = data;
+        }
+    }
+
+    if (!edits.count)
+        return folder;
+
+    NSString *root = project.folder.path;
+    if (!PathIsInFolder(folder.path, root))
+        root = folder.path;
+
+    NSError *error = nil;
+    files.folder = CanonicalFileURL(TemporaryFolder(&error));
+    if (!files.folder)
+        return nil;
+
+    NSURL *mirror = [files.folder URLByAppendingPathComponent:@"source" isDirectory:YES];
+    NSMutableSet<NSString *> *branches = [NSMutableSet set];
+    AddCheckBranch(branches, folder.path, root);
+    return WriteCheckMirror(mirror, root, branches, edits, stop, &error) ? MirroredCheckURL(mirror, folder.path) : nil;
+}
+
+static void CheckSourceFile(RunProject project, Language language, NSURL *file, NSString *name, const std::vector<CheckSource> &sources,
+                            const std::atomic_bool &stop, RunLog &log)
+{
+    NSString *text = sources.empty() ? nil : sources.front().text;
+    if (!text.length)
+        return;
+
+    log.locatedOnly = true;
+    if (language == Language::CommonLisp) {
+        LogSyntaxIssue(log, CheckLispText(text, stop), file, name, true);
+        return;
+    }
+
+    if (language == Language::JSON || language == Language::JSONC) {
+        LogSyntaxIssue(log, CheckJSONText(UTF8View(text), language == Language::JSONC), file, name);
+        return;
+    }
+
+    NSString *program = ToolsForRun(language).check;
+    NSString *tool = program ? FindTool(program, language) : nil;
+    if (!tool || stop.load(std::memory_order_relaxed))
+        return;
+
+    NSURL *directory = file.URLByDeletingLastPathComponent;
+    bool odinPackage = language == Language::Odin && file;
+    RunFiles files;
+    NSError *error = nil;
+    NSURL *input = file;
+    NSURL *mirror = nil;
+    if (odinPackage) {
+        directory = CheckOdinDirectory(directory, project, sources, stop, files);
+        if (!directory)
+            return;
+
+        if (files.folder)
+            mirror = [files.folder URLByAppendingPathComponent:@"source" isDirectory:YES];
+    } else {
+        files.folder = TemporaryFolder(&error);
+        if (!files.folder)
+            return;
+
+        NSString *suffix = language == Language::JavaScript ? JavaScriptCheckSuffix(file) : SourceSuffix(language, file);
+        NSData *data = [text dataUsingEncoding:NSUTF8StringEncoding];
+        if (!data)
+            return;
+
+        input = WriteRunSource(files, data, nil, suffix, &error);
+        if (!input)
+            return;
+
+        input = CanonicalFileURL(input);
+    }
+
+    if (!directory)
+        directory = files.folder;
+
+    NSString *path = input.path;
+    NSArray<NSString *> *args = nil;
+    std::optional<ScriptDiagnostic> script;
+    if (CFamily(language)) {
+        args = [NativeFlags(language) arrayByAddingObjectsFromArray:@[@"-fsyntax-only", @"-iquote", directory.path, path]];
+    } else {
+        switch (language) {
+        case Language::Python: {
+            // compile() reads the snapshot and reports positions without evaluating the program.
+            static NSString *const check = @"import sys\n"
+                "p = sys.argv[1]\n"
+                "try:\n"
+                "    compile(open(p, 'rb').read(), p, 'exec')\n"
+                "except SyntaxError as e:\n"
+                "    n, c = e.lineno or 1, e.offset if e.offset and e.offset > 0 else 1\n"
+                "    end = e.end_offset if getattr(e, 'end_lineno', None) == n and e.end_offset else c + 1\n"
+                "    sys.stderr.buffer.write(f'{p}:{n}:{c}:{{{n}:{c}-{n}:{max(c+1,end)}}}: error: {e.msg}\\n'.encode('utf-8'))\n"
+                "    sys.exit(1)\n";
+            args = @[@"-I", @"-S", @"-B", @"-c", check, path];
+            break;
+        }
+        case Language::JavaScript:
+            args = @[@"-u", @"NODE_OPTIONS", tool, @"--check", path];
+            tool = @"/usr/bin/env";
+            script = ScriptDiagnostic::Node;
+            break;
+
+        case Language::Go:
+            args = @[@"-e", @"-l", path];
+            break;
+
+        case Language::Swift:
+            args = @[@"-frontend", @"-parse", @"-color-diagnostics", path];
+            break;
+
+        case Language::Bash:
+            args = @[@"-p", @"-n", path];
+            script = ScriptDiagnostic::Shell;
+            break;
+
+        case Language::Zsh:
+            args = @[@"-dfn", path];
+            script = ScriptDiagnostic::Shell;
+            break;
+
+        case Language::Fish:
+            args = @[@"--no-config", @"--no-execute", path];
+            script = ScriptDiagnostic::Shell;
+            break;
+
+        case Language::Ruby:
+            args = @[@"--disable-gems", @"--disable=rubyopt", @"-c", path];
+            script = ScriptDiagnostic::Shell;
+            break;
+
+        case Language::PHP:
+            args = @[@"-n", @"-l", path];
+            script = ScriptDiagnostic::PHP;
+            break;
+
+        case Language::Lua:
+            args = @[@"-p", path];
+            script = ScriptDiagnostic::Shell;
+            break;
+
+        case Language::Odin:
+            args = @[@"check", odinPackage ? directory.path : path, @"-no-entry-point", @"-error-pos-style:unix", @"-terse-errors"];
+            if (!odinPackage)
+                args = [args arrayByAddingObject:@"-file"];
+
+            break;
+
+        case Language::Zig:
+            args = @[@"ast-check", path];
+            break;
+
+        default:
+            return;
+        }
+    }
+
+    if (script) {
+        std::string out, errors;
+        int status = RunCommand(tool, args, directory, nullptr, stop, log, nullptr, nil, nullptr, &out, &errors);
+        if (status > 0 && !stop.load(std::memory_order_relaxed)) {
+            auto issue = FindScriptIssue(errors, UTF8View(path), *script);
+            if (issue.message.empty())
+                issue = FindScriptIssue(out, UTF8View(path), *script);
+
+            LogSyntaxIssue(log, issue, file, name, *script == ScriptDiagnostic::Node);
+        }
+
+        return;
+    }
+
+    bool bytes = CFamily(language) || language == Language::Go || language == Language::Swift ||
+                 language == Language::Zig || language == Language::Odin;
+    DiagnosticContext diagnostics{input, file, directory, name, bytes, language, mirror};
+    RunCommand(tool, args, directory, &diagnostics, stop, log);
+}
+
 static void RunSource(Language language, NSURL *file, NSString *name, NSString *text, NSURL *workingFolder,
                       const std::atomic_bool &stop, RunLog &log, ProgramInput &inputChannel, void (^ready)(void))
 {
     NSString *toolName = ToolName(language);
     if (!toolName) {
-        log.status(@"This file type cannot be run.\n", OutputTone::Error);
+        LogStatus(log, @"This file type cannot be run.\n", OutputTone::Error);
         return;
     }
     if (!file && !text) {
-        log.status(@"Save this file before running it.\n", OutputTone::Error);
+        LogStatus(log, @"Save this file before running it.\n", OutputTone::Error);
         return;
     }
     NSURL *directory = file.URLByDeletingLastPathComponent;
     NSString *extension = file.pathExtension.lowercaseString;
     NSString *tool = nil, *launcher = nil;
     bool build = CFamily(language) || language == Language::Rust || language == Language::Swift ||
-        language == Language::Go || language == Language::Odin;
+        language == Language::Go || language == Language::Odin || language == Language::Assembly;
     bool kotlin = language == Language::Kotlin && ![extension isEqualToString:@"kts"];
     bool mono = false;
     bool dotnet = false;
-    if (language == Language::Python && workingFolder) {
-        for (NSString *environment in @[@".venv/bin", @"venv/bin"]) {
-            tool = ExecutableAt([workingFolder.path stringByAppendingPathComponent:environment], @"python");
-            if (tool)
-                break;
-        }
+    if (language == Language::Python) {
+        tool = FindPython(workingFolder);
     } else if (language == Language::TypeScript || language == Language::JSX || language == Language::TSX) {
         tool = FindTSX(directory, workingFolder);
     } else if (language == Language::CSharp) {
@@ -2275,7 +2366,7 @@ static void RunSource(Language language, NSURL *file, NSString *name, NSString *
             }
         }
     } else if (language == Language::VisualBasic) {
-        log.status(@"Open a file in a Visual Basic .NET project to run it.\n", OutputTone::Error);
+        LogStatus(log, @"Open a file in a Visual Basic .NET project to run it.\n", OutputTone::Error);
         return;
     }
     if (kotlin) {
@@ -2294,7 +2385,7 @@ static void RunSource(Language language, NSURL *file, NSString *name, NSString *
     if (text || build)
         files.folder = TemporaryFolder(&error);
     if ((text || build) && !files.folder) {
-        log.status([NSString stringWithFormat:@"%@\n", error.localizedDescription], OutputTone::Error);
+        LogStatus(log, [NSString stringWithFormat:@"%@\n", error.localizedDescription], OutputTone::Error);
         return;
     }
     NSURL *input = file;
@@ -2306,7 +2397,7 @@ static void RunSource(Language language, NSURL *file, NSString *name, NSString *
         else
             error = [NSError errorWithDomain:NSCocoaErrorDomain code:NSFileWriteInapplicableStringEncodingError userInfo:nil];
         if (!input || !data) {
-            log.status([NSString stringWithFormat:@"%@\n", error.localizedDescription], OutputTone::Error);
+            LogStatus(log, [NSString stringWithFormat:@"%@\n", error.localizedDescription], OutputTone::Error);
             return;
         }
     }
@@ -2314,14 +2405,15 @@ static void RunSource(Language language, NSURL *file, NSString *name, NSString *
     directory = workingFolder ? workingFolder : directory ? directory : files.folder;
     NSString *path = input.path;
     DiagnosticContext diagnostics{input, file, directory, name,
-        CFamily(language) || language == Language::Go || language == Language::Zig, language};
+        CFamily(language) || language == Language::Go || language == Language::Zig || language == Language::Assembly, language};
     if (dotnet) {
         BuildAndRunDotNet(tool, input, directory, diagnostics, stop, log, inputChannel, ready);
         return;
     }
     if (!build) {
-        bool diagnosticsInOutput = language == Language::Java || language == Language::Kotlin || language == Language::Zig ||
-            language == Language::Dart || language == Language::CSharp || language == Language::FSharp;
+        diagnostics.runtimeLocations = language == Language::Python || JavaScriptFamily(language);
+        bool diagnosticsInOutput = diagnostics.runtimeLocations || language == Language::Java || language == Language::Kotlin ||
+            language == Language::Zig || language == Language::Dart || language == Language::CSharp || language == Language::FSharp;
         RunProgram(tool, ScriptArguments(language, path), directory, stop, log, inputChannel, ready,
                    diagnosticsInOutput ? &diagnostics : nullptr);
         return;
@@ -2339,7 +2431,7 @@ static void RunSource(Language language, NSURL *file, NSString *name, NSString *
     if (!BuildProgram(tool, arguments, directory, diagnostics, stop, log))
         return;
     if (language == Language::Go && ![NSFileManager.defaultManager isExecutableFileAtPath:program]) {
-        log.status(@"A Go program needs package main and a main function.\n", OutputTone::Error);
+        LogStatus(log, @"A Go program needs package main and a main function.\n", OutputTone::Error);
         return;
     }
     if (launcher)
@@ -2348,66 +2440,33 @@ static void RunSource(Language language, NSURL *file, NSString *name, NSString *
         RunProgram(program, @[], directory, stop, log, inputChannel, ready);
 }
 
-static NSURL *BuildCargoDebug(NSURL *manifest, NSURL *file, const std::atomic_bool &stop, RunLog &log)
-{
-    NSString *tool = GetTool(@"cargo", Language::Rust, log);
-    if (!tool)
-        return nil;
-    NSURL *directory = manifest.URLByDeletingLastPathComponent;
-    log.status(@"Building…\n");
-    log.send(true);
-
-    std::string information;
-    int status = RunCommand(tool, @[@"metadata", @"--no-deps", @"--format-version", @"1", @"--manifest-path", manifest.path],
-                            directory, nullptr, stop, log, nullptr, nil, nullptr, &information);
-    if (stop.load(std::memory_order_relaxed))
-        return nil;
-    NSDictionary *metadata = status ? nil : JSONDictionary(information);
-    if (!metadata) {
-        log.status(@"Could not read the Cargo project.\n", OutputTone::Error);
-        return nil;
-    }
-    NSString *root = metadata[@"workspace_root"];
-    NSURL *workspace = root.length ? [NSURL fileURLWithPath:root isDirectory:YES] : directory;
-    NSMutableArray *arguments = [@[@"build", @"--quiet", @"--color", @"always",
-        @"--message-format=json,json-diagnostic-rendered-ansi", @"--config", @"profile.dev.debug=2",
-        @"--config", @"profile.dev.opt-level=0", @"--config", @"profile.dev.strip=false", @"--manifest-path", manifest.path] mutableCopy];
-    AddCargoTarget(arguments, metadata, manifest, file, true);
-    CargoSession cargo{{file, file, workspace, file.lastPathComponent, false, Language::Rust}, nullptr, nil, {}};
-    cargo.executables = [NSMutableOrderedSet orderedSet];
-    cargo.testsOnly = [arguments containsObject:@"--test"];
-    status = RunCommand(tool, arguments, directory, nullptr, stop, log, nullptr, nil, &cargo);
-    if (stop.load(std::memory_order_relaxed))
-        return nil;
-    if (status || !cargo.built) {
-        log.status(@"Build failed.\n", OutputTone::Error);
-        return nil;
-    }
-    if (cargo.executables.count != 1) {
-        NSString *message = cargo.executables.count ? @"Open the main file of the Cargo target you want to debug.\n" :
-                                                     @"Cargo did not produce an executable.\n";
-        log.status(message, OutputTone::Error);
-        return nil;
-    }
-    log.status(@"Build successful\n\n");
-    return [NSURL fileURLWithPath:cargo.executables.firstObject];
-}
-
 static DebugExecutable *BuildDebugExecutable(RunProject project, Language language, NSURL *file,
                                              const std::atomic_bool &stop, RunLog &log)
 {
     if (!file || !DebuggableLanguage(language, file)) {
-        log.status(@"Open a native source file or choose Debug Executable.\n", OutputTone::Error);
+        LogStatus(log, @"Open a source file that supports debugging or choose Debug Executable.\n", OutputTone::Error);
         return nil;
     }
-    RunFiles files;
     NSURL *directory = project.folder ? project.folder : file.URLByDeletingLastPathComponent;
+    if (language == Language::CommonLisp || language == Language::Python) {
+        NSString *tool = language == Language::Python ? FindPython(directory) : nil;
+        if (!tool)
+            tool = GetTool(ToolName(language), language, log);
+
+        if (!tool || stop.load(std::memory_order_relaxed))
+            return nil;
+
+        DebugBackend backend = language == Language::CommonLisp ? DebugBackend::SBCL : DebugBackend::Debugpy;
+        return [[DebugExecutable alloc] initWithFile:file directory:directory backend:backend interpreter:tool];
+    }
+
+    RunFiles files;
     NSURL *program = nil;
     if (project.kind == RunKind::NativeProject) {
         program = BuildNativeProject(directory, file, file.lastPathComponent, files, true, stop, log);
     } else if (project.kind == RunKind::Cargo) {
         directory = project.manifest.URLByDeletingLastPathComponent;
-        program = BuildCargoDebug(project.manifest, file, stop, log);
+        program = RunCargo(project.manifest, file, stop, log, nullptr, nil);
     } else if (project.kind == RunKind::SwiftPackage) {
         program = BuildSwiftPackage(project, file, stop, log, true);
     } else {
@@ -2417,7 +2476,7 @@ static DebugExecutable *BuildDebugExecutable(RunProject project, Language langua
         NSError *error = nil;
         files.folder = TemporaryFolder(&error);
         if (!files.folder) {
-            log.status([error.localizedDescription stringByAppendingString:@"\n"], OutputTone::Error);
+            LogStatus(log, [error.localizedDescription stringByAppendingString:@"\n"], OutputTone::Error);
             return nil;
         }
         program = [files.folder URLByAppendingPathComponent:@"program"];
@@ -2426,8 +2485,7 @@ static DebugExecutable *BuildDebugExecutable(RunProject project, Language langua
         if (project.kind == RunKind::GoModule) {
             directory = sourceDirectory;
             bool test = [file.lastPathComponent hasSuffix:@"_test.go"];
-            arguments = test ? @[@"test", @"-c", @"-gcflags=all=-N -l", @"-o", program.path, @"."] :
-                               @[@"build", @"-gcflags=all=-N -l", @"-o", program.path, @"."];
+            arguments = GoBuildArguments(@".", program.path, test, true);
         } else {
             arguments = NativeSourceArguments(language, file.path, program.path, sourceDirectory,
                                               project.kind == RunKind::OdinPackage, true);
@@ -2440,7 +2498,7 @@ static DebugExecutable *BuildDebugExecutable(RunProject project, Language langua
     if (!program || stop.load(std::memory_order_relaxed))
         return nil;
     if (![NSFileManager.defaultManager isExecutableFileAtPath:program.path]) {
-        log.status(@"The build did not produce an executable.\n", OutputTone::Error);
+        LogStatus(log, @"The build did not produce an executable.\n", OutputTone::Error);
         return nil;
     }
     DebugExecutable *artifact = [[DebugExecutable alloc] initWithFile:program directory:directory];
@@ -2480,6 +2538,7 @@ bool StopSourceRunsForQuit(dispatch_block_t finished)
 @implementation SourceRunner {
     std::atomic_bool _stopped;
     ProgramInput _inputChannel;
+    RunDelivery _delivery;
 }
 
 - (void)startJob:(dispatch_block_t (^)(void))work qos:(qos_class_t)qos cancelled:(dispatch_block_t)cancelled
@@ -2505,13 +2564,6 @@ bool StopSourceRunsForQuit(dispatch_block_t finished)
     });
 }
 
-- (void)startLanguage:(Language)language file:(NSURL *)file name:(NSString *)name workingText:(NSString *)text
-               output:(RunOutput)output finished:(void (^)(void))finished
-{
-    _stopped.store(false, std::memory_order_relaxed);
-    [self startProject:{} language:language file:file name:name workingText:text output:output finished:finished];
-}
-
 - (void)startProject:(RunProject)project language:(Language)language file:(NSURL *)file name:(NSString *)name
          workingText:(NSString *)text output:(RunOutput)output finished:(void (^)(void))finished
 {
@@ -2519,10 +2571,12 @@ bool StopSourceRunsForQuit(dispatch_block_t finished)
     void (^ready)(void) = self.inputReady;
     [self startJob:^dispatch_block_t {
         RunLog log{};
+        log.owner = self;
+        log.delivery = &self->_delivery;
         log.output = output;
         switch (project.kind) {
             case RunKind::Cargo:
-                RunCargo(project.manifest, file, self->_stopped, log, self->_inputChannel, ready);
+                RunCargo(project.manifest, file, self->_stopped, log, &self->_inputChannel, ready);
                 break;
             case RunKind::NativeProject:
                 RunNativeProject(project.folder, file, name, self->_stopped, log, self->_inputChannel, ready);
@@ -2543,34 +2597,44 @@ bool StopSourceRunsForQuit(dispatch_block_t finished)
                 break;
         }
         if (self->_stopped.load(std::memory_order_relaxed)) {
-            log.status(@"Stopped.\n");
+            LogStatus(log, @"Stopped.\n");
         } else if (int code = log.programExitCode; code >= 0) {
-            log.status([NSString stringWithFormat:@"Process exited with code %d.\n", code],
+            LogStatus(log, [NSString stringWithFormat:@"Process exited with code %d.\n", code],
                        code == 0 ? OutputTone::Text : OutputTone::Error);
         }
-        log.send(true);
+        SendLog(log, true);
         return finished;
     } qos:QOS_CLASS_USER_INITIATED cancelled:finished];
 }
 
-- (void)checkRustProject:(RunProject)project file:(NSURL *)file name:(NSString *)name
+- (void)checkProject:(RunProject)project language:(Language)language file:(NSURL *)file name:(NSString *)name
                  sources:(std::vector<CheckSource>)sources cache:(RustCheckCache *)cache finished:(CheckFinished)finished
 {
-    auto snapshot = std::make_shared<const std::vector<CheckSource>>(std::move(sources));
+    auto *snapshot = new std::vector<CheckSource>(std::move(sources));
     [self startJob:^dispatch_block_t {
         RunLog log{};
         log.checking = true;
         if (project.kind == RunKind::Cargo)
             CheckCargo(project.manifest, file, name, *snapshot, cache, self->_stopped, log);
-        else
+        else if (language == Language::Rust)
             CheckRustFile(file, name, snapshot->empty() ? nil : snapshot->front().text, self->_stopped, log);
-        auto result = std::make_shared<CheckResult>();
-        if (!self.isStopped) {
-            result->errors = log.errors;
-            result->diagnostics.assign(std::make_move_iterator(log.messages.begin()), std::make_move_iterator(log.messages.end()));
-        }
-        return ^{ finished(std::move(*result)); };
-    } qos:QOS_CLASS_UTILITY cancelled:^{ finished({}); }];
+        else
+            CheckSourceFile(project, language, file, name, *snapshot, self->_stopped, log);
+
+        delete snapshot;
+        if (self.isStopped)
+            return ^{ finished({}); };
+
+        log.messages.erase(log.messages.begin(), log.messages.begin() + log.first);
+        auto *result = new CheckResult{std::move(log.messages), log.errors, log.warnings};
+        return ^{
+            finished(std::move(*result));
+            delete result;
+        };
+    } qos:QOS_CLASS_UTILITY cancelled:^{
+        delete snapshot;
+        finished({});
+    }];
 }
 
 - (void)buildDebugProject:(RunProject)project language:(Language)language file:(NSURL *)file
@@ -2578,11 +2642,13 @@ bool StopSourceRunsForQuit(dispatch_block_t finished)
 {
     [self startJob:^dispatch_block_t {
         RunLog log{};
+        log.owner = self;
+        log.delivery = &self->_delivery;
         log.output = output;
         DebugExecutable *program = BuildDebugExecutable(project, language, file, self->_stopped, log);
         if (self.isStopped)
-            log.status(@"Stopped.\n");
-        log.send(true);
+            LogStatus(log, @"Stopped.\n");
+        SendLog(log, true);
         return ^{ finished(program); };
     } qos:QOS_CLASS_USER_INITIATED cancelled:^{ finished(nil); }];
 }
@@ -2592,17 +2658,12 @@ bool StopSourceRunsForQuit(dispatch_block_t finished)
 - (void)stop
 {
     _stopped.store(true, std::memory_order_relaxed);
-    _inputChannel.setOpen(false);
+    SetProgramInput(_inputChannel, false);
 }
 
 - (BOOL)sendInput:(NSString *)text
 {
-    NSData *data = [text dataUsingEncoding:NSUTF8StringEncoding];
-    std::lock_guard lock(_inputChannel.mutex);
-    if (!_inputChannel.open || !data.length || data.length > 65536 - _inputChannel.queued.size())
-        return NO;
-    _inputChannel.queued.append(static_cast<const char *>(data.bytes), data.length);
-    return YES;
+    return QueueProgramInput(_inputChannel, UTF8View(text));
 }
 
 @end

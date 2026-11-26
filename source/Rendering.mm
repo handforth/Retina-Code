@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstring>
 #include <list>
+#include <optional>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -81,28 +82,38 @@ static GlyphCache &SharedGlyphMasks()
     return masks;
 }
 
-@interface MaskFont : NSObject {
-@public
-    CTFontRef coreFont;
-    bool hasColorGlyphs;
-    uint32_t slot;
-}
-- (instancetype)initWithFont:(NSFont *)font slot:(uint32_t)index;
-@end
+struct MaskFont {
+    NSFont *font = nil;
+    bool hasColorGlyphs = false;
+};
 
-static MaskFont *CachedMaskFont(NSFont *font)
+static const MaskFont &CachedMaskFont(NSFont *font, uint32_t &slot)
 {
-    static NSMapTable<NSFont *, MaskFont *> *fonts = [NSMapTable strongToStrongObjectsMapTable];
-    MaskFont *entry = [fonts objectForKey:font];
-    if (!entry) {
-        if (fonts.count >= 32) {
-            [fonts removeAllObjects];
-            SharedGlyphMasks().clear();
-        }
-        entry = [[MaskFont alloc] initWithFont:font slot:uint32_t(fonts.count)];
-        [fonts setObject:entry forKey:font];
+    static MaskFont fonts[32];
+    static uint32_t count, last;
+    if (count && fonts[last].font == font) {
+        slot = last;
+        return fonts[last];
     }
-    return entry;
+
+    for (uint32_t i = 0; i < count; ++i) {
+        if ([fonts[i].font isEqual:font]) {
+            slot = last = i;
+            return fonts[i];
+        }
+    }
+
+    if (count == std::size(fonts)) {
+        for (auto &entry : fonts)
+            entry = {};
+        SharedGlyphMasks().clear();
+        count = 0;
+    }
+
+    CTFontRef coreFont = (__bridge CTFontRef)font;
+    slot = last = count++;
+    fonts[slot] = {font, (CTFontGetSymbolicTraits(coreFont) & kCTFontTraitColorGlyphs) != 0};
+    return fonts[slot];
 }
 
 struct GlyphStyle {
@@ -131,29 +142,10 @@ static uint32_t GlyphStyleSlot(const RenderSettings &settings, bool darkPaper)
     return uint32_t(count++);
 }
 
-@implementation MaskFont
-
-- (instancetype)initWithFont:(NSFont *)font slot:(uint32_t)index
-{
-    self = [super init];
-    if (self) {
-        coreFont = (CTFontRef)CFRetain((__bridge CTFontRef)font);
-        hasColorGlyphs = (CTFontGetSymbolicTraits(coreFont) & kCTFontTraitColorGlyphs) != 0;
-        slot = index;
-    }
-    return self;
-}
-
-- (void)dealloc
-{
-    if (coreFont)
-        CFRelease(coreFont);
-}
-
-@end
-
 static constexpr int phases = 12;
 static constexpr int verticalSamples = 4;
+static constexpr int maxGlyphSize = 1024;
+static constexpr int maxPaddedGlyphSize = maxGlyphSize + 6; // Pixel rounding and two pixels on each side.
 
 using CoverageCurve = std::array<uint8_t, 9>;
 
@@ -178,7 +170,7 @@ static void AddEdgeSpill(GlyphMask &mask, int opacity)
     size_t pixels = size_t(mask.width) * mask.height;
     std::vector<uint8_t> neutral(pixels);
     for (size_t pixel = 0; pixel < pixels; ++pixel) {
-        const uint8_t *alpha = mask.coverage.data() + pixel * 3;
+        const uint8_t *alpha = mask.coverage.data() + pixel * 4;
         neutral[pixel] = uint8_t((alpha[0] + 2 * alpha[1] + alpha[2] + 2) / 4);
     }
 
@@ -189,7 +181,7 @@ static void AddEdgeSpill(GlyphMask &mask, int opacity)
             int neighbor = std::max({neutral[pixel - 1], neutral[pixel + 1],
                                      neutral[pixel - mask.width], neutral[pixel + mask.width]});
             int spill = (neighbor * opacity + 127) / 255;
-            uint8_t *alpha = mask.coverage.data() + pixel * 3;
+            uint8_t *alpha = mask.coverage.data() + pixel * 4;
             for (int channel = 0; channel < 3; ++channel)
                 alpha[channel] += uint8_t(((255 - alpha[channel]) * spill + 127) / 255);
         }
@@ -212,7 +204,7 @@ static GlyphMask MakeMask(CTFontRef font, CGGlyph glyph, int phaseX, int phaseY,
     const CoverageCurve &curve = web ? webCurve : (darkPaper ? darkLCDCurve : lightLCDCurve);
     CGFloat stroke = CTFontGetSize(font) * (web ? 0.025 : (darkPaper ? 0.037 : 0.036)) * settings.strokeWeight;
     CGRect bounds = CGRectInset(CGPathGetPathBoundingBox(outline), -stroke / 2, -stroke / 2);
-    if (bounds.size.width * scale > 1024 || bounds.size.height * scale > 1024) {
+    if (bounds.size.width * scale > maxGlyphSize || bounds.size.height * scale > maxGlyphSize) {
         CGPathRelease(outline);
         mask.width = -1;
         return mask;
@@ -251,8 +243,8 @@ static GlyphMask MakeMask(CTFontRef font, CGGlyph glyph, int phaseX, int phaseY,
     CGPathRelease(outline);
 
     const auto *pixels = static_cast<const uint8_t *>(CGBitmapContextGetData(raster));
-    mask.coverage.resize(size_t(samples) * mask.height);
-    std::vector<int> columns(samples);
+    mask.coverage.resize(size_t(mask.width) * mask.height * 4);
+    int columns[maxPaddedGlyphSize * 3];
     int fringing = int(std::lround(settings.fringing * 256));
     for (int row = 0; row < mask.height; ++row) {
         const uint8_t *source = pixels + size_t(row * verticalSamples) * stride;
@@ -263,9 +255,9 @@ static GlyphMask MakeMask(CTFontRef font, CGGlyph glyph, int phaseX, int phaseY,
             columns[sample] = coverage;
         }
 
-        uint8_t *output = mask.coverage.data() + size_t(row) * samples;
+        uint8_t *output = mask.coverage.data() + size_t(row) * mask.width * 4;
         for (int column = 0; column < samples; column += 3) {
-            uint8_t *rgb = output + column;
+            uint8_t *rgb = output + column / 3 * 4;
             if (web) {
                 int coverage = (columns[column] + columns[column + 1] + columns[column + 2] +
                                 verticalSamples * 3 / 2) / (verticalSamples * 3);
@@ -323,6 +315,15 @@ struct Surface {
     int height = 0;
 };
 
+// Two RGBX pixels fit in eight 16-bit lanes. The unused byte has zero coverage.
+using PixelBytes = uint8_t __attribute__((ext_vector_type(8)));
+using PixelLanes = uint16_t __attribute__((ext_vector_type(8)));
+
+static PixelLanes Divide255(PixelLanes value)
+{
+    return (value + (value >> 8) + 1) >> 8;
+}
+
 template<bool translucent>
 static void BlendMask(const Surface &surface, const GlyphMask &mask, int x, int y,
                       CGRect clip, const std::array<int, 3> &ink, int opacity)
@@ -337,17 +338,31 @@ static void BlendMask(const Surface &surface, const GlyphMask &mask, int x, int 
     if (firstX >= lastX || firstY >= lastY)
         return;
 
+    PixelLanes color = {uint16_t(ink[0]), uint16_t(ink[1]), uint16_t(ink[2]), 0,
+                        uint16_t(ink[0]), uint16_t(ink[1]), uint16_t(ink[2]), 0};
     for (int row = firstY; row < lastY; ++row) {
         uint8_t *pixel = surface.data + size_t(top + row) * surface.stride + (left + firstX) * 4;
-        const uint8_t *alpha = mask.coverage.data() + (size_t(row) * mask.width + firstX) * 3;
-        for (int column = firstX; column < lastX; ++column, pixel += 4, alpha += 3) {
+        const uint8_t *alpha = mask.coverage.data() + (size_t(row) * mask.width + firstX) * 4;
+        int column = firstX;
+        for (; column + 1 < lastX; column += 2, pixel += 8, alpha += 8) {
+            PixelBytes source, coverage;
+            std::memcpy(&source, pixel, sizeof(source));
+            std::memcpy(&coverage, alpha, sizeof(coverage));
+            PixelLanes samples = __builtin_convertvector(coverage, PixelLanes);
+            if constexpr (translucent)
+                samples = Divide255(samples * uint16_t(opacity) + 127);
+            PixelLanes background = __builtin_convertvector(source, PixelLanes);
+            auto mixed = Divide255(background * (255 - samples) + color * samples + 127);
+            auto packed = __builtin_convertvector(mixed, PixelBytes);
+            std::memcpy(pixel, &packed, sizeof(packed));
+        }
+
+        if (column < lastX) {
             for (int channel = 0; channel < 3; ++channel) {
                 int coverage = alpha[channel];
                 if constexpr (translucent)
                     coverage = (coverage * opacity + 127) / 255;
-                if (coverage)
-                    pixel[channel] = uint8_t((pixel[channel] * (255 - coverage) +
-                                             ink[channel] * coverage + 127) / 255);
+                pixel[channel] = uint8_t((pixel[channel] * (255 - coverage) + ink[channel] * coverage + 127) / 255);
             }
         }
     }
@@ -409,9 +424,11 @@ static void MergeRanges(std::vector<NSRange> &ranges)
     uint32_t _styleSlot;
     NSColor *_glyphColor;
     NSColor *_selectionColor;
+    NSRange _definitionLink;
     std::vector<NSRange> _selectionRanges;
     std::vector<EditorFold> _folds;
     std::vector<NSRange> _hidden;
+    __weak id<EditorInlaySpacing> _inlaySpacing;
 }
 
 - (const std::vector<EditorFold> &)editorFolds { return _folds; }
@@ -426,7 +443,88 @@ static void MergeRanges(std::vector<NSRange> &ranges)
         else
             _hidden.push_back(fold.hidden);
     }
-    self.delegate = _hidden.empty() ? nil : self;
+    self.delegate = _hidden.empty() && !_inlaySpacing ? nil : self;
+}
+
+- (void)setInlaySpacingSource:(id<EditorInlaySpacing>)source
+{
+    _inlaySpacing = source;
+    self.delegate = _hidden.empty() && !source ? nil : self;
+}
+
+- (CGFloat)inlayWidthAfterCharacter:(NSUInteger)character
+{
+    id<EditorInlaySpacing> source = _inlaySpacing;
+    if (!source)
+        return 0;
+    auto gaps = [source inlayGaps];
+    auto gap = std::ranges::lower_bound(gaps, character + 1, {}, &InlayGap::at);
+    return gap != gaps.end() && gap->kind != InlayGapKind::Leading && character >= gap->glyphStart ? gap->width : 0;
+}
+
+- (BOOL)layoutManager:(NSLayoutManager *)layout shouldSetLineFragmentRect:(inout NSRect *)fragment
+   lineFragmentUsedRect:(inout NSRect *)used baselineOffset:(inout CGFloat *)baseline
+        inTextContainer:(NSTextContainer *)container forGlyphRange:(NSRange)range
+{
+    (void)baseline;
+    (void)container;
+    id<EditorInlaySpacing> source = _inlaySpacing;
+    if (!source || !range.length)
+        return NO;
+
+    auto gaps = [source inlayGaps];
+    NSUInteger at = [layout characterIndexForGlyphAtIndex:range.location];
+    auto indent = std::ranges::lower_bound(gaps, at, {}, &InlayGap::at);
+    if (indent == gaps.end() || indent->at != at || indent->kind != InlayGapKind::Leading)
+        return NO;
+    fragment->origin.x += indent->width;
+    used->origin.x += indent->width;
+    return YES;
+}
+
+static const InlayGap *InlayGapForTab(std::span<const InlayGap> gaps, NSUInteger character)
+{
+    auto gap = std::ranges::upper_bound(gaps, character + 1, {}, &InlayGap::at);
+    if (gap == gaps.begin())
+        return nullptr;
+    --gap;
+    return gap->kind != InlayGapKind::Leading && character >= gap->lineStart && character < gap->lineEnd ? &*gap : nullptr;
+}
+
+- (NSControlCharacterAction)layoutManager:(NSLayoutManager *)layout shouldUseAction:(NSControlCharacterAction)action
+               forControlCharacterAtIndex:(NSUInteger)character
+{
+    (void)layout;
+    id<EditorInlaySpacing> source = _inlaySpacing;
+    if (!source || action != NSControlCharacterActionHorizontalTab)
+        return action;
+    return InlayGapForTab([source inlayGaps], character) ? NSControlCharacterActionWhitespace : action;
+}
+
+- (NSRect)layoutManager:(NSLayoutManager *)layout boundingBoxForControlGlyphAtIndex:(NSUInteger)glyph
+       forTextContainer:(NSTextContainer *)container proposedLineFragment:(NSRect)fragment
+          glyphPosition:(NSPoint)position characterIndex:(NSUInteger)character
+{
+    (void)glyph;
+    (void)container;
+    id<EditorInlaySpacing> source = _inlaySpacing;
+    if (!source)
+        return NSZeroRect;
+    auto gap = InlayGapForTab([source inlayGaps], character);
+    if (!gap)
+        return NSZeroRect;
+
+    NSParagraphStyle *style = [layout.textStorage attribute:NSParagraphStyleAttributeName
+                                                     atIndex:character effectiveRange:nullptr];
+    CGFloat interval = style.defaultTabInterval;
+    if (interval <= 0)
+        interval = 28;
+    // Advance to the tab stop the source would have used before inserting the hints.
+    bool attached = gap->at == character + 1 && gap->kind == InlayGapKind::Tab;
+    CGFloat before = gap->preceding + (attached ? 0 : gap->width);
+    CGFloat sourceX = std::max(0.0, position.x - NSMinX(fragment) - before);
+    CGFloat stop = (std::floor((sourceX + 0.001) / interval) + 1) * interval;
+    return NSMakeRect(0, 0, stop - sourceX + (attached ? gap->width : 0), 0);
 }
 
 - (void)setEditorFolds:(std::vector<EditorFold>)folds
@@ -473,6 +571,8 @@ static void MergeRanges(std::vector<NSRange> &ranges)
                        font:(NSFont *)font forGlyphRange:(NSRange)range
 {
     std::vector<NSGlyphProperty> flags;
+    if (_hidden.empty())
+        return 0;
     for (NSUInteger i = 0; i < range.length; ++i) {
         auto fold = std::upper_bound(_hidden.begin(), _hidden.end(), indexes[i],
                                      [](NSUInteger at, NSRange hidden) { return at < hidden.location; });
@@ -556,7 +656,18 @@ static void MergeRanges(std::vector<NSRange> &ranges)
     }
 }
 
-- (void)drawGlyphsForGlyphRange:(NSRange)range atPoint:(NSPoint)origin
+- (void)setDefinitionLinkRange:(NSRange)range
+{
+    if (NSEqualRanges(_definitionLink, range))
+        return;
+    if (_definitionLink.length)
+        [self invalidateDisplayForCharacterRange:_definitionLink];
+    _definitionLink = range;
+    if (range.length)
+        [self invalidateDisplayForCharacterRange:range];
+}
+
+- (void)drawSelectionGlyphs:(NSRange)range atPoint:(NSPoint)origin
 {
     if (_selectionRanges.empty()) {
         [super drawGlyphsForGlyphRange:range atPoint:origin];
@@ -585,36 +696,69 @@ static void MergeRanges(std::vector<NSRange> &ranges)
         [super drawGlyphsForGlyphRange:NSMakeRange(drawn, end - drawn) atPoint:origin];
 }
 
-- (void)showCGGlyphs:(const CGGlyph *)glyphs positions:(const CGPoint *)positions
-              count:(NSInteger)count font:(NSFont *)font textMatrix:(CGAffineTransform)textMatrix
-         attributes:(NSDictionary<NSAttributedStringKey, id> *)attributes inContext:(CGContextRef)context
+- (void)drawDefinitionUnderline:(NSRange)range atPoint:(NSPoint)origin color:(NSColor *)color
+{
+    NSTextContainer *container = [self textContainerForGlyphAtIndex:range.location effectiveRange:nullptr];
+    NSRect glyphRect = [self boundingRectForGlyphRange:range inTextContainer:container];
+    NSRect lineRect = [self lineFragmentRectForGlyphAtIndex:range.location effectiveRange:nullptr];
+    NSPoint glyph = [self locationForGlyphAtIndex:range.location];
+    NSFont *font = [self.textStorage attribute:NSFontAttributeName atIndex:[self characterIndexForGlyphAtIndex:range.location]
+                                 effectiveRange:nullptr];
+    CGContextRef context = NSGraphicsContext.currentContext.CGContext;
+    CGFloat pixel = 1.0 / std::max<CGFloat>(1.0, std::abs(CGContextGetCTM(context).d));
+    CGFloat baseline = origin.y + NSMinY(lineRect) + glyph.y;
+    CGFloat y = std::round((baseline - font.underlinePosition) / pixel) * pixel;
+    [color setFill];
+    NSRectFill(NSMakeRect(origin.x + NSMinX(glyphRect), y, NSWidth(glyphRect), pixel));
+}
+
+- (void)drawGlyphsForGlyphRange:(NSRange)range atPoint:(NSPoint)origin
+{
+    if (!_definitionLink.length && _selectionRanges.empty()) {
+        [super drawGlyphsForGlyphRange:range atPoint:origin];
+        return;
+    }
+    if (_definitionLink.length) {
+        NSRange chars = [self characterRangeForGlyphRange:range actualGlyphRange:nullptr];
+        NSRange link = NSIntersectionRange(chars, _definitionLink);
+        if (link.length) {
+            NSRange glyphs = NSIntersectionRange(range, [self glyphRangeForCharacterRange:link actualCharacterRange:nullptr]);
+            NSUInteger end = NSMaxRange(range);
+            if (glyphs.length) {
+                if (range.location < glyphs.location)
+                    [self drawSelectionGlyphs:NSMakeRange(range.location, glyphs.location - range.location) atPoint:origin];
+                NSColor *color = NSColor.linkColor;
+                [self drawGlyphsForGlyphRange:glyphs atPoint:origin color:color];
+                [self drawDefinitionUnderline:glyphs atPoint:origin color:color];
+                if (NSMaxRange(glyphs) < end)
+                    [self drawSelectionGlyphs:NSMakeRange(NSMaxRange(glyphs), end - NSMaxRange(glyphs)) atPoint:origin];
+                return;
+            }
+        }
+    }
+    [self drawSelectionGlyphs:range atPoint:origin];
+}
+
+- (BOOL)drawGlyphMasks:(const CGGlyph *)glyphs positions:(const CGPoint *)positions count:(NSInteger)count
+                  font:(NSFont *)font color:(NSColor *)color inContext:(CGContextRef)context
 {
     CGAffineTransform transform = CGContextGetCTM(context);
     if (context != _surface.context ||
-        textMatrix.a != 1 || textMatrix.d != -1 || textMatrix.b != 0 || textMatrix.c != 0 ||
-        transform.a != _scale || transform.d != -_scale || transform.b != 0 || transform.c != 0) {
-        if (_glyphColor) {
-            CGContextSaveGState(context);
-            CGContextSetFillColorWithColor(context, _glyphColor.CGColor);
-        }
-        DrawCoreText((__bridge CTFontRef)font, glyphs, positions, count, textMatrix, context);
-        if (_glyphColor)
-            CGContextRestoreGState(context);
-        return;
-    }
-    MaskFont *entry = CachedMaskFont(font);
-    if (entry->hasColorGlyphs) {
-        DrawCoreText(entry->coreFont, glyphs, positions, count, textMatrix, context);
-        return;
-    }
+        transform.a != _scale || transform.d != -_scale || transform.b != 0 || transform.c != 0)
+        return NO;
 
-    NSColor *color = _glyphColor ? _glyphColor : attributes[NSForegroundColorAttributeName];
+    uint32_t fontSlot;
+    const auto &entry = CachedMaskFont(font, fontSlot);
+    if (entry.hasColorGlyphs)
+        return NO;
+    CTFontRef coreFont = (__bridge CTFontRef)entry.font;
+
     color = [color colorUsingColorSpace:NSColorSpace.sRGBColorSpace];
     if (!color)
         color = SRGBColor(rgb(0, 0, 0));
     int opacity = int(std::lround(color.alphaComponent * 255));
     if (!opacity)
-        return;
+        return YES;
     std::array<int, 3> ink = {int(std::lround(color.redComponent * 255)),
                              int(std::lround(color.greenComponent * 255)),
                              int(std::lround(color.blueComponent * 255))};
@@ -622,7 +766,7 @@ static void MergeRanges(std::vector<NSRange> &ranges)
     // device-space conversion can include a separate offset during overscroll.
     CGRect clip = CGRectIntegral(CGRectApplyAffineTransform(CGContextGetClipBoundingBox(context), transform));
     if (CGRectIsEmpty(clip))
-        return;
+        return YES;
 
     GlyphCache &masks = SharedGlyphMasks();
     uint64_t style = uint64_t(_styleSlot) << 32;
@@ -633,81 +777,152 @@ static void MergeRanges(std::vector<NSRange> &ranges)
         int phaseX, phaseY;
         int x = PixelAndPhase(point.x, phaseX);
         int y = PixelAndPhase(point.y, phaseY);
-        uint32_t glyphKey = (((entry->slot * 65536 + glyphs[i]) * phases + phaseX) * phases + phaseY) *
+        uint32_t glyphKey = (((fontSlot * 65536 + glyphs[i]) * phases + phaseX) * phases + phaseY) *
                             4 + (_scale - 1);
         uint64_t key = style | glyphKey;
         const GlyphMask *mask = masks.find(key);
         GlyphMask uncached;
         if (!mask) {
-            uncached = MakeMask(entry->coreFont, glyphs[i], phaseX, phaseY, _scale, _settings, _darkPaper);
+            uncached = MakeMask(coreFont, glyphs[i], phaseX, phaseY, _scale, _settings, _darkPaper);
             mask = masks.insert(key, uncached);
         }
         if (mask->width < 0) {
             [color setFill];
-            DrawCoreText(entry->coreFont, glyphs + i, positions + i, 1, textMatrix, context);
+            DrawCoreText(coreFont, glyphs + i, positions + i, 1, CGAffineTransformMakeScale(1, -1), context);
         } else if (opacity == 255) {
             BlendMask<false>(_surface, *mask, x, y, clip, ink, opacity);
         } else {
             BlendMask<true>(_surface, *mask, x, y, clip, ink, opacity);
         }
     }
+    return YES;
+}
+
+- (void)showCGGlyphs:(const CGGlyph *)glyphs positions:(const CGPoint *)positions
+              count:(NSInteger)count font:(NSFont *)font textMatrix:(CGAffineTransform)textMatrix
+         attributes:(NSDictionary<NSAttributedStringKey, id> *)attributes inContext:(CGContextRef)context
+{
+    if (context == _surface.context && textMatrix.a == 1 && textMatrix.d == -1 && textMatrix.b == 0 && textMatrix.c == 0) {
+        NSColor *color = _glyphColor ? _glyphColor : attributes[NSForegroundColorAttributeName];
+        if ([self drawGlyphMasks:glyphs positions:positions count:count font:font color:color inContext:context])
+            return;
+    }
+
+    if (_glyphColor) {
+        CGContextSaveGState(context);
+        CGContextSetFillColorWithColor(context, _glyphColor.CGColor);
+    }
+    DrawCoreText((__bridge CTFontRef)font, glyphs, positions, count, textMatrix, context);
+    if (_glyphColor)
+        CGContextRestoreGState(context);
+}
+
+- (void)drawShapedLine:(CTLineRef)line atPoint:(NSPoint)point color:(NSColor *)color
+{
+    CGContextRef context = NSGraphicsContext.currentContext.CGContext;
+    auto drawNative = [&](CTRunRef run, CFIndex start) {
+        CGAffineTransform matrix = CGContextGetTextMatrix(context);
+        CGContextSaveGState(context);
+        CGContextTranslateCTM(context, point.x, point.y);
+        CGContextScaleCTM(context, 1, -1);
+        CGContextSetTextMatrix(context, CGAffineTransformIdentity);
+        CGContextSetTextPosition(context, 0, 0);
+        CGContextSetFillColorWithColor(context, color.CGColor);
+        if (run)
+            CTRunDraw(run, context, CFRangeMake(start, 0));
+        else
+            CTLineDraw(line, context);
+        CGContextRestoreGState(context);
+        CGContextSetTextMatrix(context, matrix);
+    };
+
+    if (context != _surface.context) {
+        drawNative(nullptr, 0);
+        return;
+    }
+
+    CFArrayRef runs = CTLineGetGlyphRuns(line);
+    CGGlyph glyphs[128];
+    CGPoint positions[128];
+    for (CFIndex index = 0, runCount = CFArrayGetCount(runs); index < runCount; ++index) {
+        CTRunRef run = (CTRunRef)CFArrayGetValueAtIndex(runs, index);
+        NSFont *font = (__bridge NSFont *)CFDictionaryGetValue(CTRunGetAttributes(run), kCTFontAttributeName);
+        CFIndex count = CTRunGetGlyphCount(run);
+        CFIndex drawn = 0;
+        if (font && !(CTRunGetStatus(run) & kCTRunStatusHasNonIdentityMatrix)) {
+            while (drawn < count) {
+                CFIndex length = std::min(count - drawn, CFIndex(std::size(glyphs)));
+                CFRange range = CFRangeMake(drawn, length);
+                CTRunGetGlyphs(run, range, glyphs);
+                CTRunGetPositions(run, range, positions);
+                // Core Text's run positions are relative to the baseline, with y pointing up.
+                for (CFIndex i = 0; i < length; ++i)
+                    positions[i] = NSMakePoint(point.x + positions[i].x, point.y - positions[i].y);
+                if (![self drawGlyphMasks:glyphs positions:positions count:length font:font color:color inContext:context])
+                    break;
+                drawn += length;
+            }
+        }
+
+        if (drawn < count)
+            drawNative(run, drawn);
+    }
 }
 
 @end
 
-static int GrayLevel(int red, int green, int blue)
+template<class Pixel>
+static Pixel ClampByte(Pixel value)
 {
-    return (54 * red + 183 * green + 19 * blue + 128) >> 8;
-}
-
-static int SaturatedChannel(int channel, int gray, int saturation)
-{
-    return std::clamp((channel * saturation + gray * (256 - saturation) + 128) >> 8, 0, 255);
+    return __builtin_elementwise_min(__builtin_elementwise_max(value, (Pixel)0), (Pixel)255);
 }
 
 static uint8_t BrightnessLevel(int channel, int brightness)
 {
-    return uint8_t(std::clamp((channel * brightness + 128) >> 8, 0, 255));
+    return uint8_t(ClampByte((channel * brightness + 128) >> 8));
 }
 
-template<bool adjustBrightness>
-static Col32 FilterColor(Col32 color, int saturation, int brightness)
+template<bool adjustBrightness, class Pixel>
+static Pixel FilterPixels(Pixel color, int saturation, int brightness)
 {
-    int gray = GrayLevel(ColorRed(color), ColorGreen(color), ColorBlue(color));
-    Col32 filtered = Col32(ColorAlpha(color)) << 24;
-    for (unsigned shift : {0U, 8U, 16U}) {
-        int channel = SaturatedChannel(uint8_t(color >> shift), gray, saturation);
+    Pixel red = color & 255;
+    Pixel green = (color >> 8) & 255;
+    Pixel blue = (color >> 16) & 255;
+    Pixel gray = (54 * red + 183 * green + 19 * blue + 128) >> 8;
+    auto filter = [&](Pixel channel) {
+        channel = ClampByte((channel * saturation + gray * (256 - saturation) + 128) >> 8);
         if constexpr (adjustBrightness)
-            channel = BrightnessLevel(channel, brightness);
-        filtered |= Col32(channel) << shift;
-    }
-    return filtered;
+            channel = ClampByte((channel * brightness + 128) >> 8);
+        return channel;
+    };
+    return (color & (Pixel)0xff000000U) | filter(red) | (filter(green) << 8) | (filter(blue) << 16);
 }
 
 NSColor *RenderedEditorColor(Col32 color, const RenderSettings &settings)
 {
     int saturation = int(std::lround(settings.saturation * 256));
     int brightness = int(std::lround(settings.brightness * 256));
-    return SRGBColor(FilterColor<true>(color, saturation, brightness));
+    return SRGBColor(Col32(FilterPixels<true>(int32_t(color), saturation, brightness)));
 }
 
 template<bool adjustBrightness>
 static void SaturatePixels(uint8_t *data, size_t width, size_t height, size_t stride, int saturation, int brightness)
 {
-    // The bitmap is RGBX, and most of it is long runs of the same paper color.
-    Col32 previous = 0;
-    Col32 filtered = 0;
+    using Pixels = int32_t __attribute__((ext_vector_type(4)));
     for (size_t row = 0; row < height; ++row) {
         uint8_t *pixel = data + row * stride;
-        for (size_t column = 0; column < width; ++column, pixel += 4) {
-            Col32 color;
+        size_t column = 0;
+        for (; column + 4 <= width; column += 4, pixel += sizeof(Pixels)) {
+            Pixels color;
             std::memcpy(&color, pixel, sizeof(color));
-            if (color != previous) {
-                previous = color;
-                filtered = FilterColor<adjustBrightness>(color, saturation, brightness);
-            }
-            if (filtered != color)
-                std::memcpy(pixel, &filtered, sizeof(filtered));
+            Pixels filtered = FilterPixels<adjustBrightness>(color, saturation, brightness);
+            std::memcpy(pixel, &filtered, sizeof(filtered));
+        }
+        for (; column < width; ++column, pixel += 4) {
+            int32_t color;
+            std::memcpy(&color, pixel, sizeof(color));
+            int32_t filtered = FilterPixels<adjustBrightness>(color, saturation, brightness);
+            std::memcpy(pixel, &filtered, sizeof(filtered));
         }
     }
 }
@@ -736,6 +951,17 @@ static void ApplyColorFilters(CGContextRef bitmap, const RenderSettings &setting
     }
 }
 
+static std::optional<Col32> SolidSurfaceColor(CGContextRef bitmap, size_t width, size_t height, size_t stride)
+{
+    auto *pixels = static_cast<const uint8_t *>(CGBitmapContextGetData(bitmap));
+    for (size_t y = 0; y < height; ++y) {
+        const uint8_t *row = pixels + y * stride;
+        if (std::memcmp(row, pixels, 4) || std::memcmp(row, row + 4, (width - 1) * 4))
+            return {};
+    }
+    return rgb(pixels[0], pixels[1], pixels[2]);
+}
+
 static void DrawSurfaceBand(CGContextRef target, CGColorSpaceRef space, NSRect band, NSRect raster,
                             size_t width, size_t stride, int scale, RenderSettings settings,
                             CodeLayoutManager *layout, BOOL darkPaper, void (^draw)(NSRect))
@@ -762,6 +988,19 @@ static void DrawSurfaceBand(CGContextRef target, CGColorSpaceRef space, NSRect b
     [NSGraphicsContext restoreGraphicsState];
 
     ApplyColorFilters(bitmap, settings);
+    if (auto color = SolidSurfaceColor(bitmap, width, height, stride)) {
+        // Empty bands can go straight to AppKit without a viewport-sized image.
+        CGContextRelease(bitmap);
+        CGFloat components[] = {ColorRed(*color) / 255.0, ColorGreen(*color) / 255.0,
+                                ColorBlue(*color) / 255.0, 1.0};
+        CGContextSaveGState(target);
+        CGContextSetBlendMode(target, kCGBlendModeCopy);
+        CGContextSetFillColorSpace(target, space);
+        CGContextSetFillColor(target, components);
+        CGContextFillRect(target, band);
+        CGContextRestoreGState(target);
+        return;
+    }
     CGImageRef image = CGBitmapContextCreateImage(bitmap);
     CGContextRelease(bitmap);
     if (!image) {
@@ -876,6 +1115,7 @@ void DrawEditorWhitespace(NSTextView *view, NSRect dirty, NSFont *font, Whitespa
         return;
 
     NSLayoutManager *layout = view.layoutManager;
+    CodeLayoutManager *codeLayout = [layout isKindOfClass:CodeLayoutManager.class] ? (CodeLayoutManager *)layout : nil;
     NSTextContainer *container = view.textContainer;
     NSPoint origin = view.textContainerOrigin;
     NSRect area = NSOffsetRect(dirty, -origin.x, -origin.y);
@@ -989,6 +1229,7 @@ void DrawEditorWhitespace(NSTextView *view, NSRect dirty, NSFont *font, Whitespa
                 }
                 NSRect cell = advance > 0 ? NSMakeRect(cellStart, NSMinY(line), advance, NSHeight(line)) :
                     [layout boundingRectForGlyphRange:NSMakeRange(glyph, 1) inTextContainer:container];
+                cell.size.width = std::max(0.0, NSWidth(cell) - [codeLayout inlayWidthAfterCharacter:at]);
                 if (!NSIntersectsRect(cell, area))
                     continue;
                 CGFloat y = origin.y + NSMinY(line) + position.y - centerAboveBaseline;

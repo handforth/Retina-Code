@@ -1,6 +1,7 @@
 #pragma once
 
 #import <AppKit/AppKit.h>
+#import <CoreText/CTLine.h>
 #include "Color.h"
 #include <span>
 #include <vector>
@@ -26,12 +27,31 @@ struct EditorFold {
     NSRange hidden;
 };
 
+enum class InlayGapKind : uint8_t { Glyph, Tab, Leading };
+
+struct InlayGap {
+    NSUInteger at;
+    NSUInteger lineStart, lineEnd;
+    NSUInteger glyphStart;
+    CGFloat width;
+    CGFloat preceding;
+    InlayGapKind kind;
+};
+
+@protocol EditorInlaySpacing <NSObject>
+- (std::span<const InlayGap>)inlayGaps;
+@end
+
 @interface CodeLayoutManager : NSLayoutManager <NSLayoutManagerDelegate>
 - (void)drawGlyphsForGlyphRange:(NSRange)range atPoint:(NSPoint)origin color:(NSColor *)color;
+- (void)drawShapedLine:(CTLineRef)line atPoint:(NSPoint)point color:(NSColor *)color;
 - (void)setSelectionColor:(NSColor *)color characterRanges:(std::span<const NSRange>)ranges;
+- (void)setDefinitionLinkRange:(NSRange)range;
 - (const std::vector<EditorFold> &)editorFolds;
 - (const std::vector<NSRange> &)hiddenEditorRanges;
 - (void)setEditorFolds:(std::vector<EditorFold>)folds;
+- (void)setInlaySpacingSource:(id<EditorInlaySpacing>)source;
+- (CGFloat)inlayWidthAfterCharacter:(NSUInteger)character;
 @end
 
 void DrawEditorSurface(NSView *view, NSRect dirty, RenderSettings settings, NSColor *paper, CodeLayoutManager *layout,

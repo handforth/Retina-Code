@@ -2,12 +2,12 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
+#include <cstdint>
 #include <mutex>
-#include <unordered_set>
 #include <utility>
 
 using Text = std::u16string_view;
-using Words = std::unordered_set<Text>;
 
 static constexpr Text odinProcedures[] = {
     u"abs", u"align_of", u"append", u"append_elem", u"append_elems", u"assert", u"cap", u"clamp", u"clear",
@@ -39,43 +39,78 @@ static constexpr Text gmlProcedures =
     u"string_copy string_format string_length string_lower string_upper struct_exists struct_get struct_set "
     u"variable_global_exists variable_instance_exists variable_instance_get variable_instance_set";
 
-static Words SplitWords(Text list)
+static constexpr Text lispProcedures =
+    u"+ - * / 1+ 1- = /= < > <= >= abs adjoin append apply aref assoc ash atom boundp butlast caaadr caaar "
+    u"caar cadr car cdar cddr cdr ceiling char char-code char= close clrhash coerce compile complement "
+    u"concatenate cons consp copy-list copy-seq count delete describe elt eq eql equal equalp error eval "
+    u"evenp every expt fill find find-if first floor format funcall gensym get getf gethash get-internal-real-time "
+    u"identity incf decf intern intersection last length list list* listp load logand logior make-array "
+    u"make-hash-table make-instance make-list make-pathname make-string map mapc mapcar mapcan mapcon maphash "
+    u"max member member-if merge min mod multiple-value-list nconc ninth nreverse nth nthcdr numberp oddp open "
+    u"package-name parse-integer pathnamep position position-if princ prin1 print random read read-char read-line "
+    u"read-from-string reduce rem remhash remove remove-duplicates remove-if remove-if-not replace rest reverse "
+    u"round search second set-difference seventh sixth sleep slot-value some sort sqrt stable-sort string-downcase "
+    u"string-equal string-upcase string= stringp subseq substitute symbol-name symbolp tenth terpri third truncate "
+    u"type-of typep union values values-list vectorp warn write write-char write-line write-string zerop";
+
+static constexpr Text cppLibraryTypes =
+    u"any array atomic basic_string basic_string_view bitset complex deque duration "
+    u"enable_if expected false_type filesystem_error function future initializer_list integral_constant "
+    u"istream iterator_traits jthread list lock_guard map multimap multiset mutex numeric_limits optional ostream "
+    u"pair path priority_queue promise queue ratio reference_wrapper regex remove_cv remove_reference "
+    u"set shared_lock shared_mutex shared_ptr span stack string string_view stringstream thread time_point "
+    u"true_type tuple underlying_type unique_lock unique_ptr unordered_map unordered_multimap unordered_multiset "
+    u"unordered_set u8string u16string u32string variant vector weak_ptr wstring";
+
+enum WordFlag : uint8_t {
+    ControlWord = 1 << 0,
+    ConstantWord = 1 << 1,
+    KeywordWord = 1 << 2,
+    TypeWord = 1 << 3,
+    LispProcedure = 1 << 4,
+    CppLibraryType = 1 << 5,
+};
+
+struct WordSlot {
+    const char16_t *text = nullptr;
+    uint32_t length = 0;
+    uint8_t flags = 0;
+
+    Text word() const { return {text, length}; }
+};
+
+struct Vocabulary {
+    std::vector<WordSlot> slots;
+    std::vector<Text> completion;
+    std::u16string uppercase;
+};
+
+static void AddWords(Vocabulary &vocabulary, std::vector<WordSlot> &words, Text list, uint8_t flags)
 {
-    Words words;
     while (!list.empty()) {
         size_t end = list.find(u' ');
-        if (end)
-            words.insert(list.substr(0, end));
+        if (end) {
+            Text word = list.substr(0, end);
+            if (flags)
+                words.push_back({word.data(), uint32_t(word.size()), flags});
+            if (flags != CppLibraryType)
+                vocabulary.completion.push_back(word);
+        }
+
         if (end == Text::npos)
             break;
         list.remove_prefix(end + 1);
     }
-    return words;
 }
 
-static const Words &LispProcedures()
+static size_t WordSlotFor(const std::vector<WordSlot> &slots, Text word)
 {
-    static const auto procedures = SplitWords(
-        u"+ - * / 1+ 1- = /= < > <= >= abs adjoin append apply aref assoc ash atom boundp butlast caaadr caaar "
-        u"caar cadr car cdar cddr cdr ceiling char char-code char= close clrhash coerce compile complement "
-        u"concatenate cons consp copy-list copy-seq count delete describe elt eq eql equal equalp error eval "
-        u"evenp every expt fill find find-if first floor format funcall gensym get getf gethash get-internal-real-time "
-        u"identity incf decf intern intersection last length list list* listp load logand logior make-array "
-        u"make-hash-table make-instance make-list make-pathname make-string map mapc mapcar mapcan mapcon maphash "
-        u"max member member-if merge min mod multiple-value-list nconc ninth nreverse nth nthcdr numberp oddp open "
-        u"package-name parse-integer pathnamep position position-if princ prin1 print random read read-char read-line "
-        u"read-from-string reduce rem remhash remove remove-duplicates remove-if remove-if-not replace rest reverse "
-        u"round search second set-difference seventh sixth sleep slot-value some sort sqrt stable-sort string-downcase "
-        u"string-equal string-upcase string= stringp subseq substitute symbol-name symbolp tenth terpri third truncate "
-        u"type-of typep union values values-list vectorp warn write write-char write-line write-string zerop");
-    return procedures;
+    size_t mask = slots.size() - 1;
+    size_t index = std::hash<Text>{}(word) & mask;
+    while (slots[index].flags && slots[index].word() != word)
+        index = (index + 1) & mask;
+    return index;
 }
-
-struct Vocabulary {
-    Words keywords, types, control, constants;
-    std::vector<std::u16string> uppercase;
-    std::vector<Text> completion;
-};
 
 static const Vocabulary &VocabularyFor(Language language)
 {
@@ -84,50 +119,73 @@ static const Vocabulary &VocabularyFor(Language language)
     size_t index = size_t(language) < tables.size() ? size_t(language) : 0;
     auto &table = tables[index];
     std::call_once(prepared[index], [&] {
-        const auto &info = InfoForLanguage(Language(index));
-        table.keywords = SplitWords(info.keywords);
-        table.types = SplitWords(info.types);
-        table.control = SplitWords(info.control);
-        table.constants = SplitWords(info.constants);
-        if (language == Language::ObjectiveC || language == Language::ObjectiveCpp) {
-            const auto &base = VocabularyFor(language == Language::ObjectiveC ? Language::C : Language::Cpp);
-            table.keywords.insert(base.keywords.begin(), base.keywords.end());
-            table.types.insert(base.types.begin(), base.types.end());
-            table.control.insert(base.control.begin(), base.control.end());
-            table.constants.insert(base.constants.begin(), base.constants.end());
-        }
-        for (const Words *group : {&table.keywords, &table.types, &table.control, &table.constants})
-            table.completion.insert(table.completion.end(), group->begin(), group->end());
-        if (language == Language::Odin)
+        std::vector<WordSlot> words;
+        auto add = [&](Language mode) {
+            const auto &info = InfoForLanguage(mode);
+            AddWords(table, words, info.keywords, KeywordWord);
+            AddWords(table, words, info.types, TypeWord);
+            AddWords(table, words, info.control, ControlWord);
+            AddWords(table, words, info.constants, ConstantWord);
+        };
+        add(Language(index));
+        switch (language) {
+        case Language::ObjectiveC: add(Language::C); break;
+        case Language::ObjectiveCpp: add(Language::Cpp); break;
+        case Language::Cpp: AddWords(table, words, cppLibraryTypes, CppLibraryType); break;
+        case Language::Odin:
             table.completion.insert(table.completion.end(), std::begin(odinProcedures), std::end(odinProcedures));
-        if (language == Language::GML) {
-            Words functions = SplitWords(gmlProcedures);
-            table.completion.insert(table.completion.end(), functions.begin(), functions.end());
+            break;
+        case Language::GML: AddWords(table, words, gmlProcedures, 0); break;
+        case Language::CommonLisp: AddWords(table, words, lispProcedures, LispProcedure); break;
+        case Language::SCSS: case Language::Less:
+            AddWords(table, words, InfoForLanguage(Language::CSS).keywords, 0);
+            break;
+        default: break;
         }
-        if (language == Language::CommonLisp) {
-            const auto &procedures = LispProcedures();
-            table.completion.insert(table.completion.end(), procedures.begin(), procedures.end());
-        }
-        if (language == Language::SCSS || language == Language::Less) {
-            Words properties = SplitWords(InfoForLanguage(Language::CSS).keywords);
-            table.completion.insert(table.completion.end(), properties.begin(), properties.end());
-        }
-        if (language == Language::SQL || language == Language::CommonLisp) {
-            table.uppercase.reserve(table.completion.size());
-            for (Text word : table.completion) {
-                auto &uppercase = table.uppercase.emplace_back(word);
-                for (char16_t &ch : uppercase) {
-                    if (ch >= u'a' && ch <= u'z')
-                        ch -= u'a' - u'A';
-                }
+
+        if (!words.empty()) {
+            table.slots.resize(std::bit_ceil(words.size() + words.size() / 4 + 1));
+            for (auto word : words) {
+                auto &slot = table.slots[WordSlotFor(table.slots, word.word())];
+                word.flags |= slot.flags;
+                slot = word;
             }
-            for (const auto &word : table.uppercase)
-                table.completion.push_back(word);
         }
-        std::sort(table.completion.begin(), table.completion.end());
-        table.completion.erase(std::unique(table.completion.begin(), table.completion.end()), table.completion.end());
+
+        auto &completion = table.completion;
+        std::sort(completion.begin(), completion.end());
+        completion.erase(std::unique(completion.begin(), completion.end()), completion.end());
+        if (language == Language::SQL || language == Language::CommonLisp) {
+            size_t units = 0;
+            for (Text word : completion)
+                units += word.size();
+
+            table.uppercase.resize(units);
+            char16_t *out = table.uppercase.data();
+            size_t count = completion.size();
+            completion.reserve(count * 2);
+            for (size_t i = 0; i < count; ++i) {
+                Text word = completion[i];
+                for (size_t j = 0; j < word.size(); ++j) {
+                    char16_t ch = word[j];
+                    out[j] = ch >= u'a' && ch <= u'z' ? ch - (u'a' - u'A') : ch;
+                }
+
+                completion.emplace_back(out, word.size());
+                out += word.size();
+            }
+
+            std::sort(completion.begin(), completion.end());
+            completion.erase(std::unique(completion.begin(), completion.end()), completion.end());
+        }
     });
     return table;
+}
+
+static uint8_t LookupWord(Language language, Text word)
+{
+    const auto &slots = VocabularyFor(language).slots;
+    return slots.empty() ? 0 : slots[WordSlotFor(slots, word)].flags;
 }
 
 static char16_t At(Text line, size_t index)
@@ -185,22 +243,22 @@ static bool StartsIgnoringCase(Text text, Text prefix)
 
 static Ink WordInk(Text word, Language language, char16_t next)
 {
-    const Vocabulary &vocabulary = VocabularyFor(language);
     std::array<char16_t, 64> lower;
     Text lookup = word;
     if (InfoForLanguage(language).ignoreCase && word.size() <= lower.size()) {
         std::transform(word.begin(), word.end(), lower.begin(), Lower);
         lookup = Text(lower.data(), word.size());
     }
-    if (vocabulary.control.contains(lookup))
+    uint8_t flags = LookupWord(language, lookup);
+    if (flags & ControlWord)
         return Ink::Control;
-    if (vocabulary.constants.contains(lookup))
+    if (flags & ConstantWord)
         return Ink::Constant;
-    if (vocabulary.keywords.contains(lookup))
+    if (flags & KeywordWord)
         return Ink::Keyword;
-    if (vocabulary.types.contains(lookup))
+    if (flags & TypeWord)
         return Ink::Type;
-    if (next == u'(' || (language == Language::Rust && next == u'!'))
+    if ((flags & LispProcedure) || next == u'(' || (language == Language::Rust && next == u'!'))
         return Ink::Function;
     if (CFamily(language) && word.ends_with(u"_t"))
         return Ink::Type;
@@ -278,18 +336,6 @@ static size_t AfterCppTemplateArguments(Text line, size_t open)
         }
     }
     return Text::npos;
-}
-
-static bool StandardCppType(Text word)
-{
-    static const Words types = SplitWords(u"any array atomic basic_string basic_string_view bitset complex deque duration "
-        u"enable_if expected false_type filesystem_error function future initializer_list integral_constant "
-        u"istream iterator_traits jthread list lock_guard map multimap multiset mutex numeric_limits optional ostream "
-        u"pair path priority_queue promise queue ratio reference_wrapper regex remove_cv remove_reference "
-        u"set shared_lock shared_mutex shared_ptr span stack string string_view stringstream thread time_point "
-        u"true_type tuple underlying_type unique_lock unique_ptr unordered_map unordered_multimap unordered_multiset "
-        u"unordered_set u8string u16string u32string variant vector weak_ptr wstring");
-    return types.contains(word);
 }
 
 static bool AtParameterStart(const NameContext &context)
@@ -394,7 +440,7 @@ static Ink ContextualWordInk(Text line, Text word, size_t end, Language language
     bool knownParameter = parameter != context.parameters.rend();
     if (knownParameter)
         ink = parameter->ink;
-    else if (role == NameRole::Type || role == NameRole::TypeParameter || (standard && StandardCppType(word)) ||
+    else if (role == NameRole::Type || role == NameRole::TypeParameter || (standard && (LookupWord(Language::Cpp, word) & CppLibraryType)) ||
              (context.typeAlias && follow == u'=') || (qualifier && !turbofish))
         ink = Ink::Type;
 
@@ -424,7 +470,7 @@ static Ink ContextualWordInk(Text line, Text word, size_t end, Language language
     // A use tree gives path segments and type names context. Its bare value imports use the foreground.
     if (context.rustImport && ink == Ink::Name)
         return Ink::Text;
-    if (!rust && ink == Ink::Type && VocabularyFor(Language::Cpp).types.contains(word) &&
+    if (!rust && ink == Ink::Type && (LookupWord(Language::Cpp, word) & TypeWord) &&
         word != u"size_t" && word != u"ptrdiff_t" && word != u"FILE")
         return Ink::Keyword;
     return ink;
@@ -2310,7 +2356,7 @@ static void TokenizeCodeInMode(Text line, Language requested, LexState &state, s
             } else if (identifiers == IdentifierContext::Attribute) {
                 ink = RustAttributeWordInk(line, word, index, raw, state.attribute);
             } else if (json) {
-                ink = VocabularyFor(language).constants.contains(word) ? Ink::Constant : Ink::Text;
+                ink = (LookupWord(language, word) & ConstantWord) ? Ink::Constant : Ink::Text;
             } else {
                 ink = ContextualExtraWord(line, word, start, index, language, state);
                 if (make && !(word.starts_with(u".") && ink == Ink::Constant) &&
@@ -2455,11 +2501,7 @@ static Ink LispWordInk(Text word, LexState &state)
                 state.names.nextName = NameRole::Type;
         }
     }
-    if (ink != Ink::Name || name.size() > 64)
-        return ink;
-    std::array<char16_t, 64> lower;
-    std::transform(name.begin(), name.end(), lower.begin(), Lower);
-    return LispProcedures().contains(Text(lower.data(), name.size())) ? Ink::Function : Ink::Name;
+    return ink;
 }
 
 static size_t LispReaderMacro(Text line, size_t start, LexState &state, std::vector<Token> &tokens, bool finishLine)

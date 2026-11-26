@@ -1,5 +1,6 @@
 #import "Preferences.h"
 #import "Editor.h"
+#import "LanguageServer.h"
 #import "Runner.h"
 #import "SessionState.h"
 #import "Workspace.h"
@@ -16,6 +17,8 @@
 NSString *const EditorPreferencesChanged = @"RetinaCodePreferencesChanged";
 NSString *const AutoSavePreferencesChanged = @"RetinaCodeAutoSavePreferencesChanged";
 NSString *const OutputScrollbackPreferencesChanged = @"RetinaCodeOutputScrollbackPreferencesChanged";
+NSString *const UnusedWarningsPreferencesChanged = @"RetinaCodeUnusedWarningsChanged";
+NSString *const InlayPreferencesChanged = @"RetinaCodeInlaySettingsChanged";
 NSString *const themeKey = @"EditorTheme";
 NSString *const smoothingKey = @"FontSmoothing";
 NSString *const sizeKey = @"EditorFontSize";
@@ -34,7 +37,29 @@ static NSString *const indentationKey = @"EditorIndentation";
 static NSString *const fileIndentationKey = @"EditorFileIndentation";
 static NSString *const outputScrollbackKey = @"OutputScrollbackLines";
 static NSString *const clearOutputOnRunKey = @"ClearOutputOnRun";
+static NSString *const showUnusedWarningsKey = @"ShowUnusedWarnings";
+static NSString *const inlayHintsKey = @"ShowInlayHints";
+static NSString *const inlayFontKey = @"InlayHintFont";
+static NSString *const inlaySizeKey = @"InlayHintSize";
 static constexpr long long maximumOutputScrollbackLines = 50000;
+
+struct LanguageDisplaySettings {
+    bool unusedWarnings;
+    bool inlayHints;
+};
+
+static LanguageDisplaySettings &LanguageDisplayPreferences()
+{
+    static LanguageDisplaySettings settings = [] {
+        NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+        return LanguageDisplaySettings{bool([defaults boolForKey:showUnusedWarningsKey]),
+                                       bool([defaults boolForKey:inlayHintsKey])};
+    }();
+    return settings;
+}
+
+bool ShowUnusedWarnings() { return LanguageDisplayPreferences().unusedWarnings; }
+bool ShowInlayHints() { return LanguageDisplayPreferences().inlayHints; }
 
 static std::atomic<NSUInteger> &CurrentOutputScrollbackLines()
 {
@@ -309,8 +334,11 @@ static auto ColorFields(Palette &theme)
         &theme.accents.completionPaper, &theme.accents.completionBorder, &theme.accents.completionSelection,
         &theme.accents.completionSelectedText, &theme.accents.wordMatch, &theme.accents.bracketMatch,
         &theme.accents.vimFlash, &theme.accents.commandCaret,
+        &theme.inlay.text, &theme.inlay.background, &theme.inlay.border,
     };
 }
+
+static constexpr size_t inlayColorIndex = std::tuple_size_v<decltype(ColorFields(std::declval<Theme &>()))> - 3;
 
 static std::optional<Col32> EditableThemeColor(const Theme &theme, const Col32 *field)
 {
@@ -360,11 +388,11 @@ static auto &CustomThemes()
             if (![identifier isKindOfClass:NSString.class] || !identifier.length ||
                 ![title isKindOfClass:NSString.class] || !title.length ||
                 ![values isKindOfClass:NSArray.class] ||
-                (values.count != fields.size() && values.count != fields.size() - 1))
+                (values.count != fields.size() && values.count != inlayColorIndex && values.count != inlayColorIndex - 1))
                 continue;
 
             bool packed = [row[@"colorFormat"] isEqual:@"RGBA"];
-            bool missingWhitespace = values.count < fields.size();
+            bool missingWhitespace = values.count == inlayColorIndex - 1;
             bool hasWhitespaceColor = false;
             for (size_t i = 0; i < values.count; ++i) {
                 Col32 *field = fields[i + (missingWhitespace && i >= whitespaceColorIndex)];
@@ -388,6 +416,8 @@ static auto &CustomThemes()
             theme.blockCaretText = SavedThemeColor(row[@"blockCaretText"], packed);
             if (!hasWhitespaceColor)
                 theme.whitespace = DefaultWhitespaceColor(theme.paper, theme.line, theme.selection, theme.lineNumber, theme.dark);
+            if (values.count <= inlayColorIndex)
+                theme.inlay = DefaultInlayColors(theme.paper, theme.ink[size_t(Ink::Text)]);
             std::vector<Col32> brackets;
             if ([row[@"brackets"] isKindOfClass:NSArray.class]) {
                 for (id value in row[@"brackets"]) {
@@ -587,6 +617,30 @@ CGFloat FontSizePreference()
     return std::isfinite(size) && size > 0 ? size : defaultFontSize;
 }
 
+static NSFont *TypefaceFont(id record, CGFloat size)
+{
+    NSDictionary *typeface = [record isKindOfClass:NSDictionary.class] ? record : nil;
+    NSString *name = typeface ? typeface[@"name"] : record;
+    if (![name isKindOfClass:NSString.class] || !name.length)
+        return nil;
+
+    NSFont *named = [NSFont fontWithName:name size:size];
+    NSData *archive = typeface[@"descriptor"];
+    if (named && [archive isKindOfClass:NSData.class]) {
+        NSFontDescriptor *descriptor = [NSKeyedUnarchiver unarchivedObjectOfClass:NSFontDescriptor.class fromData:archive error:nil];
+        NSFont *face = descriptor ? [NSFont fontWithDescriptor:descriptor size:size] : nil;
+        if ([face.fontName isEqualToString:named.fontName])
+            return face;
+    }
+    return named;
+}
+
+static NSDictionary *TypefaceRecord(NSFont *font)
+{
+    NSData *archive = [NSKeyedArchiver archivedDataWithRootObject:font.fontDescriptor requiringSecureCoding:YES error:nil];
+    return archive ? @{@"name":font.fontName, @"descriptor":archive} : @{@"name":font.fontName};
+}
+
 NSFont *EditorFontPreference()
 {
     NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
@@ -594,18 +648,8 @@ NSFont *EditorFontPreference()
     NSDictionary *typeface = [defaults dictionaryForKey:typefaceKey];
     NSString *name = typeface[@"name"];
     if ([name isKindOfClass:NSString.class] && name.length) {
-        NSFont *named = [NSFont fontWithName:name size:size];
-        if (named) {
-            NSData *archive = typeface[@"descriptor"];
-            if ([archive isKindOfClass:NSData.class]) {
-                NSFontDescriptor *descriptor = [NSKeyedUnarchiver unarchivedObjectOfClass:NSFontDescriptor.class
-                                                                                 fromData:archive error:nil];
-                NSFont *face = descriptor ? [NSFont fontWithDescriptor:descriptor size:size] : nil;
-                if ([face.fontName isEqualToString:named.fontName])
-                    return face;
-            }
-            return named;
-        }
+        if (NSFont *font = TypefaceFont(typeface, size))
+            return font;
     } else if ([defaults integerForKey:@"EditorFont"] == 1) {
         NSFont *monaco = [NSFont fontWithName:@"Monaco" size:size];
         if (monaco)
@@ -613,6 +657,17 @@ NSFont *EditorFontPreference()
     }
     NSFont *menlo = [NSFont fontWithName:@"Menlo-Regular" size:size];
     return menlo ? menlo : [NSFont monospacedSystemFontOfSize:size weight:NSFontWeightRegular];
+}
+
+NSFont *InlayFont(NSFont *editor)
+{
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    CGFloat size = [defaults doubleForKey:inlaySizeKey];
+    if (!std::isfinite(size) || size <= 0)
+        size = editor.pointSize;
+    if (NSFont *font = TypefaceFont([defaults objectForKey:inlayFontKey], size))
+        return font;
+    return size == editor.pointSize ? editor : [NSFont fontWithDescriptor:editor.fontDescriptor size:size];
 }
 
 static void PublishPreferences()
@@ -712,7 +767,22 @@ static void SetBracketPalette(NSInteger index, std::vector<Col32> brackets)
     UpdateCustomTheme(index, ThemeRowTitle(index), *theme, std::move(brackets));
 }
 
-static std::optional<Col32> RGBValue(NSColor *color)
+static NSColorWell *ThemeColorWell(NSRect frame)
+{
+    NSColorWell *well = [[NSColorWell alloc] initWithFrame:frame];
+    if (@available(macOS 14.0, *)) {
+        well.supportsAlpha = YES;
+    } else {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        NSColor.ignoresAlpha = NO;
+#pragma clang diagnostic pop
+    }
+    well.continuous = YES;
+    return well;
+}
+
+static std::optional<Col32> ThemeColorValue(NSColor *color)
 {
     NSColor *srgb = [color colorUsingColorSpace:NSColorSpace.sRGBColorSpace];
     if (!srgb)
@@ -720,7 +790,8 @@ static std::optional<Col32> RGBValue(NSColor *color)
     auto component = [](CGFloat value) {
         return uint8_t(std::lround(std::clamp(value, CGFloat(0), CGFloat(1)) * 255));
     };
-    return rgb(component(srgb.redComponent), component(srgb.greenComponent), component(srgb.blueComponent));
+    return rgba(component(srgb.redComponent), component(srgb.greenComponent), component(srgb.blueComponent), 0) |
+           (Col32(component(srgb.alphaComponent)) << 24);
 }
 
 void SetEditorPreference(NSString *key, id value)
@@ -734,14 +805,146 @@ void SetEditorFont(NSFont *font)
     if (!font || font.pointSize <= 0 || !std::isfinite(font.pointSize))
         return;
     NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
-    NSData *archive = [NSKeyedArchiver archivedDataWithRootObject:font.fontDescriptor
-                                           requiringSecureCoding:YES error:nil];
-    NSMutableDictionary *typeface = [@{@"name":font.fontName} mutableCopy];
-    if (archive)
-        typeface[@"descriptor"] = archive;
-    [defaults setObject:typeface forKey:typefaceKey];
+    [defaults setObject:TypefaceRecord(font) forKey:typefaceKey];
     [defaults setDouble:font.pointSize forKey:sizeKey];
     PublishPreferences();
+}
+
+@interface EditorFontManager : NSFontManager
+@end
+
+@implementation EditorFontManager {
+    BOOL _choosingInlayFont;
+    NSTextField *_sizeField;
+}
+
+- (NSFont *)preferredFont
+{
+    NSFont *editor = EditorFontPreference();
+    return _choosingInlayFont ? InlayFont(editor) : editor;
+}
+
+- (void)addSizeFieldToPanel:(NSFontPanel *)panel
+{
+    if (_sizeField)
+        return;
+
+    NSView *row = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 152, 34)];
+    NSTextField *label = [NSTextField labelWithString:@"Size"];
+    label.frame = NSMakeRect(16, 8, 35, 18);
+    [row addSubview:label];
+    _sizeField = [NSTextField textFieldWithString:@""];
+    _sizeField.frame = NSMakeRect(55, 6, 62, 22);
+    _sizeField.alignment = NSTextAlignmentRight;
+    _sizeField.accessibilityLabel = @"Font Size";
+    _sizeField.cell.sendsActionOnEndEditing = YES;
+    _sizeField.target = self;
+    _sizeField.action = @selector(changePickedSize:);
+    NSNumberFormatter *number = [[NSNumberFormatter alloc] init];
+    number.numberStyle = NSNumberFormatterDecimalStyle;
+    number.usesGroupingSeparator = NO;
+    number.maximumFractionDigits = 3;
+    _sizeField.formatter = number;
+    [row addSubview:_sizeField];
+    NSTextField *units = [NSTextField labelWithString:@"pt"];
+    units.frame = NSMakeRect(124, 8, 20, 18);
+    [row addSubview:units];
+    panel.accessoryView = row;
+}
+
+- (void)showFontPanel:(id)sender forInlayHints:(BOOL)inlay
+{
+    if (_sizeField.currentEditor && ![_sizeField.window makeFirstResponder:nil])
+        [_sizeField abortEditing];
+
+    _choosingInlayFont = inlay;
+    self.target = self;
+    self.action = @selector(changePickedFont:);
+    NSFont *font = [self preferredFont];
+    [self setSelectedFont:font isMultiple:NO];
+
+    NSFontPanel *panel = [self fontPanel:YES];
+    panel.title = inlay ? @"Inlay Hint Font" : @"Fonts";
+    panel.becomesKeyOnlyIfNeeded = NO;
+    panel.worksWhenModal = YES;
+    [panel makeKeyAndOrderFront:sender];
+    // Keep AppKit's rich-text toolbar out of layout after the Fonts panel closes.
+    panel.toolbar.visible = NO;
+    if (@available(macOS 26.0, *))
+        [self addSizeFieldToPanel:panel];
+    _sizeField.doubleValue = font.pointSize;
+}
+
+- (void)orderFrontFontPanel:(id)sender
+{
+    [self showFontPanel:sender forInlayHints:NO];
+}
+
+- (IBAction)orderFrontInlayFontPanel:(id)sender
+{
+    [self showFontPanel:sender forInlayHints:YES];
+}
+
+- (void)changePickedFont:(NSFontManager *)sender
+{
+    NSFont *previous = [self preferredFont];
+    [self applyPickedFont:[sender convertFont:previous] previous:previous];
+}
+
+- (IBAction)changePickedSize:(NSTextField *)sender
+{
+    NSFont *previous = [self preferredFont];
+    CGFloat size = sender.doubleValue;
+    if (!std::isfinite(size) || size <= 0) {
+        sender.doubleValue = previous.pointSize;
+        return;
+    }
+
+    if (size != previous.pointSize)
+        [self applyPickedFont:[self convertFont:previous toSize:size] previous:previous];
+}
+
+- (void)applyPickedFont:(NSFont *)font previous:(NSFont *)previous
+{
+    if (!font || [font isEqual:previous] || font.pointSize <= 0 || !std::isfinite(font.pointSize))
+        return;
+
+    [self setSelectedFont:font isMultiple:NO];
+    _sizeField.doubleValue = font.pointSize;
+    if (!_choosingInlayFont) {
+        SetEditorFont(font);
+        return;
+    }
+
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    NSFont *face = [NSFont fontWithDescriptor:font.fontDescriptor size:previous.pointSize];
+    if (![face isEqual:previous])
+        [defaults setObject:TypefaceRecord(font) forKey:inlayFontKey];
+    if (font.pointSize != previous.pointSize)
+        [defaults setDouble:font.pointSize forKey:inlaySizeKey];
+    [NSNotificationCenter.defaultCenter postNotificationName:InlayPreferencesChanged object:nil];
+}
+
+- (IBAction)resetInlayFont:(id)sender
+{
+    (void)sender;
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    [defaults removeObjectForKey:inlayFontKey];
+    [defaults removeObjectForKey:inlaySizeKey];
+    if (_choosingInlayFont && [self fontPanel:NO].isVisible) {
+        [_sizeField abortEditing];
+        NSFont *font = EditorFontPreference();
+        [self setSelectedFont:font isMultiple:NO];
+        _sizeField.doubleValue = font.pointSize;
+    }
+    [NSNotificationCenter.defaultCenter postNotificationName:InlayPreferencesChanged object:nil];
+}
+
+@end
+
+void SetUpEditorFontManager()
+{
+    [NSFontManager setFontManagerFactory:EditorFontManager.class];
 }
 
 void SetRenderingPreference(RenderSettings value)
@@ -774,10 +977,10 @@ static NSTabViewItem *AddPreferencesTab(NSTabView *tabs, NSString *title)
     return tab;
 }
 
-static void AddPreview(NSView *pane, NSRect frame)
+static void AddPreview(NSView *pane, NSRect frame, bool compact = false)
 {
     Label(pane, @"Preview", NSMakeRect(NSMinX(frame), NSMaxY(frame) + 5, NSWidth(frame), 17), NSTextAlignmentLeft);
-    NSView *preview = CreateEditorPreview();
+    NSView *preview = CreateEditorPreview(compact);
     preview.frame = frame;
     [pane addSubview:preview];
 }
@@ -797,6 +1000,7 @@ static constexpr CGFloat preferencesHeight = 506;
 static constexpr CGFloat editingHeight = 267;
 static constexpr CGFloat filesHeight = 296;
 static constexpr CGFloat outputHeight = 166;
+static constexpr CGFloat lspHeight = 392;
 
 @interface PreferencesContent : NSView
 @end
@@ -826,6 +1030,7 @@ static NSString *const colorTitles[] = {
     @"Comment", @"Directive", @"Constant", @"Escape",
     @"Completion Background", @"Completion Border", @"Completion Selection", @"Selected Completion Text",
     @"Word Match", @"Matching Bracket", @"Yank Flash", @"Command Caret",
+    @"Hint Text", @"Hint Background", @"Hint Border",
 };
 
 static_assert(std::size(colorTitles) == std::tuple_size_v<decltype(ColorFields(std::declval<Theme &>()))>);
@@ -870,6 +1075,11 @@ static_assert(std::size(colorTitles) == std::tuple_size_v<decltype(ColorFields(s
     NSButton *_trimTrailingWhitespace;
     NSPopUpButton *_finalNewline;
     NSTextField *_outputScrollback;
+    NSTextField *_inlayFontDescription;
+    NSButton *_resetInlayFont;
+    NSPopUpButton *_serverLanguage;
+    NSTextField *_serverPath;
+    NSTextView *_serverArguments;
     NSButton *_colorizeBrackets;
     NSScrollView *_bracketScroll;
     NSView *_bracketStrip;
@@ -886,6 +1096,12 @@ static_assert(std::size(colorTitles) == std::tuple_size_v<decltype(ColorFields(s
     NSInteger _editingTheme;
     NSMutableArray<NSSlider *> *_sliders;
     NSMutableArray<NSTextField *> *_values;
+}
+
++ (PreferencesController *)sharedController
+{
+    static PreferencesController *controller = [[PreferencesController alloc] init];
+    return controller;
 }
 
 - (instancetype)init
@@ -931,6 +1147,10 @@ static_assert(std::size(colorTitles) == std::tuple_size_v<decltype(ColorFields(s
     [self buildOutput:output.view];
     output.initialFirstResponder = _outputScrollback;
 
+    NSTabViewItem *lsp = AddPreferencesTab(tabs, @"LSP");
+    [self buildLanguageServerSettings:lsp.view];
+    lsp.initialFirstResponder = _serverLanguage;
+
     [tabs selectTabViewItem:appearance];
     tabs.delegate = self;
     window.initialFirstResponder = _themes;
@@ -940,6 +1160,10 @@ static_assert(std::size(colorTitles) == std::tuple_size_v<decltype(ColorFields(s
                                                name:AutoSavePreferencesChanged object:nil];
     [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(saveCleanupPreferencesChanged:)
                                                name:saveCleanupPreferencesChanged object:nil];
+    [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(inlayPreferencesChanged:)
+                                               name:InlayPreferencesChanged object:nil];
+    [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(languageServerConfigurationChanged:)
+                                               name:LanguageServerConfigurationChanged object:nil];
     [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(finishScrollbackEditing:)
                                                name:NSWindowWillCloseNotification object:window];
     [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(finishScrollbackEditing:)
@@ -1224,6 +1448,188 @@ static_assert(std::size(colorTitles) == std::tuple_size_v<decltype(ColorFields(s
     [pane addSubview:clearOnRun];
 }
 
+- (void)buildLanguageServerSettings:(NSView *)pane
+{
+    constexpr CGFloat left = 130;
+    constexpr CGFloat margin = 20;
+    CGFloat width = NSWidth(pane.bounds) - left - margin;
+    CGFloat y = NSHeight(pane.bounds) - 41;
+    NSButton *warnings = [NSButton checkboxWithTitle:@"Show Unused Warnings" target:self action:@selector(toggleUnusedWarnings:)];
+    warnings.frame = NSMakeRect(left - 2, y, 230, 22);
+    warnings.autoresizingMask = NSViewMinYMargin;
+    warnings.state = ShowUnusedWarnings() ? NSControlStateValueOn : NSControlStateValueOff;
+    warnings.toolTip = @"Show unused warnings in the editor.";
+    [pane addSubview:warnings];
+
+    NSButton *hints = [NSButton checkboxWithTitle:@"Show Inlay Hints" target:self action:@selector(toggleInlayHints:)];
+    hints.frame = NSMakeRect(left - 2, y - 26, 230, 22);
+    hints.autoresizingMask = NSViewMinYMargin;
+    hints.state = ShowInlayHints() ? NSControlStateValueOn : NSControlStateValueOff;
+    [pane addSubview:hints];
+
+    y -= 55;
+    Label(pane, @"Inlay Hint Font", NSMakeRect(margin, y, 98, 18), NSTextAlignmentRight).autoresizingMask = NSViewMinYMargin;
+    _inlayFontDescription = Label(pane, @"", NSMakeRect(left, y, width - 237, 18), NSTextAlignmentLeft);
+    _inlayFontDescription.autoresizingMask = NSViewMinYMargin;
+    NSFontManager *fonts = NSFontManager.sharedFontManager;
+    NSButton *choose = [NSButton buttonWithTitle:@"Choose…" target:fonts action:@selector(orderFrontInlayFontPanel:)];
+    choose.frame = NSMakeRect(left + width - 225, y - 5, 94, 27);
+    choose.autoresizingMask = NSViewMinYMargin;
+    choose.accessibilityLabel = @"Choose Inlay Hint Font";
+    [pane addSubview:choose];
+    _resetInlayFont = [NSButton buttonWithTitle:@"Use Editor Font" target:fonts action:@selector(resetInlayFont:)];
+    _resetInlayFont.frame = NSMakeRect(left + width - 128, y - 5, 128, 27);
+    _resetInlayFont.autoresizingMask = NSViewMinYMargin;
+    [pane addSubview:_resetInlayFont];
+
+    y -= 21;
+    NSBox *divider = [[NSBox alloc] initWithFrame:NSMakeRect(margin, y, left + width - margin, 1)];
+    divider.boxType = NSBoxSeparator;
+    divider.autoresizingMask = NSViewMinYMargin;
+    [pane addSubview:divider];
+
+    y -= 35;
+    Label(pane, @"Language", NSMakeRect(margin, y, 98, 18), NSTextAlignmentRight).autoresizingMask = NSViewMinYMargin;
+    _serverLanguage = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(left - 3, y - 4, 228, 26) pullsDown:NO];
+    NSArray<NSString *> *names = EditorLanguageNames();
+    for (NSString *name in [names sortedArrayUsingSelector:@selector(localizedStandardCompare:)]) {
+        [_serverLanguage addItemWithTitle:name];
+        _serverLanguage.lastItem.tag = [names indexOfObject:name];
+    }
+    NSDocument *document = NSDocumentController.sharedDocumentController.currentDocument;
+    NSInteger language = [document isKindOfClass:SourceDocument.class] ? ((SourceDocument *)document).languageMode : NSInteger(Language::Plain);
+    [_serverLanguage selectItemWithTag:language];
+    _serverLanguage.accessibilityLabel = @"Server Language";
+    _serverLanguage.autoresizingMask = NSViewMinYMargin;
+    _serverLanguage.target = self;
+    _serverLanguage.action = @selector(loadLanguageServerConfiguration:);
+    [pane addSubview:_serverLanguage];
+
+    y -= 31;
+    Label(pane, @"Executable", NSMakeRect(margin, y, 98, 18), NSTextAlignmentRight).autoresizingMask = NSViewMinYMargin;
+    _serverPath = [NSTextField textFieldWithString:@""];
+    _serverPath.frame = NSMakeRect(left, y - 2, width, 22);
+    _serverPath.placeholderString = @"Default server";
+    _serverPath.accessibilityLabel = @"Server Executable";
+    _serverPath.cell.scrollable = YES;
+    _serverPath.autoresizingMask = NSViewMinYMargin;
+    [pane addSubview:_serverPath];
+
+    y -= 33;
+    Label(pane, @"Arguments", NSMakeRect(margin, y, 98, 18), NSTextAlignmentRight).autoresizingMask = NSViewMinYMargin;
+    NSScrollView *scroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(left, y - 63, width, 83)];
+    scroll.borderType = NSBezelBorder;
+    scroll.hasVerticalScroller = YES;
+    scroll.autohidesScrollers = YES;
+    scroll.autoresizingMask = NSViewMinYMargin;
+    _serverArguments = [[NSTextView alloc] initWithFrame:NSMakeRect(0, 0, scroll.contentSize.width, scroll.contentSize.height)];
+    _serverArguments.richText = NO;
+    _serverArguments.font = [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular];
+    _serverArguments.automaticQuoteSubstitutionEnabled = NO;
+    _serverArguments.automaticDashSubstitutionEnabled = NO;
+    _serverArguments.automaticTextReplacementEnabled = NO;
+    _serverArguments.autoresizingMask = NSViewWidthSizable;
+    _serverArguments.textContainer.widthTracksTextView = YES;
+    _serverArguments.accessibilityLabel = @"Server Arguments";
+    _serverArguments.toolTip = @"One argument per line.";
+    scroll.documentView = _serverArguments;
+    [pane addSubview:scroll];
+
+    y -= 99;
+    NSButton *restore = [NSButton buttonWithTitle:@"Use Default Server" target:self action:@selector(resetLanguageServer:)];
+    restore.frame = NSMakeRect(left + width - 242, y, 149, 28);
+    restore.autoresizingMask = NSViewMinYMargin;
+    [pane addSubview:restore];
+    NSButton *apply = [NSButton buttonWithTitle:@"Apply" target:self action:@selector(applyLanguageServer:)];
+    apply.frame = NSMakeRect(left + width - 90, y, 90, 28);
+    apply.autoresizingMask = NSViewMinYMargin;
+    [pane addSubview:apply];
+    [self loadLanguageServerConfiguration:nil];
+}
+
+- (IBAction)toggleUnusedWarnings:(NSButton *)sender
+{
+    bool show = sender.state == NSControlStateValueOn;
+    LanguageDisplayPreferences().unusedWarnings = show;
+    [NSUserDefaults.standardUserDefaults setBool:show forKey:showUnusedWarningsKey];
+    [NSNotificationCenter.defaultCenter postNotificationName:UnusedWarningsPreferencesChanged object:nil];
+}
+
+- (IBAction)toggleInlayHints:(NSButton *)sender
+{
+    bool show = sender.state == NSControlStateValueOn;
+    LanguageDisplayPreferences().inlayHints = show;
+    [NSUserDefaults.standardUserDefaults setBool:show forKey:inlayHintsKey];
+    [NSNotificationCenter.defaultCenter postNotificationName:InlayPreferencesChanged object:nil];
+}
+
+- (void)refreshInlayFontDescription:(NSFont *)editor
+{
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    id typeface = [defaults objectForKey:inlayFontKey];
+    bool custom = [typeface isKindOfClass:NSDictionary.class] || LSPString(typeface).length > 0;
+    NSFont *font = InlayFont(editor);
+    _inlayFontDescription.stringValue = [NSString stringWithFormat:@"%@, %g pt", custom ? font.displayName : @"Editor Font", font.pointSize];
+    _resetInlayFont.enabled = custom || [defaults doubleForKey:inlaySizeKey] > 0;
+}
+
+- (void)inlayPreferencesChanged:(NSNotification *)notification
+{
+    (void)notification;
+    [self refreshInlayFontDescription:EditorFontPreference()];
+}
+
+- (IBAction)loadLanguageServerConfiguration:(id)sender
+{
+    (void)sender;
+    if (_serverPath.currentEditor)
+        [self.window makeFirstResponder:nil];
+    NSDictionary *command = LanguageServerConfiguration(Language(_serverLanguage.selectedTag));
+    NSString *path = LSPString(command[@"path"]);
+    NSString *arguments = [LSPArray(command[@"arguments"]) componentsJoinedByString:@"\n"];
+    _serverPath.stringValue = path ? path : @"";
+    _serverArguments.string = arguments ? arguments : @"";
+}
+
+- (void)languageServerConfigurationChanged:(NSNotification *)notification
+{
+    if ([notification.object integerValue] == _serverLanguage.selectedTag)
+        [self loadLanguageServerConfiguration:nil];
+}
+
+- (IBAction)applyLanguageServer:(id)sender
+{
+    (void)sender;
+    [self.window makeFirstResponder:nil];
+    NSString *program = [_serverPath.stringValue stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    program = program.stringByExpandingTildeInPath;
+    NSMutableArray<NSString *> *arguments = [NSMutableArray array];
+    for (NSString *line in [_serverArguments.string componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet]) {
+        if (line.length)
+            [arguments addObject:line];
+    }
+
+    if (program.length || arguments.count) {
+        BOOL directory = NO;
+        NSFileManager *files = NSFileManager.defaultManager;
+        if (!program.isAbsolutePath || ![files fileExistsAtPath:program isDirectory:&directory] || directory || ![files isExecutableFileAtPath:program]) {
+            NSAlert *alert = [[NSAlert alloc] init];
+            alert.messageText = @"Choose an executable using its full path.";
+            [alert beginSheetModalForWindow:self.window completionHandler:nil];
+            return;
+        }
+    }
+    SetLanguageServerConfiguration(Language(_serverLanguage.selectedTag), program, arguments);
+    [self loadLanguageServerConfiguration:nil];
+}
+
+- (IBAction)resetLanguageServer:(id)sender
+{
+    (void)sender;
+    SetLanguageServerConfiguration(Language(_serverLanguage.selectedTag), nil, nil);
+    [self loadLanguageServerConfiguration:nil];
+}
+
 - (IBAction)changeClearOutputOnRun:(NSButton *)sender
 {
     [NSUserDefaults.standardUserDefaults setBool:sender.state == NSControlStateValueOn forKey:clearOutputOnRunKey];
@@ -1287,6 +1693,8 @@ static_assert(std::size(colorTitles) == std::tuple_size_v<decltype(ColorFields(s
         height = filesHeight;
     else if ([item.identifier isEqual:@"Output"])
         height = outputHeight;
+    else if ([item.identifier isEqual:@"LSP"])
+        height = lspHeight;
     CGFloat delta = height - NSHeight(window.contentView.bounds);
     if (delta) {
         NSRect frame = window.frame;
@@ -1414,6 +1822,7 @@ static_assert(std::size(colorTitles) == std::tuple_size_v<decltype(ColorFields(s
     _detectIndentation.state = indentation.detect ? NSControlStateValueOn : NSControlStateValueOff;
     NSFont *font = EditorFontPreference();
     _fontDescription.stringValue = [NSString stringWithFormat:@"%@, %g pt", font.displayName, font.pointSize];
+    [self refreshInlayFontDescription:font];
 
     RenderSettings settings = RenderingPreference();
     auto smoothing = std::find(std::begin(smoothingChoices), std::end(smoothingChoices), settings.smoothing);
@@ -1445,12 +1854,10 @@ static_assert(std::size(colorTitles) == std::tuple_size_v<decltype(ColorFields(s
         [_bracketWells removeAllObjects];
         [_bracketStrip setFrameSize:NSMakeSize(std::max(NSWidth(_bracketScroll.bounds), pitch * colors.size()), 39)];
         for (size_t i = 0; i < colors.size(); ++i) {
-            NSColorWell *well = [[NSColorWell alloc] initWithFrame:NSMakeRect(pitch * i + 1, 15, 29, 22)];
+            NSColorWell *well = ThemeColorWell(NSMakeRect(pitch * i + 1, 15, 29, 22));
             well.tag = NSInteger(i);
             well.target = self;
             well.action = @selector(changeBracketColor:);
-            // Color-panel changes must send an action to update the theme.
-            well.continuous = YES;
             well.accessibilityLabel = [NSString stringWithFormat:@"Bracket Level %lu", (unsigned long)i + 1];
             [_bracketStrip addSubview:well];
             [_bracketWells addObject:well];
@@ -1475,7 +1882,7 @@ static_assert(std::size(colorTitles) == std::tuple_size_v<decltype(ColorFields(s
     NSColorWell *well = _bracketWells[level];
     [_bracketStrip scrollRectToVisible:well.frame];
     NSColorPanel *panel = NSColorPanel.sharedColorPanel;
-    panel.showsAlpha = NO;
+    panel.showsAlpha = YES;
     [well activate:YES];
     [panel orderFront:nil];
 }
@@ -1509,7 +1916,7 @@ static_assert(std::size(colorTitles) == std::tuple_size_v<decltype(ColorFields(s
 {
     NSInteger index = ThemePreference();
     auto theme = ThemeAt(index);
-    auto color = RGBValue(sender.color);
+    auto color = ThemeColorValue(sender.color);
     if (!color || index != _bracketTheme || sender.tag < 0 || size_t(sender.tag) >= theme->bracketColors.size() ||
         theme->bracketColors[sender.tag] == *color)
         return;
@@ -1555,7 +1962,7 @@ static_assert(std::size(colorTitles) == std::tuple_size_v<decltype(ColorFields(s
     NSInteger index = ThemePreference();
     _editingTheme = IsCustomTheme(index) ? index : DuplicateTheme(index, CopyBrackets(*ThemeAt(index)));
     auto theme = ThemeAt(_editingTheme);
-    const CGFloat width = 398, height = 428;
+    const CGFloat width = 398, height = 506;
     _themeEditor = [[NSPanel alloc] initWithContentRect:NSMakeRect(0, 0, width, height)
                                               styleMask:NSWindowStyleMaskTitled
                                                 backing:NSBackingStoreBuffered defer:NO];
@@ -1583,28 +1990,34 @@ static_assert(std::size(colorTitles) == std::tuple_size_v<decltype(ColorFields(s
     _italicTypes.frame = NSMakeRect(220, height - 69, 143, 20);
     [body addSubview:_italicTypes];
 
-    NSScrollView *scroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(20, 54, width - 40, height - 138)];
+    AddPreview(body, NSMakeRect(20, 54, width - 40, 48), true);
+    NSButton *hintFont = [NSButton buttonWithTitle:@"Hint Font…" target:NSFontManager.sharedFontManager
+                                           action:@selector(orderFrontInlayFontPanel:)];
+    hintFont.controlSize = NSControlSizeSmall;
+    hintFont.frame = NSMakeRect(width - 130, 104, 114, 25);
+    [body addSubview:hintFont];
+
+    NSScrollView *scroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(20, 132, width - 40, height - 216)];
     scroll.borderType = NSBezelBorder;
     scroll.scrollerStyle = NSScrollerStyleLegacy;
     scroll.hasVerticalScroller = YES;
     auto fields = ColorFields(*theme);
     CGFloat formWidth = scroll.contentSize.width;
-    CGFloat formHeight = 24 * (fields.size() + 3) + 14;
+    CGFloat formHeight = 24 * (fields.size() + 4) + 14;
     NSView *form = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, formWidth, formHeight)];
     _themeWells = [NSMutableArray arrayWithCapacity:fields.size()];
     CGFloat y = formHeight - 28;
     for (size_t i = 0; i < fields.size(); ++i) {
-        if (i == 0 || i == 9 || i == 21) {
-            NSString *title = i == 0 ? @"Editor" : i == 9 ? @"Syntax" : @"Highlights";
+        if (i == 0 || i == 9 || i == 21 || i == inlayColorIndex) {
+            NSString *title = i == 0 ? @"Editor" : i == 9 ? @"Syntax" : i == 21 ? @"Highlights" : @"Inlay Hints";
             NSTextField *section = Label(form, title, NSMakeRect(11, y + 2, 150, 18), NSTextAlignmentLeft);
             section.font = [NSFont boldSystemFontOfSize:12];
             y -= 24;
         }
         Label(form, colorTitles[i], NSMakeRect(22, y + 1, formWidth - 105, 18), NSTextAlignmentLeft);
-        NSColorWell *well = [[NSColorWell alloc] initWithFrame:NSMakeRect(formWidth - 68, y, 54, 21)];
+        NSColorWell *well = ThemeColorWell(NSMakeRect(formWidth - 68, y, 54, 21));
         auto color = EditableThemeColor(*theme, fields[i]);
         well.color = SRGBColor(color.value_or(theme->ink[size_t(Ink::Text)]));
-        well.continuous = YES;
         well.tag = NSInteger(i);
         well.target = self;
         well.action = @selector(changeThemeColor:);
@@ -1622,7 +2035,7 @@ static_assert(std::size(colorTitles) == std::tuple_size_v<decltype(ColorFields(s
     done.keyEquivalent = @"\r";
     done.toolTip = @"Done (↩)";
     [body addSubview:done];
-    NSColorPanel.sharedColorPanel.showsAlpha = NO;
+    NSColorPanel.sharedColorPanel.showsAlpha = YES;
     _themeEditor.initialFirstResponder = _themeName;
     [self.window beginSheet:_themeEditor completionHandler:nil];
 }
@@ -1687,7 +2100,7 @@ static_assert(std::size(colorTitles) == std::tuple_size_v<decltype(ColorFields(s
 
 - (IBAction)changeThemeColor:(NSColorWell *)sender
 {
-    auto color = RGBValue(sender.color);
+    auto color = ThemeColorValue(sender.color);
     if (!color || !IsCustomTheme(_editingTheme))
         return;
     auto source = ThemeAt(_editingTheme);
@@ -1758,6 +2171,13 @@ static_assert(std::size(colorTitles) == std::tuple_size_v<decltype(ColorFields(s
     [self showWindow:nil];
     [_preferenceTabs selectTabViewItemWithIdentifier:identifier];
     [self.window makeFirstResponder:_preferenceTabs.selectedTabViewItem.initialFirstResponder];
+}
+
+- (void)showLSPPaneForLanguage:(Language)language
+{
+    if (_serverLanguage.selectedTag != NSInteger(language) && [_serverLanguage selectItemWithTag:NSInteger(language)])
+        [self loadLanguageServerConfiguration:nil];
+    [self showPane:@"LSP"];
 }
 
 @end

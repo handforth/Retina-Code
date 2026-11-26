@@ -11,6 +11,11 @@ struct VimBlockCaret {
     NSUInteger position;
 };
 
+struct DocumentEditOptions {
+    Vim::Offset (*insertionAdvance)(Vim::Text) = nullptr;
+    NSUInteger caretAfter = NSNotFound;
+};
+
 @interface VimTextView : NSTextView
 @property(nonatomic) BOOL vimEnabled;
 @property(nonatomic) BOOL smoothScrollingEnabled;
@@ -40,13 +45,17 @@ struct VimBlockCaret {
 - (NSUInteger)vimStepRow:(NSUInteger)row down:(BOOL)down count:(NSUInteger)count;
 - (NSUInteger)vimHiddenRows:(Vim::Range)rows;
 - (void)revealVimFoldAt:(NSUInteger)position;
-+ (void)jumpToVimFileMark:(char32_t)mark exact:(BOOL)exact;
-+ (void)vimStorage:(NSTextStorage *)storage edited:(NSRange)range newLength:(NSUInteger)length;
++ (void)jumpToVimFileMark:(char32_t)mark exact:(BOOL)exact inWindow:(NSWindow *)window;
++ (void)vimStorage:(NSTextStorage *)storage edited:(const Vim::EditMap &)edit;
 + (const Vim::EditBatch *)cursorBatchForStorage:(NSTextStorage *)storage;
-+ (void)vimStorage:(NSTextStorage *)storage editedBatch:(const Vim::EditBatch &)batch;
 - (NSRange)selectedCharacterRange;
 - (BOOL)insertionLocationsMatch:(BOOL (^)(NSUInteger position))test;
 - (NSRect)vimCaretAt:(NSUInteger)position;
+- (CGFloat)vimExtraGlyphWidthAt:(NSUInteger)position;
+- (CGFloat)inlayWidthAtInsertion:(NSUInteger)position;
+- (NSUInteger)inlayInsertionAtPoint:(NSPoint)point before:(BOOL *)before;
+- (Vim::Range)vimCharactersInViewport:(NSRect)visible;
+- (void)prepareLayoutAroundOffset:(NSUInteger)offset verticalMargin:(CGFloat)margin;
 - (std::optional<Vim::InsertEdit>)planVimInsert:(Vim::Key)key at:(NSUInteger)position
                                       tabWidth:(unsigned)tabWidth indentWidth:(unsigned)indentWidth
                                         spaces:(BOOL)spaces automaticIndent:(BOOL)automatic;
@@ -63,22 +72,21 @@ struct VimBlockCaret {
                   indentWidth:(unsigned)indentWidth spaces:(BOOL)spaces;
 - (NSString *)vimLineNumber:(NSUInteger)line current:(NSUInteger)current;
 - (void)drawVimOverlays:(NSRect)dirty selection:(NSColor *)selection flash:(NSColor *)flash
-        selectedRanges:(std::vector<NSRange> *)ranges blockCarets:(std::vector<VimBlockCaret> *)blocks;
+        selectedRanges:(std::vector<NSRange> *)ranges blockCarets:(std::vector<VimBlockCaret> &)blocks contrastingCaret:(BOOL)contrasting;
 - (void)drawVimComposition:(NSRect)dirty;
 - (void)invalidateVimCaret;
+- (void)refreshVimCaretGeometry;
 - (void)refreshVimCaret;
 - (void)vimDidLiveScroll;
 - (void)finishVimChange;
 - (std::vector<Vim::Offset>)editingCaretOffsets;
 - (std::vector<Vim::Range>)editingSelections;
-- (BOOL)applyDocumentEdits:(Vim::EditBatch)batch undoName:(NSString *)name;
-- (BOOL)applyDocumentEdits:(Vim::EditBatch)batch undoName:(NSString *)name
-          insertionAdvance:(Vim::Offset (*)(Vim::Text))advance;
+- (BOOL)applyDocumentEdits:(Vim::EditBatch)batch undoName:(NSString *)name options:(DocumentEditOptions)options;
 - (void)loadVimMappings:(NSString *)text;
 - (void)vimDocumentReplaced;
-- (void)vimStorageEdited:(NSRange)range newLength:(NSUInteger)length;
-- (void)vimStorageEditedBatch:(const Vim::EditBatch &)batch;
+- (void)vimStorageEdited:(const Vim::EditMap &)edit;
 - (void)visitVimFileMark:(NSUInteger)offset exact:(BOOL)exact;
+- (void)visitDefinitionAtOffset:(NSUInteger)offset;
 - (void)revealSearchMatch:(NSRange)range;
 - (NSArray<NSArray<NSNumber *> *> *)sessionCursors;
 - (void)restoreSessionCursors:(NSArray *)positions;

@@ -380,19 +380,17 @@ BracketMatch BracketsAtSelection(NSAttributedString *storage, NSRange selection,
     return {};
 }
 
-static bool ShiftRange(NSRange &range, NSRange changed, NSUInteger newLength)
+void AdjustTypedPairs(std::vector<TypedPair> &pairs, const Vim::EditMap &edit)
 {
-    if (NSMaxRange(changed) <= range.location) {
-        range.location = range.location - changed.length + newLength;
-        return true;
-    }
-    return changed.location >= NSMaxRange(range);
-}
+    auto adjust = [&](NSRange &part) {
+        if (edit.overlaps({part.location, NSMaxRange(part)}))
+            return false;
 
-void AdjustTypedPairs(std::vector<TypedPair> &pairs, NSRange oldRange, NSUInteger newLength)
-{
+        part.location = edit.map(part.location);
+        return true;
+    };
     std::erase_if(pairs, [&](TypedPair &pair) {
-        return !ShiftRange(pair.opening, oldRange, newLength) || !ShiftRange(pair.closing, oldRange, newLength);
+        return !adjust(pair.opening) || !adjust(pair.closing);
     });
 }
 

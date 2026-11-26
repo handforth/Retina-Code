@@ -1,11 +1,10 @@
 #import "Debugger.h"
+#import "Workspace.h"
+#include "DebugTransport.hpp"
 #import <AppKit/AppKit.h>
 #include <algorithm>
 #include <cerrno>
-#include <csignal>
-#include <fcntl.h>
-#include <util.h>
-#include <unistd.h>
+#include <limits.h>
 
 NSString *const DebugBreakpointsChanged = @"DebugBreakpointsChanged";
 
@@ -117,99 +116,63 @@ bool StopDebugSessionsForQuit(dispatch_block_t finished)
     return true;
 }
 
-static void OnDebugMain(dispatch_block_t work)
+struct PendingDebugReply {
+    uint64_t sequence;
+    DebugReply reply;
+};
+
+static std::string_view DebugUTF8(NSString *text)
 {
-    CFRunLoopRef loop = CFRunLoopGetMain();
-    CFRunLoopPerformBlock(loop, (__bridge CFArrayRef)@[NSDefaultRunLoopMode, NSModalPanelRunLoopMode], work);
-    CFRunLoopWakeUp(loop);
+    const char *bytes = text.UTF8String;
+    return bytes ? std::string_view(bytes, [text lengthOfBytesUsingEncoding:NSUTF8StringEncoding]) : std::string_view{};
 }
 
-static NSData *ReadDebugPipe(NSFileHandle *file)
+static NSString *PanicFunction(Language language)
 {
-    char bytes[16 * 1024];
-    ssize_t size;
-    do {
-        size = read(file.fileDescriptor, bytes, sizeof(bytes));
-    } while (size < 0 && errno == EINTR);
-    return size > 0 ? [NSData dataWithBytes:bytes length:NSUInteger(size)] : nil;
+    if (language == Language::Rust)
+        return @"rust_panic";
+
+    // Go reaches fatalpanic after deferred recover calls have had a chance to run.
+    return language == Language::Go ? @"runtime.fatalpanic" : nil;
 }
 
-static constexpr NSUInteger maxPacketSize = 16 * 1024 * 1024;
-
-// Only the pipe reader touches the receive buffer. Replies and debugger state live on the main thread.
-@interface DebugPackets : NSObject
-@property(nonatomic, copy) void (^message)(NSDictionary *);
-@property(nonatomic, copy) dispatch_block_t invalid;
-- (void)receive:(NSData *)data;
-@end
-
-@implementation DebugPackets {
-    NSMutableData *_data;
-    NSUInteger _bodyLength;
-}
-
-- (void)receive:(NSData *)data
+static NSString *DebugAdapterName(DebugBackend backend)
 {
-    if (!_data)
-        _data = [NSMutableData data];
-    [_data appendData:data];
-    while (_data.length) {
-        if (!_bodyLength) {
-            NSData *separator = [NSData dataWithBytes:"\r\n\r\n" length:4];
-            NSRange header = [_data rangeOfData:separator options:0 range:NSMakeRange(0, _data.length)];
-            if (header.location == NSNotFound && _data.length < 4096)
-                return;
-            if (header.location != NSNotFound && header.location < 4096) {
-                NSString *text = [[NSString alloc] initWithBytes:_data.bytes length:header.location
-                                                        encoding:NSASCIIStringEncoding];
-                for (NSString *line in [text componentsSeparatedByString:@"\r\n"]) {
-                    if (![line hasPrefix:@"Content-Length:"])
-                        continue;
-                    NSScanner *scanner = [NSScanner scannerWithString:[line substringFromIndex:15]];
-                    unsigned long long length = 0;
-                    if ([scanner scanUnsignedLongLong:&length] && scanner.isAtEnd && length <= maxPacketSize)
-                        _bodyLength = NSUInteger(length);
-                }
-            }
-            if (!_bodyLength)
-                break;
-            [_data replaceBytesInRange:NSMakeRange(0, NSMaxRange(header)) withBytes:nullptr length:0];
-        }
-        if (_data.length < _bodyLength)
-            return;
-        NSData *body = [NSData dataWithBytes:_data.bytes length:_bodyLength];
-        [_data replaceBytesInRange:NSMakeRange(0, _bodyLength) withBytes:nullptr length:0];
-        _bodyLength = 0;
-        id object = [NSJSONSerialization JSONObjectWithData:body options:0 error:nil];
-        if (![object isKindOfClass:NSDictionary.class]) {
-            _invalid();
-            [_data setLength:0];
-            return;
-        }
-        _message(object);
-    }
-    if (_data.length) {
-        [_data setLength:0];
-        _invalid();
+    switch (backend) {
+    case DebugBackend::SBCL: return @"SBCL";
+    case DebugBackend::Debugpy: return @"debugpy";
+    default: return @"LLDB";
     }
 }
 
+static std::string_view DebugDataView(NSData *data)
+{
+    return data.length ? std::string_view(static_cast<const char *>(data.bytes), data.length) : std::string_view{};
+}
+
+static NSString *DebugText(std::string_view bytes)
+{
+    NSString *text = [[NSString alloc] initWithBytes:bytes.data() length:bytes.size() encoding:NSUTF8StringEncoding];
+    return text ? text : [[NSString alloc] initWithBytes:bytes.data() length:bytes.size() encoding:NSISOLatin1StringEncoding];
+}
+
+@interface DebugSession ()
+- (void)receiveEvents;
 @end
 
 @implementation DebugSession {
     DebugExecutable *_executable;
     NSArray<NSString *> *_arguments;
     Language _language;
+    DebugBackend _backend;
     pid_t _attachPID;
-    NSTask *_task;
-    NSFileHandle *_input;
-    NSFileHandle *_reader;
-    NSFileHandle *_stderrReader;
-    NSFileHandle *_terminal;
-    NSFileHandle *_slave;
-    dispatch_queue_t _writes;
-    dispatch_queue_t _terminalWrites;
-    NSMutableDictionary<NSNumber *, DebugReply> *_replies;
+    DebugTransport _transport;
+    DebugBatch _batch;
+    CFRunLoopSourceRef _eventSource;
+    bool _receiving;
+    bool _needsDrain;
+    bool _terminalOpen;
+    std::vector<PendingDebugReply> _replies;
     NSMutableDictionary<NSString *, NSDictionary<NSNumber *, NSNumber *> *> *_resolved;
     NSDictionary *_capabilities;
     NSString *_temporaryPath;
@@ -218,7 +181,7 @@ static constexpr NSUInteger maxPacketSize = 16 * 1024 * 1024;
     NSUInteger _sequence;
     NSUInteger _stackRequest;
     NSUInteger _stopSequence;
-    NSInteger _rustPanicBreakpoint;
+    NSInteger _panicBreakpoint;
     BOOL _configured;
     BOOL _hasExitCode;
     BOOL _rustPanic;
@@ -232,12 +195,10 @@ static constexpr NSUInteger maxPacketSize = 16 * 1024 * 1024;
         _executable = executable;
         _arguments = [arguments copy];
         _language = language;
+        _backend = executable.backend;
         _attachPID = pid;
         _phase = DebugPhase::Launching;
-        _status = @"Starting LLDB…";
-        _replies = [NSMutableDictionary dictionary];
-        _resolved = [NSMutableDictionary dictionary];
-        _writes = dispatch_queue_create("RetinaCode.DebugWrites", DISPATCH_QUEUE_SERIAL);
+        _status = [NSString stringWithFormat:@"Starting %@…", DebugAdapterName(_backend)];
     }
     return self;
 }
@@ -249,7 +210,7 @@ static constexpr NSUInteger maxPacketSize = 16 * 1024 * 1024;
 
 - (BOOL)acceptsInput
 {
-    return _terminal && _phase == DebugPhase::Running;
+    return _terminalOpen && _phase == DebugPhase::Running;
 }
 
 - (NSString *)rustPanicMessage
@@ -330,97 +291,161 @@ static constexpr NSUInteger maxPacketSize = 16 * 1024 * 1024;
     [self stop];
 }
 
-- (void)adapterExited:(NSTask *)task
+- (void)adapterExited
 {
-    if (_task != task)
-        return;
-    _reader.readabilityHandler = nil;
-    _stderrReader.readabilityHandler = nil;
-    _terminal.readabilityHandler = nil;
-    [_slave closeAndReturnError:nil];
-    [_terminal closeAndReturnError:nil];
-    _terminal = nil;
-    _slave = nil;
-    [_replies removeAllObjects];
-    _input = nil;
-    _reader = nil;
-    _stderrReader = nil;
-    _task = nil;
+    CFRunLoopSourceInvalidate(_eventSource);
+    CFRelease(_eventSource);
+    _eventSource = nullptr;
+    _terminalOpen = false;
+    _replies = {};
+    _resolved = nil;
+    _capabilities = nil;
+    _rustOutputTail = nil;
+    _configured = NO;
     _executable = nil;
-    if (_phase != DebugPhase::Stopping && _phase != DebugPhase::Finished && !_hasExitCode)
-        [self report:@"LLDB disconnected."];
+    if (_phase != DebugPhase::Stopping && _phase != DebugPhase::Finished && !_hasExitCode) {
+        if (_phase == DebugPhase::Launching && _backend == DebugBackend::Debugpy)
+            [self report:@"Install debugpy in the Python environment used to run this file."];
+        else
+            [self report:[NSString stringWithFormat:@"%@ disconnected.", DebugAdapterName(_backend)]];
+    }
+
     NSString *status = (_hasExitCode || _phase == DebugPhase::Stopping) ? _status : @"Disconnected";
     [sessions removeObject:self];
     dispatch_group_leave(sessionGroup);
     [self changePhase:DebugPhase::Finished status:status];
 }
 
-- (void)start
+- (void)receiveEvents
 {
-    if (quitting || _task)
-        return;
-    NSTask *task = [[NSTask alloc] init];
-    NSString *tool = FindTool(@"lldb-dap", Language::Plain);
-    task.executableURL = [NSURL fileURLWithPath:tool ? tool : @"/usr/bin/xcrun"];
-    task.arguments = tool ? @[] : @[@"lldb-dap"];
-    task.currentDirectoryURL = _executable.directory;
-    NSPipe *input = [NSPipe pipe];
-    NSPipe *stdoutPipe = [NSPipe pipe];
-    NSPipe *stderrPipe = [NSPipe pipe];
-    task.standardInput = input;
-    task.standardOutput = stdoutPipe;
-    task.standardError = stderrPipe;
-
-    __weak DebugSession *weak = self;
-    DebugPackets *packets = [[DebugPackets alloc] init];
-    packets.message = ^(NSDictionary *message) {
-        OnDebugMain(^{ [weak receive:message]; });
-    };
-    packets.invalid = ^{
-        dispatch_async(dispatch_get_main_queue(), ^{ [weak fail:@"Invalid response from LLDB."]; });
-    };
-
-    _reader = stdoutPipe.fileHandleForReading;
-    _stderrReader = stderrPipe.fileHandleForReading;
-    _input = input.fileHandleForWriting;
-    fcntl(_input.fileDescriptor, F_SETNOSIGPIPE, 1);
-    _reader.readabilityHandler = ^(NSFileHandle *file) {
-        NSData *data = ReadDebugPipe(file);
-        if (data.length)
-            [packets receive:data];
-        else
-            file.readabilityHandler = nil;
-    };
-    _stderrReader.readabilityHandler = ^(NSFileHandle *file) {
-        NSData *data = ReadDebugPipe(file);
-        if (!data.length) {
-            file.readabilityHandler = nil;
-            return;
-        }
-        NSString *message = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-        dispatch_async(dispatch_get_main_queue(), ^{ [weak writeOutput:message tone:OutputTone::Error]; });
-    };
-    task.terminationHandler = ^(NSTask *ended) {
-        OnDebugMain(^{ [weak adapterExited:ended]; });
-    };
-
-    NSError *error = nil;
-    if (![task launchAndReturnError:&error]) {
-        _reader.readabilityHandler = nil;
-        _stderrReader.readabilityHandler = nil;
-        [self report:error.localizedDescription];
-        [self changePhase:DebugPhase::Finished status:@"Could not start LLDB"];
+    if (_receiving) {
+        _needsDrain = true;
         return;
     }
-    _task = task;
+
+    _receiving = true;
+    _needsDrain = false;
+    TakeDebugEvents(_transport, _batch);
+    for (const auto &event : _batch.events) {
+        @autoreleasepool {
+            auto bytes = std::string_view(_batch.bytes).substr(event.offset, event.length);
+            switch (event.kind) {
+            case DebugEventKind::Packet: {
+                NSData *data = [NSData dataWithBytesNoCopy:const_cast<char *>(bytes.data()) length:bytes.size() freeWhenDone:NO];
+                id message = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+                if ([message isKindOfClass:NSDictionary.class])
+                    [self receive:message];
+                else
+                    [self fail:@"Invalid response from LLDB."];
+                break;
+            }
+
+            case DebugEventKind::Program:
+            case DebugEventKind::ProgramError:
+                [self writeProgramOutput:DebugText(bytes)
+                                    tone:event.kind == DebugEventKind::ProgramError ? OutputTone::Error : OutputTone::Text];
+                break;
+
+            case DebugEventKind::Console:
+            case DebugEventKind::AdapterError:
+                [self writeOutput:DebugText(bytes) tone:event.kind == DebugEventKind::AdapterError ? OutputTone::Error : OutputTone::Text];
+                break;
+
+            case DebugEventKind::Invalid:
+                [self fail:@"Invalid response from LLDB."];
+                break;
+
+            case DebugEventKind::Exit:
+                [self adapterExited];
+                break;
+            }
+        }
+    }
+
+    _receiving = false;
+    if (!_eventSource) {
+        _batch = {};
+    } else if (_needsDrain) {
+        CFRunLoopSourceSignal(_eventSource);
+        CFRunLoopWakeUp(CFRunLoopGetMain());
+    }
+}
+
+- (void)start
+{
+    if (quitting || _eventSource)
+        return;
+
+    _resolved = [NSMutableDictionary dictionary];
+    __attribute__((objc_precise_lifetime)) NSString *tool = _executable.interpreter;
+    __attribute__((objc_precise_lifetime)) NSString *worker = nil;
+    const char *argv[5]{};
+    NSString *adapterID = @"lldb";
+    if (_backend == DebugBackend::SBCL) {
+        worker = [NSBundle.mainBundle pathForResource:@"LispDebug" ofType:@"lisp"];
+        if (!worker.length) {
+            [self report:@"LispDebug.lisp is missing from Retina Code."];
+            [self changePhase:DebugPhase::Finished status:@"Debugging failed"];
+            return;
+        }
+
+        argv[0] = tool.fileSystemRepresentation;
+        argv[1] = "--noinform";
+        argv[2] = "--script";
+        argv[3] = worker.fileSystemRepresentation;
+        adapterID = @"common-lisp";
+        _transport.lispRequests = true;
+    } else if (_backend == DebugBackend::Debugpy) {
+        argv[0] = tool.fileSystemRepresentation;
+        argv[1] = "-m";
+        argv[2] = "debugpy.adapter";
+        adapterID = @"debugpy";
+    } else {
+        tool = FindTool(@"lldb-dap", Language::Plain);
+        argv[0] = tool ? tool.fileSystemRepresentation : "/usr/bin/xcrun";
+        argv[1] = tool ? nullptr : "lldb-dap";
+    }
+
+    CFRunLoopSourceContext events{};
+    events.info = (__bridge void *)self;
+    events.perform = [](void *context) {
+        __attribute__((objc_precise_lifetime)) DebugSession *session = (__bridge DebugSession *)context;
+        [session receiveEvents];
+    };
+    _eventSource = CFRunLoopSourceCreate(nullptr, 0, &events);
+    CFRunLoopRef loop = CFRunLoopGetMain();
+    if (_eventSource) {
+        CFRunLoopAddSource(loop, _eventSource, kCFRunLoopDefaultMode);
+        CFRunLoopAddSource(loop, _eventSource, (__bridge CFStringRef)NSModalPanelRunLoopMode);
+    }
+
+    auto wake = [](void *source) {
+        CFRunLoopSourceSignal(static_cast<CFRunLoopSourceRef>(source));
+        CFRunLoopWakeUp(CFRunLoopGetMain());
+    };
+    int error = _eventSource ? StartDebugTransport(_transport, argv, _executable.directory.fileSystemRepresentation, wake, _eventSource) : ENOMEM;
+    if (error) {
+        if (_eventSource) {
+            CFRunLoopSourceInvalidate(_eventSource);
+            CFRelease(_eventSource);
+            _eventSource = nullptr;
+        }
+
+        [self report:[NSError errorWithDomain:NSPOSIXErrorDomain code:error userInfo:nil].localizedDescription];
+        [self changePhase:DebugPhase::Finished status:@"Debugging failed"];
+        return;
+    }
+
     if (!sessions) {
         sessions = [NSMutableSet set];
         sessionGroup = dispatch_group_create();
     }
+
     [sessions addObject:self];
     dispatch_group_enter(sessionGroup);
+    __weak DebugSession *weak = self;
     [self request:@"initialize" arguments:@{
-        @"adapterID":@"lldb", @"clientID":@"retina-code", @"clientName":@"Retina Code",
+        @"adapterID":adapterID, @"clientID":@"retina-code", @"clientName":@"Retina Code",
         @"linesStartAt1":@YES, @"columnsStartAt1":@YES, @"pathFormat":@"path",
         @"supportsVariableType":@YES, @"supportsVariablePaging":@YES,
         @"$__lldb_sourceInitFile":@NO
@@ -433,41 +458,21 @@ static constexpr NSUInteger maxPacketSize = 16 * 1024 * 1024;
     }];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 35 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
         DebugSession *session = weak;
-        if (session && session.phase == DebugPhase::Launching)
-            [session fail:@"LLDB could not start the program. Check for a macOS Developer Tools prompt."];
+        if (session && session.phase == DebugPhase::Launching) {
+            NSString *error = session->_backend == DebugBackend::LLDB ?
+                @"LLDB could not start the program. Check for a macOS Developer Tools prompt." : @"The debugger did not respond.";
+            [session fail:error];
+        }
     });
 }
 
 - (NSString *)openTerminal
 {
-    int master = -1;
-    int slave = -1;
     char path[PATH_MAX];
-    if (openpty(&master, &slave, path, nullptr, nullptr) != 0)
+    if (StartDebugTerminal(_transport, path))
         return nil;
-    fcntl(master, F_SETFD, FD_CLOEXEC);
-    fcntl(slave, F_SETFD, FD_CLOEXEC);
-    struct termios mode;
-    if (tcgetattr(slave, &mode) == 0) {
-        mode.c_lflag &= ~ECHO;
-        mode.c_oflag &= ~ONLCR;
-        tcsetattr(slave, TCSANOW, &mode);
-    }
-    _terminalWrites = dispatch_queue_create("RetinaCode.DebugTerminalWrites", DISPATCH_QUEUE_SERIAL);
-    _terminal = [[NSFileHandle alloc] initWithFileDescriptor:master closeOnDealloc:YES];
-    _slave = [[NSFileHandle alloc] initWithFileDescriptor:slave closeOnDealloc:YES];
-    __weak DebugSession *weak = self;
-    _terminal.readabilityHandler = ^(NSFileHandle *file) {
-        NSData *data = ReadDebugPipe(file);
-        if (!data.length) {
-            file.readabilityHandler = nil;
-            return;
-        }
-        NSString *string = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-        if (!string)
-            string = [[NSString alloc] initWithData:data encoding:NSISOLatin1StringEncoding];
-        dispatch_async(dispatch_get_main_queue(), ^{ [weak writeProgramOutput:string tone:OutputTone::Text]; });
-    };
+
+    _terminalOpen = true;
     return [NSString stringWithUTF8String:path];
 }
 
@@ -480,6 +485,28 @@ static constexpr NSUInteger maxPacketSize = 16 * 1024 * 1024;
     NSString *command = self.attached ? @"attach" : @"launch";
     if (_executable.file)
         arguments[@"program"] = _executable.file.path;
+
+    if (_backend != DebugBackend::LLDB) {
+        arguments[@"cwd"] = _executable.directory.path;
+        arguments[@"args"] = _arguments ? _arguments : @[];
+        if (_backend == DebugBackend::SBCL) {
+            arguments[@"terminal"] = [self openTerminal];
+        } else {
+            arguments[@"python"] = @[_executable.interpreter];
+            arguments[@"console"] = @"internalConsole";
+            arguments[@"redirectOutput"] = @YES;
+            arguments[@"justMyCode"] = @YES;
+            arguments[@"subProcess"] = @NO;
+        }
+
+        __weak DebugSession *weak = self;
+        [self request:@"launch" arguments:arguments reply:^(NSDictionary *, NSString *error) {
+            if (error)
+                [weak fail:error];
+        }];
+        return;
+    }
+
     if (_executable.directory) {
         arguments[@"cwd"] = _executable.directory.path;
         arguments[@"debuggerRoot"] = _executable.directory.path;
@@ -499,8 +526,9 @@ static constexpr NSUInteger maxPacketSize = 16 * 1024 * 1024;
                 [commands addObject:[NSString stringWithFormat:@"?settings set target.%@-path %@", stream, path]];
         }
     }
-    if (_language == Language::Rust && ![capabilities[@"supportsFunctionBreakpoints"] boolValue])
-        [commands addObject:@"?breakpoint set --name rust_panic"];
+    NSString *panic = PanicFunction(_language);
+    if (panic && ![capabilities[@"supportsFunctionBreakpoints"] boolValue])
+        [commands addObject:[NSString stringWithFormat:@"?breakpoint set --name %@", panic]];
     if (commands.count)
         arguments[@"preRunCommands"] = commands;
 
@@ -513,7 +541,7 @@ static constexpr NSUInteger maxPacketSize = 16 * 1024 * 1024;
 
 - (void)stop
 {
-    if (!_task || _phase == DebugPhase::Stopping || _phase == DebugPhase::Finished)
+    if (!_eventSource || _phase == DebugPhase::Stopping || _phase == DebugPhase::Finished)
         return;
     NSString *status = [_status isEqualToString:@"Debugging failed"] ? _status : self.attached ? @"Detached" : @"Stopped";
     [self changePhase:DebugPhase::Stopping status:status];
@@ -522,68 +550,60 @@ static constexpr NSUInteger maxPacketSize = 16 * 1024 * 1024;
 
 - (void)disconnect
 {
-    if (!_task)
+    if (!_eventSource)
         return;
-    NSTask *task = _task;
+
+    RequestDebugStop(_transport);
     __weak DebugSession *weak = self;
     [self request:@"disconnect" arguments:@{@"terminateDebuggee":@(!self.attached)} reply:^(NSDictionary *, NSString *) {
-        // Closing the protocol input lets the adapter flush its final events and exit.
         DebugSession *session = weak;
-        if (session) {
-            NSFileHandle *input = session->_input;
-            dispatch_async(session->_writes, ^{ [input closeAndReturnError:nil]; });
-        }
+        if (session)
+            CloseDebugInput(session->_transport);
     }];
-    dispatch_queue_t cleanup = dispatch_get_global_queue(QOS_CLASS_UTILITY, 0);
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), cleanup, ^{
-        if (task.running)
-            [task terminate];
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), cleanup, ^{
-            if (task.running)
-                kill(task.processIdentifier, SIGKILL);
-        });
-    });
 }
 
 - (void)request:(NSString *)command arguments:(NSDictionary *)arguments reply:(DebugReply)reply
 {
-    if (!_task)
+    if (!_eventSource)
         return;
-    NSNumber *sequence = @(++_sequence);
-    NSDictionary *message = @{@"type":@"request", @"seq":sequence, @"command":command,
-                              @"arguments":arguments ? arguments : @{}};
+
+    uint64_t sequence = ++_sequence;
+    __attribute__((objc_precise_lifetime)) NSData *data = arguments ? [NSJSONSerialization dataWithJSONObject:arguments options:0 error:nil] : nil;
+    if ((arguments && !data) || !SendDebugRequest(_transport, sequence, DebugUTF8(command), DebugDataView(data))) {
+        if (reply)
+            reply(nil, @"Could not send the request to the debugger.");
+        return;
+    }
+
     if (reply)
-        _replies[sequence] = [reply copy];
-    [self send:message];
+        _replies.push_back({sequence, reply});
 }
 
 - (void)send:(NSDictionary *)message
 {
-    NSData *data = [NSJSONSerialization dataWithJSONObject:message options:0 error:nil];
-    if (!data || data.length > maxPacketSize)
-        return;
-    NSString *header = [NSString stringWithFormat:@"Content-Length: %lu\r\n\r\n", data.length];
-    NSMutableData *packet = [NSMutableData dataWithData:[header dataUsingEncoding:NSASCIIStringEncoding]];
-    [packet appendData:data];
-    NSFileHandle *input = _input;
-    dispatch_async(_writes, ^{ [input writeData:packet error:nil]; });
+    __attribute__((objc_precise_lifetime)) NSData *data = [NSJSONSerialization dataWithJSONObject:message options:0 error:nil];
+    SendDebugPacket(_transport, DebugDataView(data));
 }
 
 - (void)receive:(NSDictionary *)message
 {
-    if (!_task)
+    if (!_eventSource)
         return;
     NSString *type = message[@"type"];
+    if (![type isKindOfClass:NSString.class])
+        return;
+
     if ([type isEqualToString:@"response"]) {
-        NSNumber *sequence = message[@"request_seq"];
-        if (!sequence)
-            return;
-        DebugReply reply = _replies[sequence];
-        [_replies removeObjectForKey:sequence];
-        if (reply) {
-            NSString *error = nil;
-            if (![message[@"success"] boolValue])
-                error = message[@"message"] ? message[@"message"] : @"LLDB request failed.";
+        uint64_t sequence = [message[@"request_seq"] unsignedLongLongValue];
+        auto pending = std::find_if(_replies.begin(), _replies.end(), [sequence](const PendingDebugReply &request) {
+            return request.sequence == sequence;
+        });
+        if (pending != _replies.end()) {
+            DebugReply reply = pending->reply;
+            if (pending != _replies.end() - 1)
+                *pending = std::move(_replies.back());
+            _replies.pop_back();
+            NSString *error = [message[@"success"] boolValue] ? nil : message[@"message"] ? message[@"message"] : @"Debugger request failed.";
             reply(message[@"body"], error);
         }
         return;
@@ -595,14 +615,10 @@ static constexpr NSUInteger maxPacketSize = 16 * 1024 * 1024;
     }
     NSString *event = message[@"event"];
     NSDictionary *body = message[@"body"];
-    if ([event isEqualToString:@"output"]) {
-        NSString *category = body[@"category"];
-        if ([category isEqualToString:@"stdout"] || [category isEqualToString:@"stderr"]) {
-            [self writeProgramOutput:body[@"output"] tone:[category isEqualToString:@"stderr"] ? OutputTone::Error : OutputTone::Text];
-        } else if (![category isEqualToString:@"telemetry"]) {
-            [self writeOutput:body[@"output"] tone:OutputTone::Text];
-        }
-    } else if ([event isEqualToString:@"exited"]) {
+    if (![event isKindOfClass:NSString.class])
+        return;
+
+    if ([event isEqualToString:@"exited"]) {
         int code = [body[@"exitCode"] intValue];
         _hasExitCode = YES;
         NSString *status = [NSString stringWithFormat:@"Exited (%d)", code];
@@ -628,6 +644,9 @@ static constexpr NSUInteger maxPacketSize = 16 * 1024 * 1024;
         NSString *path = breakpoint[@"source"][@"path"];
         NSNumber *line = breakpoint[@"line"];
         if (path.length && line) {
+            if (path.isAbsolutePath)
+                path = DebugSourcePath([NSURL fileURLWithPath:path]);
+
             NSMutableDictionary *states = [_resolved[path] mutableCopy];
             if (!states)
                 states = [NSMutableDictionary dictionary];
@@ -651,7 +670,7 @@ static constexpr NSUInteger maxPacketSize = 16 * 1024 * 1024;
         NSString *name = option[@"filter"];
         if (!name)
             continue;
-        if ([name isEqualToString:@"cpp_throw"] || [name isEqualToString:@"objc_throw"] ||
+        if ((_backend == DebugBackend::Debugpy && [name isEqualToString:@"uncaught"]) || [name isEqualToString:@"cpp_throw"] || [name isEqualToString:@"objc_throw"] ||
             [name isEqualToString:@"swift_throw"]) {
             [filters addObject:name];
         }
@@ -659,14 +678,14 @@ static constexpr NSUInteger maxPacketSize = 16 * 1024 * 1024;
 
     __weak DebugSession *weak = self;
     [self request:@"setExceptionBreakpoints" arguments:@{@"filters":filters} reply:nil];
-    if (_language == Language::Rust && [_capabilities[@"supportsFunctionBreakpoints"] boolValue]) {
-        // The panic hook has already written its message by the time rust_panic runs.
-        [self request:@"setFunctionBreakpoints" arguments:@{@"breakpoints":@[@{@"name":@"rust_panic"}]}
+    NSString *panic = PanicFunction(_language);
+    if (panic && [_capabilities[@"supportsFunctionBreakpoints"] boolValue]) {
+        [self request:@"setFunctionBreakpoints" arguments:@{@"breakpoints":@[@{@"name":panic}]}
                 reply:^(NSDictionary *body, NSString *) {
             DebugSession *session = weak;
             if (session) {
                 NSArray *points = body[@"breakpoints"];
-                session->_rustPanicBreakpoint = [points.firstObject[@"id"] integerValue];
+                session->_panicBreakpoint = [points.firstObject[@"id"] integerValue];
             }
         }];
     }
@@ -772,10 +791,13 @@ static constexpr NSUInteger maxPacketSize = 16 * 1024 * 1024;
     ++_revision;
     NSString *reason = body[@"reason"];
     BOOL nativeException = [reason isEqualToString:@"exception"] || [reason isEqualToString:@"signal"];
-    _rustPanic = _rustPanicBreakpoint > 0 && [body[@"hitBreakpointIds"] containsObject:@(_rustPanicBreakpoint)];
+    bool panic = _panicBreakpoint > 0 && [body[@"hitBreakpointIds"] containsObject:@(_panicBreakpoint)];
+    _rustPanic = panic && _language == Language::Rust;
     _exception = nil;
     if (_rustPanic) {
         _exception = [self rustPanicMessage];
+    } else if (panic && _language == Language::Go) {
+        _exception = @"Go panic";
     } else if (nativeException) {
         NSString *description = body[@"description"];
         if (!description.length)
@@ -838,7 +860,6 @@ static constexpr NSUInteger maxPacketSize = 16 * 1024 * 1024;
         }
         session->_frames = reply[@"stackFrames"];
         NSDictionary *selected = nil;
-        NSString *directory = session->_executable.directory.path;
         NSString *topName = session.frames.firstObject[@"name"];
         if (session->_language == Language::Rust && !session->_rustPanic &&
             ([topName hasPrefix:@"__rustc::rust_panic"] || [topName hasPrefix:@"std::panicking::rust_panic"] ||
@@ -846,16 +867,20 @@ static constexpr NSUInteger maxPacketSize = 16 * 1024 * 1024;
             session->_status = @"Exception";
             session->_rustPanic = YES;
             session->_exception = [session rustPanicMessage];
+        } else if (session->_language == Language::Go && [topName isEqualToString:@"runtime.fatalpanic"]) {
+            session->_status = @"Exception";
+            session->_exception = @"Go panic";
         }
+
         BOOL preferUserSource = session.exception.length > 0;
-        NSString *sourceRoot = [directory stringByAppendingString:@"/"];
+        NSString *sourceRoot = preferUserSource ? DebugSourcePath(session->_executable.directory) : nil;
         for (NSDictionary *frame in session.frames) {
             NSString *path = frame[@"source"][@"path"];
             if (!path.isAbsolutePath || ![NSFileManager.defaultManager fileExistsAtPath:path])
                 continue;
             if (!selected)
                 selected = frame;
-            if (!preferUserSource || (sourceRoot && [path hasPrefix:sourceRoot])) {
+            if (!preferUserSource || PathIsInFolder(DebugSourcePath([NSURL fileURLWithPath:path]), sourceRoot)) {
                 selected = frame;
                 break;
             }
@@ -870,12 +895,17 @@ static constexpr NSUInteger maxPacketSize = 16 * 1024 * 1024;
     if (_phase != DebugPhase::Paused || !frameID)
         return;
     NSString *path = _frame[@"source"][@"path"];
-    BOOL rust = _language == Language::Rust || [path.pathExtension.lowercaseString isEqualToString:@"rs"];
-    NSString *context = rust ? @"hover" : @"watch";
-    // Hover resolves variable paths without requesting Rust expression compilation.
+    Language language = DetectLanguage(DebugUTF8(path));
+    if (language == Language::Plain)
+        language = _language;
+
+    // LLDB can resolve variable paths in Rust and Go without compiling an expression.
+    bool variable_path = language == Language::Rust || language == Language::Go;
+    NSString *context = variable_path ? @"hover" : @"watch";
     [self request:@"evaluate" arguments:@{@"expression":expression, @"frameId":frameID, @"context":context}
              reply:^(NSDictionary *body, NSString *error) {
-        reply(body, rust && error ? @"Unavailable in this frame" : error);
+        if (reply)
+            reply(body, variable_path && error ? @"Unavailable in this frame" : error);
     }];
 }
 
@@ -929,10 +959,7 @@ static constexpr NSUInteger maxPacketSize = 16 * 1024 * 1024;
 {
     if (!self.acceptsInput)
         return NO;
-    NSData *data = [text dataUsingEncoding:NSUTF8StringEncoding];
-    NSFileHandle *terminal = _terminal;
-    dispatch_async(_terminalWrites, ^{ [terminal writeData:data error:nil]; });
-    return YES;
+    return SendDebugInput(_transport, DebugUTF8(text));
 }
 
 @end

@@ -1,0 +1,93 @@
+#!/bin/sh
+#|
+exec ros -Q -- "$0" "$@"
+|#
+
+(progn
+  (ros:ensure-asdf)
+  (let ((*standard-output* *error-output*))
+    (ql:quickload :alive-lsp :silent t)))
+
+(defun close-alive-document (state params)
+  (let ((uri (cdr (assoc :uri (cdr (assoc :text-document params))))))
+    (alive/session/state:lock (state mutex)
+      (remhash uri (alive/session/state::state-files state))
+      (remhash uri (alive/session/state::state-forms state))
+      (remhash uri (alive/session/state::state-tokens state)))))
+
+(defun alive-response (method response)
+  (let ((result (and (hash-table-p response) (gethash "result" response))))
+    (when (hash-table-p result)
+      (cond
+        ((equal method "initialize")
+         (setf (gethash "hoverProvider" (gethash "capabilities" result)) t))
+        ((equal method "textDocument/hover")
+         (setf (gethash "contents" result) (gethash "value" result))
+         (remhash "value" result))
+        ((equal method "textDocument/completion")
+         ;; This client requests plain completions. Lisp symbols already have the right spelling in label.
+         (map nil (lambda (item)
+                    (when (eql (gethash "insertTextFormat" item) 2)
+                      (setf (gethash "insertTextFormat" item) 1
+                            (gethash "insertText" item) (gethash "label" item))))
+              (gethash "items" result)))))
+    response))
+
+(defun alive-definition (state params response)
+  (let ((location (and (hash-table-p response) (gethash "result" response))))
+    (when (and (hash-table-p location) (not (gethash "uri" location)))
+      (let* ((uri (cdr (assoc :uri (cdr (assoc :text-document params)))))
+             (position (cdr (assoc :position params)))
+             (forms (alive/session/state:get-file-forms state uri))
+             (name (alive/symbols:for-pos forms position)))
+        (when name
+          (let ((symbol (find name (alive/lsp/symbol:for-document forms)
+                              :key (lambda (item) (gethash "name" item)) :test #'string-equal)))
+            (when symbol
+              (setf (gethash "uri" location) uri
+                    (gethash "range" location) (gethash "selectionRange" symbol))))))))
+  response)
+
+(defun alive-request (state handle deps message)
+  (let ((method (cdr (assoc :method message)))
+        (params (cdr (assoc :params message))))
+    (cond
+      ((equal method "shutdown")
+       (let ((reply (alive/lsp/message/abstract:create-response (cdr (assoc :id message)))))
+         (setf (gethash "result" reply) nil)
+         reply))
+      ((equal method "exit")
+       (alive/session/state:set-running state nil))
+      ((equal method "textDocument/didClose")
+       (close-alive-document state params)
+       nil)
+      ((equal method "textDocument/rangeFormatting")
+       (let ((options (alive/lsp/types/format-options:convert (cdr (assoc :options params)))))
+         (alive/session/handler/document::format-msg state options message)))
+      ((equal method "textDocument/definition")
+       (alive-definition state params (funcall handle deps message)))
+      (t
+       (alive-response method (funcall handle deps message))))))
+
+(defun main (&rest arguments)
+  (declare (ignore arguments))
+  (let* ((input (flexi-streams:make-flexi-stream
+                 (sb-sys:make-fd-stream 0 :input t :element-type '(unsigned-byte 8))))
+         (output (sb-sys:make-fd-stream 1 :output t :element-type '(unsigned-byte 8)))
+         (*standard-output* *error-output*)
+         (state (alive/session/state:create))
+         (deps (alive/server::create-deps :state state :input-stream input :output-stream output))
+         (read-msg (alive/deps::dependencies-read-msg deps))
+         (handle (alive/deps:msg-handler deps)))
+    ;; Use the server's stdio framing without opening a listener or starting a second process.
+    (setf (alive/deps::dependencies-read-msg deps)
+          (lambda ()
+            (handler-case
+                (or (funcall read-msg) (alive/session/state:set-running state nil))
+              (end-of-file () (alive/session/state:set-running state nil))))
+          (alive/deps::dependencies-msg-handler deps)
+          (lambda (deps message)
+            (alive-request state handle deps message)))
+
+    (alive/session/state:set-running state t)
+    (alive/session/message-loop:run deps state)))

@@ -26,6 +26,13 @@ struct Range {
     bool operator==(const Range &) const = default;
 };
 
+inline Offset OffsetAfterEdit(Offset position, Range edited, Offset inserted)
+{
+    if (position == NoOffset || position < edited.first)
+        return position;
+    return position < edited.last ? edited.first : position - edited.size() + inserted;
+}
+
 enum class Key : uint32_t {
     None = 0,
     Backspace = 8, Tab = 9, Enter = 13, Escape = 27,
@@ -150,6 +157,10 @@ struct Host {
     Offset (*hiddenRows)(void *, Range) = nullptr;
     bool batch = false;
     void (*writeCursorClipboard)(void *, const Register &) = nullptr;
+    bool (*inlayAt)(void *, Offset) = nullptr;
+
+    // A cursor preview rebinds text access while editor actions keep their original context.
+    void *document = context;
 };
 
 struct Selection {
@@ -229,6 +240,7 @@ struct State {
     RowInsert rowInsert = RowInsert::Column;
     bool padBlock = false;
     bool simpleInsert = true;
+    bool beforeInlay = false;
     std::vector<Edit> replacements;
     std::vector<Range> occurrences;
     std::u16string occurrencePattern;
@@ -270,9 +282,29 @@ struct State {
     State() { marks.fill(NoOffset); }
 };
 
+template<class Map>
+void MapHistory(State &state, Map map)
+{
+    for (auto &mark : state.marks)
+        mark = map(mark);
+    for (auto &jump : state.jumps)
+        jump = map(jump);
+    for (auto &change : state.changes)
+        change = map(change);
+
+    state.lastInsert = map(state.lastInsert);
+    state.lastAnchor = map(state.lastAnchor);
+    state.lastVisualCursor = map(state.lastVisualCursor);
+    state.exNextLine = map(state.exNextLine);
+    state.exEnd = map(state.exEnd);
+    for (auto &occurrence : state.occurrences)
+        occurrence = {map(occurrence.first), map(occurrence.last)};
+}
+
 bool IsVisual(Mode mode);
 bool IsInsert(Mode mode);
 void SetCursor(State &state, const Host &host, Offset cursor);
+Offset ClampNormalCursor(const Host &host, Offset cursor, std::optional<bool> finalNewline);
 Offset CursorOnRow(const State &state, const Host &host, Offset row);
 Offset CursorColumn(const Host &host, Offset position, unsigned tabStop, bool finalNewline);
 Offset CursorAtColumn(const Host &host, Offset row, Offset column, unsigned tabStop, bool finalNewline,
