@@ -7,6 +7,9 @@
 *.dSYM/
 *.o
 
+# Local release script
+/release.sh
+
 # Xcode and clangd
 /DerivedData/
 xcuserdata/
