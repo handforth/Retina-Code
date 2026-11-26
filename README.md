@@ -1,18 +1,23 @@
 # Retina-Code
 A code editor for Mac, with nostalgic LCD font rendering of the 2013 MacBook era
 
-## Settings
-You can tweak the look of the LCD text effect
-<img width="832" height="646" alt="Screenshot 2026-11-21 at 9 52 56 AM" src="https://github.com/user-attachments/assets/1780ef84-aa5e-4742-aae1-0e8c7a44e87f" />
-
 ## 50+ languages supported
 <img width="631" height="476" alt="image" src="https://github.com/user-attachments/assets/58f03a94-316d-433f-a5c5-8b76617abe5d" />
 
 ## Vim mode
 <img width="628" height="442" alt="image" src="https://github.com/user-attachments/assets/8e692ba4-765f-451b-bd0d-0d478da276fd" />
 
-## Word-based autocomplete
+## Full LSP support for most languages
+<img width="659" height="539" alt="image" src="https://github.com/user-attachments/assets/715db2f8-1f1f-4fa4-8a97-291aab37a42e" />
+
+## LSP Errors
+<img width="376" height="79" alt="image" src="https://github.com/user-attachments/assets/a1ebba9f-5cd4-46bd-a8e6-bd950130950d" />
+
+## LSP and word-based autocomplete
 <img width="408" height="248" alt="image" src="https://github.com/user-attachments/assets/cddf640a-9c71-4b0c-bca0-63071fdc30e9" />
+
+## Debugger (LLDB) for most languages
+<img width="738" height="628" alt="image" src="https://github.com/user-attachments/assets/b6c415a1-55bd-487a-b5c0-58ea5d19173b" />
 
 ## Screenshots
 <img width="952" height="788" alt="Screenshot 2026-11-19 at 9 52 57 PM" src="https://github.com/user-attachments/assets/fc3ade20-9d61-42a5-83bf-07af8437963a" />
@@ -33,6 +38,11 @@ Visual Studio 2012 Dark:
 ## Theme picker:
 <img width="832" height="646" alt="Screenshot 2026-11-21 at 9 52 35 AM" src="https://github.com/user-attachments/assets/15387282-9866-4f31-ad1e-dfe69882352f" />
 <img width="832" height="646" alt="image" src="https://github.com/user-attachments/assets/b792a7c8-7252-47cf-9b00-252898185a70" />
+
+## Settings
+You can tweak the look of the LCD text effect
+
+<img width="624" height="484" alt="Screenshot 2026-11-21 at 9 52 56 AM" src="https://github.com/user-attachments/assets/1780ef84-aa5e-4742-aae1-0e8c7a44e87f" />
 
 ## Building
 Run `./build.sh` in the project's root directory.
