@@ -45,7 +45,11 @@ You can tweak the look of the LCD text effect
 <img width="624" height="484" alt="Screenshot 2026-11-21 at 9 52 56 AM" src="https://github.com/user-attachments/assets/1780ef84-aa5e-4742-aae1-0e8c7a44e87f" />
 
 ## Building
-Run `./build.sh` in the project's root directory.
+The editor code shared by both frontends lives in `source/`. Each platform layer has its own folder, `source/mac_appkit/` and `source/qt/`. Each build compiles one file, `source/main_appkit.mm` or `source/main_qt.cpp`, which includes everything it needs.
+
+**macOS (AppKit):** run `./build.sh` in the project's root directory.
+
+**Windows (Qt):** install Qt 6 with the MSVC 64-bit kit and Visual Studio's C++ tools. Check the two paths at the top of `build.bat`, then run it. The app is `build\RetinaCode.exe`.
 
 ## Usage
 [Download the latest release](https://github.com/sackboy19/Retina-Code/releases/latest), then run Retina Code.app

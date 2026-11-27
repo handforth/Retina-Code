@@ -1,0 +1,2 @@
+// Windows icon for the exe. Qt also uses the IDI_ICON1 resource as every window's icon.
+IDI_ICON1 ICON "retina-code.ico"

@@ -3,14 +3,9 @@
 #include <array>
 #include <utility>
 
-using Text = TypingSource;
-using Line = CommentLine;
-using Range = TypingRange;
-using String = std::u16string;
-using View = std::u16string_view;
 static constexpr auto missing = typingNotFound;
 
-static Line LineAt(const Text &text, size_t at)
+static CommentLine LineAt(const TypingSource &text, size_t at)
 {
     return text.line(text.context, at);
 }
@@ -20,38 +15,38 @@ static bool Blank(char16_t ch)
     return ch == u' ' || ch == u'\t';
 }
 
-static bool Space(char16_t ch)
+static bool UnicodeWhitespace(char16_t ch)
 {
     return ch == u' ' || (ch >= u'\t' && ch <= u'\r') || ch == 0x85 || ch == 0xA0 || ch == 0x1680 ||
            (ch >= 0x2000 && ch <= 0x200A) || ch == 0x2028 || ch == 0x2029 ||
            ch == 0x202F || ch == 0x205F || ch == 0x3000;
 }
 
-static bool Word(const Text &text, char16_t ch)
+static bool Word(const TypingSource &text, char16_t ch)
 {
     return (IsASCIIIdentifierPart(ch) && ch != u'$') || (ch >= 0x80 && text.alphanumeric(ch));
 }
 
-static size_t SkipIndent(const Text &text, size_t from, size_t end)
+static size_t SkipIndent(const TypingSource &text, size_t from, size_t end)
 {
     while (from < end && Blank(text.at(from)))
         ++from;
     return from;
 }
 
-static String Slice(const Text &text, size_t first, size_t end)
+static std::u16string Slice(const TypingSource &text, size_t first, size_t end)
 {
-    String result;
+    std::u16string result;
     text.append(text.context, result, {first, end - first});
     return result;
 }
 
-static String LeadingIndent(const Text &text, Line line)
+static std::u16string LeadingIndent(const TypingSource &text, CommentLine line)
 {
     return Slice(text, line.start, SkipIndent(text, line.start, line.end));
 }
 
-static size_t Column(const Text &text, size_t at, size_t end, size_t tabWidth)
+static size_t Column(const TypingSource &text, size_t at, size_t end, size_t tabWidth)
 {
     size_t column = 0;
     while (at < end) {
@@ -66,7 +61,7 @@ static size_t Column(const Text &text, size_t at, size_t end, size_t tabWidth)
     return column;
 }
 
-static size_t IndentColumn(View indent, size_t tabWidth)
+static size_t IndentColumn(std::u16string_view indent, size_t tabWidth)
 {
     size_t column = 0;
     for (char16_t ch : indent)
@@ -74,32 +69,32 @@ static size_t IndentColumn(View indent, size_t tabWidth)
     return column;
 }
 
-static String MakeIndent(size_t column, const Indentation &style)
+static std::u16string MakeIndent(size_t column, const Indentation &style)
 {
     if (!style.tabs)
-        return String(column, u' ');
-    String result(column / style.tabWidth, u'\t');
+        return std::u16string(column, u' ');
+    std::u16string result(column / style.tabWidth, u'\t');
     result.append(column % style.tabWidth, u' ');
     return result;
 }
 
-static String AddIndent(View indent, const Indentation &style)
+static std::u16string AddIndent(std::u16string_view indent, const Indentation &style)
 {
     const auto column = IndentColumn(indent, style.tabWidth);
     return MakeIndent(column + style.width - column % style.width, style);
 }
 
-static String NormalizeIndent(View text, const Indentation &style)
+static std::u16string NormalizeIndent(std::u16string_view text, const Indentation &style)
 {
     size_t end = 0;
     while (end < text.size() && Blank(text[end]))
         ++end;
-    String indent = MakeIndent(IndentColumn(text.substr(0, end), style.tabWidth), style);
+    std::u16string indent = MakeIndent(IndentColumn(text.substr(0, end), style.tabWidth), style);
     indent += text.substr(end);
     return indent;
 }
 
-Indentation DetectTypingIndentation(const Text &text, Indentation fallback)
+Indentation DetectTypingIndentation(const TypingSource &text, Indentation fallback)
 {
     const size_t limit = std::min<size_t>(65536, text.length);
     std::array<unsigned, 9> widths{};
@@ -137,7 +132,7 @@ Indentation DetectTypingIndentation(const Text &text, Indentation fallback)
     return fallback;
 }
 
-static String Newline(const Text &text, Line line)
+static std::u16string Newline(const TypingSource &text, CommentLine line)
 {
     if (line.next > line.end)
         return Slice(text, line.end, line.next);
@@ -149,12 +144,12 @@ static String Newline(const Text &text, Line line)
     return u"\n";
 }
 
-static bool CodeAt(const Text &text, size_t position)
+static bool CodeAt(const TypingSource &text, size_t position)
 {
     return position < text.length && text.syntax(text.context, position).role == Ink::Text;
 }
 
-size_t NextTypingBracket(const Text &text, Range range, bool backwards)
+size_t NextTypingBracket(const TypingSource &text, TypingRange range, bool backwards)
 {
     while (range.length) {
         const auto bracket = text.find(text.context, range, TypingSearch::Bracket, backwards);
@@ -176,12 +171,12 @@ size_t NextTypingBracket(const Text &text, Range range, bool backwards)
     return missing;
 }
 
-static size_t ScanBrackets(const Text &text, size_t start, bool backwards, char16_t expected = 0)
+static size_t ScanBrackets(const TypingSource &text, size_t start, bool backwards, char16_t expected = 0)
 {
-    String nesting;
+    std::u16string nesting;
     if (expected)
         nesting += expected;
-    Range remaining = backwards ? Range{0, start} : Range{start, text.length - start};
+    TypingRange remaining = backwards ? TypingRange{0, start} : TypingRange{start, text.length - start};
     while (remaining.length) {
         const auto bracket = NextTypingBracket(text, remaining, backwards);
         if (bracket == missing)
@@ -198,12 +193,12 @@ static size_t ScanBrackets(const Text &text, size_t start, bool backwards, char1
             if (nesting.empty() && expected)
                 return bracket;
         }
-        remaining = backwards ? Range{0, bracket} : Range{bracket + 1, text.length - bracket - 1};
+        remaining = backwards ? TypingRange{0, bracket} : TypingRange{bracket + 1, text.length - bracket - 1};
     }
     return missing;
 }
 
-size_t MatchingTypingBracket(const Text &text, size_t position)
+size_t MatchingTypingBracket(const TypingSource &text, size_t position)
 {
     const auto ch = text.at(position);
     const auto close = TypingCloseFor(ch), open = TypingOpenFor(ch);
@@ -212,7 +207,7 @@ size_t MatchingTypingBracket(const Text &text, size_t position)
     return close ? ScanBrackets(text, position + 1, false, close) : ScanBrackets(text, position, true, open);
 }
 
-BracketMatch BracketsAtSelection(const Text &text, Range selection, bool preferUnderCursor)
+BracketMatch BracketsAtSelection(const TypingSource &text, TypingRange selection, bool preferUnderCursor)
 {
     const auto at = selection.location;
     if (at > text.length || selection.length > 1 || selection.length > text.length - at)
@@ -243,12 +238,12 @@ void RememberTypedPair(std::vector<TypedPair> &pairs, const std::optional<TypedP
     }
 }
 
-static TypingPlan Edit(Range range, String text, size_t cursor, size_t selected = 0)
+static TypingPlan Edit(TypingRange range, std::u16string text, size_t cursor, size_t selected = 0)
 {
     return {range, std::move(text), {cursor, selected}, {}, missing};
 }
 
-static bool Escaped(const Text &text, size_t at)
+static bool Escaped(const TypingSource &text, size_t at)
 {
     auto start = at;
     while (start && text.at(start - 1) == u'\\')
@@ -262,16 +257,16 @@ static bool IsCStyle(Language language)
            language == Language::CSharp || language == Language::Java || language == Language::GML;
 }
 
-static View Trim(View text)
+static std::u16string_view Trim(std::u16string_view text)
 {
-    while (!text.empty() && Space(text.front()))
+    while (!text.empty() && UnicodeWhitespace(text.front()))
         text.remove_prefix(1);
-    while (!text.empty() && Space(text.back()))
+    while (!text.empty() && UnicodeWhitespace(text.back()))
         text.remove_suffix(1);
     return text;
 }
 
-static View CodePrefix(const Text &text, Line line, size_t end, String &code)
+static std::u16string_view CodePrefix(const TypingSource &text, CommentLine line, size_t end, std::u16string &code)
 {
     code.clear();
     for (size_t at = line.start; at < end;) {
@@ -287,9 +282,9 @@ static View CodePrefix(const Text &text, Line line, size_t end, String &code)
 }
 
 template<size_t N>
-static bool OneOf(View word, const char16_t *const (&choices)[N])
+static bool OneOf(std::u16string_view word, const char16_t *const (&choices)[N])
 {
-    return std::ranges::any_of(choices, [=](View candidate) { return word == candidate; });
+    return std::ranges::any_of(choices, [=](std::u16string_view candidate) { return word == candidate; });
 }
 
 static char16_t LowerASCII(char16_t ch)
@@ -297,12 +292,12 @@ static char16_t LowerASCII(char16_t ch)
     return ch >= u'A' && ch <= u'Z' ? ch + (u'a' - u'A') : ch;
 }
 
-static bool EqualIgnoringCase(View a, View b)
+static bool EqualIgnoringCase(std::u16string_view a, std::u16string_view b)
 {
     return std::ranges::equal(a, b, {}, LowerASCII, LowerASCII);
 }
 
-static View FirstWord(const Text &text, View code)
+static std::u16string_view FirstWord(const TypingSource &text, std::u16string_view code)
 {
     size_t start = 0, end = 0;
     while (end < code.size() && Word(text, code[end]))
@@ -317,7 +312,7 @@ static View FirstWord(const Text &text, View code)
     return code.substr(start, end - start);
 }
 
-static size_t LispListColumn(const Text &text, Line line, size_t opening, size_t end, const Indentation &style)
+static size_t LispListColumn(const TypingSource &text, CommentLine line, size_t opening, size_t end, const Indentation &style)
 {
     const auto column = Column(text, line.start, opening, style.tabWidth);
     const auto first = SkipIndent(text, opening + 1, end);
@@ -345,18 +340,18 @@ static size_t LispListColumn(const Text &text, Line line, size_t opening, size_t
         Column(text, line.start, argument, style.tabWidth) : column + 1;
 }
 
-static bool PythonHeader(const Text &text, View code)
+static bool PythonHeader(const TypingSource &text, std::u16string_view code)
 {
     return OneOf(FirstWord(text, code), {u"def", u"class", u"if", u"elif", u"else", u"for", u"while", u"try",
                                          u"except", u"finally", u"with", u"match", u"case"});
 }
 
-static bool CaseLabel(const Text &text, View code)
+static bool CaseLabel(const TypingSource &text, std::u16string_view code)
 {
     return OneOf(FirstWord(text, code), {u"case", u"default"});
 }
 
-static bool SingleStatementHeader(const Text &text, View code)
+static bool SingleStatementHeader(const TypingSource &text, std::u16string_view code)
 {
     if (code == u"else" || code == u"do")
         return true;
@@ -365,7 +360,7 @@ static bool SingleStatementHeader(const Text &text, View code)
     return code.ends_with(u")") && OneOf(FirstWord(text, code), {u"if", u"for", u"while"});
 }
 
-static std::optional<String> PythonSuiteIndent(const Text &text, Line line, size_t end, View code, String &scratch)
+static std::optional<std::u16string> PythonSuiteIndent(const TypingSource &text, CommentLine line, size_t end, std::u16string_view code, std::u16string &scratch)
 {
     if (!code.ends_with(u":"))
         return {};
@@ -383,7 +378,7 @@ static std::optional<String> PythonSuiteIndent(const Text &text, Line line, size
     return {};
 }
 
-static void IndentAfterStatement(const Text &text, Line line, String &existing, String &scratch)
+static void IndentAfterStatement(const TypingSource &text, CommentLine line, std::u16string &existing, std::u16string &scratch)
 {
     for (unsigned i = 0; line.start && i < 64; ++i) {
         line = LineAt(text, line.start - 1);
@@ -403,7 +398,7 @@ static bool MarkupLanguage(Language language)
            language == Language::JSX || language == Language::TSX;
 }
 
-static std::optional<Range> OpeningTag(const Text &text, size_t end)
+static std::optional<TypingRange> OpeningTag(const TypingSource &text, size_t end)
 {
     const size_t first = end > 4096 ? end - 4096 : 0;
     const auto opening = text.find(text.context, {first, end - first}, TypingSearch::TagStart, true);
@@ -440,19 +435,19 @@ static std::optional<Range> OpeningTag(const Text &text, size_t end)
     }
     if (quote)
         return {};
-    return Range{start, nameEnd - start};
+    return TypingRange{start, nameEnd - start};
 }
 
-static bool VoidHTMLTag(View name, Language language)
+static bool VoidHTMLTag(std::u16string_view name, Language language)
 {
     if (language != Language::HTML && language != Language::PHP)
         return false;
-    constexpr View names[] = {u"area", u"base", u"br", u"col", u"embed", u"hr", u"img", u"input", u"link", u"meta",
+    constexpr std::u16string_view names[] = {u"area", u"base", u"br", u"col", u"embed", u"hr", u"img", u"input", u"link", u"meta",
                               u"param", u"source", u"track", u"wbr"};
-    return std::ranges::any_of(names, [=](View candidate) { return EqualIgnoringCase(name, candidate); });
+    return std::ranges::any_of(names, [=](std::u16string_view candidate) { return EqualIgnoringCase(name, candidate); });
 }
 
-static bool StartsWith(const Text &text, size_t at, View expected, bool insensitive = false)
+static bool StartsWith(const TypingSource &text, size_t at, std::u16string_view expected, bool insensitive = false)
 {
     if (expected.size() > text.length - at)
         return false;
@@ -464,19 +459,19 @@ static bool StartsWith(const Text &text, size_t at, View expected, bool insensit
     return true;
 }
 
-static bool StartsWithTagEnd(const Text &text, size_t at, View name, Language language)
+static bool StartsWithTagEnd(const TypingSource &text, size_t at, std::u16string_view name, Language language)
 {
     return StartsWith(text, at, u"</") &&
            StartsWith(text, at + 2, name, language == Language::HTML || language == Language::PHP) &&
            text.at(at + 2 + name.size()) == u'>';
 }
 
-static bool WordSuffix(const Text &text, View code, View word)
+static bool WordSuffix(const TypingSource &text, std::u16string_view code, std::u16string_view word)
 {
     return code.ends_with(word) && (code.size() == word.size() || !Word(text, code[code.size() - word.size() - 1]));
 }
 
-static bool StartsIndentedBlock(const Text &text, Language language, View code)
+static bool StartsIndentedBlock(const TypingSource &text, Language language, std::u16string_view code)
 {
     const auto word = FirstWord(text, code);
     switch (language) {
@@ -500,14 +495,14 @@ static bool StartsIndentedBlock(const Text &text, Language language, View code)
         case Language::Elixir:
             return WordSuffix(text, code, u"do") || code.ends_with(u"->") || code == u"else";
         case Language::CMake: {
-            constexpr View names[] = {u"if", u"elseif", u"else", u"foreach", u"while", u"function", u"macro", u"block"};
-            return code.ends_with(u")") && std::ranges::any_of(names, [=](View name) { return EqualIgnoringCase(word, name); });
+            constexpr std::u16string_view names[] = {u"if", u"elseif", u"else", u"foreach", u"while", u"function", u"macro", u"block"};
+            return code.ends_with(u")") && std::ranges::any_of(names, [=](std::u16string_view name) { return EqualIgnoringCase(word, name); });
         }
         default: return false;
     }
 }
 
-static bool ClosesIndentedBlock(const Text &text, Language language, View code)
+static bool ClosesIndentedBlock(const TypingSource &text, Language language, std::u16string_view code)
 {
     const auto word = FirstWord(text, code);
     switch (language) {
@@ -517,14 +512,14 @@ static bool ClosesIndentedBlock(const Text &text, Language language, View code)
         case Language::Elixir: case Language::Fish: case Language::Julia:
             return word == u"end" || ((language == Language::Lua || language == Language::Luau) && word == u"until");
         case Language::CMake: {
-            constexpr View names[] = {u"endif", u"endforeach", u"endwhile", u"endfunction", u"endmacro", u"endblock"};
-            return std::ranges::any_of(names, [=](View name) { return EqualIgnoringCase(word, name); });
+            constexpr std::u16string_view names[] = {u"endif", u"endforeach", u"endwhile", u"endfunction", u"endmacro", u"endblock"};
+            return std::ranges::any_of(names, [=](std::u16string_view name) { return EqualIgnoringCase(word, name); });
         }
         default: return false;
     }
 }
 
-static std::optional<String> OuterBlockIndent(const Text &text, Line line, Language language, String &scratch)
+static std::optional<std::u16string> OuterBlockIndent(const TypingSource &text, CommentLine line, Language language, std::u16string &scratch)
 {
     unsigned depth = 1;
     for (unsigned scanned = 0; line.start && scanned < 128; ++scanned) {
@@ -555,8 +550,8 @@ static bool TripleQuotedStrings(Language language, char16_t quote)
     }
 }
 
-static TypingPlan LineBreak(const Text &text, Language language, const LexState &context,
-                            const Indentation &style, Range selection)
+static TypingPlan LineBreak(const TypingSource &text, Language language, const LexState &context,
+                            const Indentation &style, TypingRange selection)
 {
     const auto at = selection.location;
     const auto line = LineAt(text, at);
@@ -570,7 +565,7 @@ static TypingPlan LineBreak(const Text &text, Language language, const LexState 
     const auto tail = LineAt(text, selection.end());
     const auto next = SkipIndent(text, selection.end(), tail.end);
     const auto first = SkipIndent(text, line.start, at);
-    String scratch;
+    std::u16string scratch;
     if (language == Language::Makefile && next == tail.end && context.mode == LexMode::Code) {
         const auto code = CodePrefix(text, line, at, scratch);
         const auto colon = code.find(u':'), equals = code.find(u'=');
@@ -692,8 +687,8 @@ static TypingPlan LineBreak(const Text &text, Language language, const LexState 
     return Edit(selection, std::move(inserted), caret);
 }
 
-static std::optional<TypingPlan> Backspace(const Text &text, const Indentation &style,
-                                            std::span<const TypedPair> pairs, Range selection)
+static std::optional<TypingPlan> Backspace(const TypingSource &text, const Indentation &style,
+                                            std::span<const TypedPair> pairs, TypingRange selection)
 {
     const auto at = selection.location;
     if (selection.length || !at)
@@ -710,11 +705,11 @@ static std::optional<TypingPlan> Backspace(const Text &text, const Indentation &
     return Edit({line.start, at - line.start}, std::move(indent), caret);
 }
 
-static TypingPlan ShiftIndent(const Text &text, Range selection, const Indentation &style, bool right)
+static TypingPlan ShiftIndent(const TypingSource &text, TypingRange selection, const Indentation &style, bool right)
 {
     const auto first = LineAt(text, selection.location);
     const auto last = LineAt(text, selection.length ? selection.end() - 1 : selection.location);
-    String reformatted;
+    std::u16string reformatted;
     ptrdiff_t delta = 0;
     size_t start = selection.location, end = selection.end();
     for (auto offset = first.start;;) {
@@ -743,7 +738,7 @@ static TypingPlan ShiftIndent(const Text &text, Range selection, const Indentati
     return Edit({first.start, last.next - first.start}, std::move(reformatted), start, end - start);
 }
 
-static size_t PreviousIndentColumn(const Text &text, size_t lineStart, size_t tabWidth)
+static size_t PreviousIndentColumn(const TypingSource &text, size_t lineStart, size_t tabWidth)
 {
     auto last = text.find(text.context, {0, lineStart}, TypingSearch::NonBlank, true);
     if (last == missing)
@@ -752,7 +747,7 @@ static size_t PreviousIndentColumn(const Text &text, size_t lineStart, size_t ta
     return Column(text, previous.start, SkipIndent(text, previous.start, previous.end), tabWidth);
 }
 
-static TypingPlan Tab(const Text &text, Range selection, const Indentation &style)
+static TypingPlan Tab(const TypingSource &text, TypingRange selection, const Indentation &style)
 {
     if (selection.length)
         return ShiftIndent(text, selection, style, true);
@@ -772,17 +767,17 @@ static TypingPlan Tab(const Text &text, Range selection, const Indentation &styl
     const auto column = Column(text, line.start, at, style.tabWidth);
     const auto toStop = style.width - column % style.width;
     const bool tab = style.tabs && style.tabWidth - column % style.tabWidth == toStop;
-    return Edit(selection, String(tab ? 1 : toStop, tab ? u'\t' : u' '), at + (tab ? 1 : toStop));
+    return Edit(selection, std::u16string(tab ? 1 : toStop, tab ? u'\t' : u' '), at + (tab ? 1 : toStop));
 }
 
-static bool IncludeDirective(const Text &text, size_t at)
+static bool IncludeDirective(const TypingSource &text, size_t at)
 {
-    String scratch;
+    std::u16string scratch;
     auto code = CodePrefix(text, LineAt(text, at), at, scratch);
     return code.starts_with(u'#') && OneOf(Trim(code.substr(1)), {u"include", u"include_next", u"import"});
 }
 
-static size_t RustRawHashes(const Text &text, size_t at)
+static size_t RustRawHashes(const TypingSource &text, size_t at)
 {
     auto start = at;
     while (start && text.at(start - 1) == u'#')
@@ -795,7 +790,7 @@ static size_t RustRawHashes(const Text &text, size_t at)
     return prefix && Word(text, text.at(prefix - 1)) ? 0 : at - start;
 }
 
-static bool CanPairApostrophe(const Text &text, size_t at, Language language)
+static bool CanPairApostrophe(const TypingSource &text, size_t at, Language language)
 {
     const auto prior = at ? text.at(at - 1) : 0;
     if (language == Language::Rust) {
@@ -804,13 +799,13 @@ static bool CanPairApostrophe(const Text &text, size_t at, Language language)
         const auto start = LineAt(text, at).start;
         while (at > start && Blank(text.at(at - 1)))
             --at;
-        return at > start && View(u"=([,").find(text.at(at - 1)) != View::npos;
+        return at > start && std::u16string_view(u"=([,").find(text.at(at - 1)) != std::u16string_view::npos;
     }
     return !Word(text, prior) || language == Language::Python || CFamily(language);
 }
 
-static std::optional<TypingPlan> AlignColon(const Text &text, Language language,
-                                             const Indentation &style, Range selection)
+static std::optional<TypingPlan> AlignColon(const TypingSource &text, Language language,
+                                             const Indentation &style, TypingRange selection)
 {
     const auto at = selection.location;
     const auto line = LineAt(text, at);
@@ -819,9 +814,9 @@ static std::optional<TypingPlan> AlignColon(const Text &text, Language language,
     const auto indent = LeadingIndent(text, line);
     if (indent.empty())
         return {};
-    String scratch;
+    std::u16string scratch;
     const auto code = CodePrefix(text, line, at, scratch);
-    std::optional<String> aligned;
+    std::optional<std::u16string> aligned;
     const bool odinCase = language == Language::Odin && FirstWord(text, code) == u"case";
     if ((odinCase || (IsCStyle(language) && language != Language::Rust && CaseLabel(text, code))) &&
         code.find_first_of(u"?:") == code.npos) {
@@ -832,11 +827,11 @@ static std::optional<TypingPlan> AlignColon(const Text &text, Language language,
         }
     } else if (language == Language::Python && ScanBrackets(text, at, true) == missing) {
         const auto clause = FirstWord(text, code);
-        constexpr View ifs[] = {u"if", u"elif"};
-        constexpr View elses[] = {u"if", u"elif", u"for", u"while", u"try", u"except"};
-        constexpr View errors[] = {u"try", u"except", u"else"};
-        constexpr View cases[] = {u"case", u"match"};
-        std::span<const View> headers;
+        constexpr std::u16string_view ifs[] = {u"if", u"elif"};
+        constexpr std::u16string_view elses[] = {u"if", u"elif", u"for", u"while", u"try", u"except"};
+        constexpr std::u16string_view errors[] = {u"try", u"except", u"else"};
+        constexpr std::u16string_view cases[] = {u"case", u"match"};
+        std::span<const std::u16string_view> headers;
         if (clause == u"elif")
             headers = ifs;
         else if (clause == u"else")
@@ -867,12 +862,12 @@ static std::optional<TypingPlan> AlignColon(const Text &text, Language language,
     return Edit({line.start, at - line.start}, std::move(*aligned), caret);
 }
 
-static std::optional<TypingPlan> CompleteCharacter(const Text &text, Language language, const LexState &context,
+static std::optional<TypingPlan> CompleteCharacter(const TypingSource &text, Language language, const LexState &context,
                                                    const Indentation &style, std::span<const TypedPair> pairs,
-                                                   Range selection, char16_t ch)
+                                                   TypingRange selection, char16_t ch)
 {
     const auto at = selection.location;
-    if (language == Language::CommonLisp && View(u"[]{}").find(ch) != View::npos)
+    if (language == Language::CommonLisp && std::u16string_view(u"[]{}").find(ch) != std::u16string_view::npos)
         return {};
     const auto next = text.at(at);
     const bool inCode = context.mode == LexMode::Code, markupTag = context.mode == LexMode::MarkupTag;
@@ -954,7 +949,7 @@ static std::optional<TypingPlan> CompleteCharacter(const Text &text, Language la
     if (quote && TripleQuotedStrings(language, ch) && !selection.length && inCode && at >= 2 &&
         text.at(at - 1) == ch && text.at(at - 2) == ch &&
         (at < 3 || text.at(at - 3) != ch) && next != ch && !Escaped(text, at - 2)) {
-        auto triple = Edit(selection, String(4, ch), at + 1);
+        auto triple = Edit(selection, std::u16string(4, ch), at + 1);
         triple.pair = TypedPair{{at - 2, 3}, {at + 1, 3}};
         return triple;
     }
@@ -962,7 +957,7 @@ static std::optional<TypingPlan> CompleteCharacter(const Text &text, Language la
     if (!selection.length) {
         if (!inCode && !templateBrace && !jsxBrace && !(quote && markupTag && context.markup.part == TagPart::Value))
             return {};
-        if (next && !Space(next) && View(u";:.,=)}]>\"'\x60").find(next) == View::npos)
+        if (next && !UnicodeWhitespace(next) && std::u16string_view(u";:.,=)}]>\"'\x60").find(next) == std::u16string_view::npos)
             return {};
         if (quote && (Escaped(text, at) || (ch == u'\'' && !CanPairApostrophe(text, at, language))))
             return {};
@@ -974,7 +969,7 @@ static std::optional<TypingPlan> CompleteCharacter(const Text &text, Language la
     const auto hashes = language == Language::Rust && ch == u'"' ? RustRawHashes(text, at) : 0;
     if (hashes > 255)
         return {};
-    String replacement(1, ch);
+    std::u16string replacement(1, ch);
     replacement.reserve(selection.length + hashes + 2);
     text.append(text.context, replacement, selection);
     replacement += close;
@@ -984,9 +979,9 @@ static std::optional<TypingPlan> CompleteCharacter(const Text &text, Language la
     return paired;
 }
 
-std::optional<TypingPlan> PlanTyping(const Text &text, Language language, const LexState &context,
+std::optional<TypingPlan> PlanTyping(const TypingSource &text, Language language, const LexState &context,
                                      const Indentation &style, std::span<const TypedPair> pairs,
-                                     Range selection, TypingKey key, char16_t ch)
+                                     TypingRange selection, TypingKey key, char16_t ch)
 {
     if (selection.location > text.length || selection.length > text.length - selection.location)
         return {};
