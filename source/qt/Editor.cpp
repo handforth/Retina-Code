@@ -323,7 +323,7 @@ FileFormat formatOf(std::string_view bytes)
 Language detectSourceLanguage(const QByteArray &path, QStringView text)
 {
     const QByteArray beginning = text.first(std::min<qsizetype>(languagePrefixLength, text.size())).toUtf8();
-    return DetectLanguage(utf8View(path), utf8View(beginning));
+    return detect_language(utf8View(path), utf8View(beginning));
 }
 
 constexpr int typingRoleProperty = QTextFormat::UserProperty + 1;
@@ -351,7 +351,7 @@ public:
     void typingContext(const QTextBlock &block, std::u16string_view prefix, LexState &context)
     {
         context = stateBefore(block);
-        TokenizeLine(prefix, language_ == Language::Plain ? Language::C : language_, context, tokens_, false);
+        tokenize_line(prefix, language_ == Language::Plain ? Language::C : language_, context, tokens_, false);
     }
 
     bool setLanguage(Language language)
@@ -407,7 +407,7 @@ protected:
         const bool plain = language_ == Language::Plain;
         const int previous = previousBlockState();
         scratch_ = state(previous);
-        TokenizeLine(utf16View(text), plain ? Language::C : language_, scratch_, tokens_);
+        tokenize_line(utf16View(text), plain ? Language::C : language_, scratch_, tokens_);
         for (const auto &token : tokens_) {
             if (IsNonCodeToken(token))
                 setFormat(int(token.start), int(token.length),
@@ -428,14 +428,14 @@ private:
     int stateId(int old, int previous)
     {
         // Preserve the old ID when its state matches so Qt can stop the incremental pass.
-        if (scratch_ == state(0))
+        if (lex_states_equal(scratch_, state(0)))
             return 0;
-        if (old > 0 && scratch_ == state(old))
+        if (old > 0 && lex_states_equal(scratch_, state(old)))
             return old;
-        if (previous > 0 && scratch_ == state(previous))
+        if (previous > 0 && lex_states_equal(scratch_, state(previous)))
             return previous;
         for (int id : recentStates_) {
-            if (id > 0 && scratch_ == state(id))
+            if (id > 0 && lex_states_equal(scratch_, state(id)))
                 return id;
         }
 
@@ -616,9 +616,9 @@ bool completionCharacter(QStringView text, qsizetype at, bool lisp)
 {
     const QChar unit = text[at];
     if (lisp)
-        return IsLispSymbolPart(unit.unicode());
+        return is_lisp_symbol_char(unit.unicode());
     if (unit.unicode() < 128)
-        return IsASCIIIdentifierPart(unit.unicode());
+        return is_ascii_identifier_char(unit.unicode());
     if (unit.isHighSurrogate() && at + 1 < text.size() && text[at + 1].isLowSurrogate())
         return QChar::isLetterOrNumber(QChar::surrogateToUcs4(unit, text[at + 1]));
     if (unit.isLowSurrogate() && at > 0 && text[at - 1].isHighSurrogate())
@@ -737,7 +737,7 @@ public:
              const TextAppearance &appearance = {})
         : name(std::move(name)), gutter_(*this), theme_(&theme), appearance_(appearance),
           languagePath_(QDir::fromNativeSeparators(sourcePath.isEmpty() ? this->name : sourcePath).toUtf8()),
-          detectsFromText_(DetectLanguage(utf8View(languagePath_)) == Language::Plain),
+          detectsFromText_(detect_language(utf8View(languagePath_)) == Language::Plain),
           highlighter_(detectSourceLanguage(languagePath_, text))
     {
         gutter_.setAttribute(Qt::WA_OpaquePaintEvent);
@@ -879,7 +879,7 @@ public:
         name = info.fileName();
         filePath = resolvedPath;
         languagePath_ = QDir::fromNativeSeparators(info.absoluteFilePath()).toUtf8();
-        detectsFromText_ = DetectLanguage(utf8View(languagePath_)) == Language::Plain;
+        detectsFromText_ = detect_language(utf8View(languagePath_)) == Language::Plain;
         refreshDetectedLanguage();
     }
 
@@ -1270,7 +1270,7 @@ private:
         while (start > 0 && completionCharacter(line, start - 1, lisp))
             --start;
         if (end - start < minimum || (end < line.size() && completionCharacter(line, end, lisp)) ||
-            (start < end && !lisp && line[start].unicode() < 128 && !IsASCIIIdentifierStart(line[start].unicode()))) {
+            (start < end && !lisp && line[start].unicode() < 128 && !is_ascii_identifier_start(line[start].unicode()))) {
             dismissCompletion();
             return;
         }
@@ -1429,7 +1429,7 @@ public:
             return;
         detected_ = language;
         autoLabel_ = language == Language::Count ? QStringLiteral("Auto Detect")
-            : QStringLiteral("%1 (Auto)").arg(QString::fromUtf8(InfoForLanguage(language).name));
+            : QStringLiteral("%1 (Auto)").arg(QString::fromUtf8(language_info(language).name));
         emit dataChanged(index(0), index(0), {Qt::DisplayRole});
     }
 
@@ -1444,7 +1444,7 @@ private:
         static const auto rows = [] {
             std::array<Choice, size_t(Language::Count)> result{};
             for (size_t i = 0; i < result.size(); ++i)
-                result[i] = {Language(i), QString::fromUtf8(InfoForLanguage(Language(i)).name)};
+                result[i] = {Language(i), QString::fromUtf8(language_info(Language(i)).name)};
             std::sort(result.begin() + 1, result.end(), [](const Choice &left, const Choice &right) {
                 return left.label.compare(right.label, Qt::CaseInsensitive) < 0;
             });

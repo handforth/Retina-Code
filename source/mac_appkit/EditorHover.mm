@@ -73,7 +73,7 @@ static Language HoverCodeLanguage(NSString *hint, Language fallback)
     hint = [[hint componentsSeparatedByCharactersInSet:NSCharacterSet.whitespaceCharacterSet] firstObject];
     std::u16string name(hint.length, u'\0');
     [hint getCharacters:reinterpret_cast<unichar *>(name.data()) range:NSMakeRange(0, hint.length)];
-    return LanguageForFence(name);
+    return language_for_fence(name);
 }
 
 static void AppendCode(NSMutableAttributedString *text, NSString *code, NSString *hint,
@@ -95,7 +95,7 @@ static void AppendCode(NSMutableAttributedString *text, NSString *code, NSString
             size_t end = source.find(u'\n', start);
             if (end == std::u16string::npos)
                 end = source.size();
-            TokenizeLine(std::u16string_view(source).substr(start, end - start), codeLanguage, state, tokens);
+            tokenize_line(std::u16string_view(source).substr(start, end - start), codeLanguage, state, tokens);
             for (const Token &token : tokens) {
                 if (token.ink == Ink::Text)
                     continue;

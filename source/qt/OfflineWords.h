@@ -36,12 +36,12 @@ public:
         const bool plain = language == Language::Plain;
         const auto lexLanguage = plain ? Language::C : language;
         state_ = incoming_;
-        TokenizeLine(line, lexLanguage, state_, tokens_);
-        if (state_ != outgoing_) {
+        tokenize_line(line, lexLanguage, state_, tokens_);
+        if (!lex_states_equal(state_, outgoing_)) {
             // Comments, strings, or embedded modes can change the names on later lines.
             rebuild(block, language);
             state_ = incoming_;
-            TokenizeLine(line, lexLanguage, state_, tokens_);
+            tokenize_line(line, lexLanguage, state_, tokens_);
         }
         if (end > 0) {
             for (const Token &token : tokens_) {
@@ -80,8 +80,8 @@ public:
 
         if (language == Language::HTML || language == Language::Markdown || language == Language::PHP) {
             state_ = incoming_;
-            TokenizeLine(line.substr(0, size_t(end)), language, state_, tokens_, false);
-            language = LanguageInContext(language, state_);
+            tokenize_line(line.substr(0, size_t(end)), language, state_, tokens_, false);
+            language = language_in_context(language, state_);
         }
         return MergeCompletionWords(prefix, language, std::span(names).first(count), matches);
     }
@@ -123,7 +123,7 @@ private:
             const auto line = utf16View(blockText);
             if (block == active)
                 incoming_ = state_;
-            TokenizeLine(line, lexLanguage, state_, tokens_);
+            tokenize_line(line, lexLanguage, state_, tokens_);
             if (block == active) {
                 outgoing_ = state_;
                 continue;

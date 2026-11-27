@@ -400,7 +400,7 @@ void RunPane::run(Language language, const QString &file, const QString &name, c
 
     const auto extension = QFileInfo(file.isEmpty() ? name : file).suffix().toLower();
     const bool kotlinBuild = language == Language::Kotlin && extension != QStringLiteral("kts");
-    const bool build = CFamily(language) || language == Language::Rust || language == Language::Go ||
+    const bool build = is_c_family(language) || language == Language::Rust || language == Language::Go ||
         language == Language::Swift || language == Language::Odin || language == Language::Assembly || kotlinBuild;
     QString tool = QString::fromLatin1(spec.tool);
     QString program;
@@ -485,7 +485,7 @@ void RunPane::run(Language language, const QString &file, const QString &name, c
 #else
             : QStringLiteral("program"));
 #endif
-        if (CFamily(language)) {
+        if (is_c_family(language)) {
 #ifdef Q_OS_WIN
             if (prepareCompiler) {
                 prepareWindowsCompiler();
@@ -928,7 +928,7 @@ void RunPane::appendLine(QTextCursor &cursor, std::string_view bytes, Stream &st
     QUrl link;
     CompilerLocation location{};
     if (!partial) {
-        const bool runtime = stderrLine && (language_ == Language::Python || JavaScriptFamily(language_)) &&
+        const bool runtime = stderrLine && (language_ == Language::Python || is_javascript_family(language_)) &&
             ParseRuntimeLocation(data, language_ == Language::Python, location);
         auto format = compilerFormat(language_);
 #ifdef Q_OS_WIN
@@ -940,9 +940,9 @@ void RunPane::appendLine(QTextCursor &cursor, std::string_view bytes, Stream &st
             tone = location.tone;
         if (runtime || compiler) {
             const bool byteColumns = format != CompilerFormat::Parenthesized &&
-                (CFamily(language_) || language_ == Language::Go || language_ == Language::Odin ||
+                (is_c_family(language_) || language_ == Language::Go || language_ == Language::Odin ||
                  language_ == Language::Zig || language_ == Language::Assembly);
-            link = diagnosticLink(location, byteColumns, runtime && JavaScriptFamily(language_));
+            link = diagnosticLink(location, byteColumns, runtime && is_javascript_family(language_));
         }
     }
 

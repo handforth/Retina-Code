@@ -24,7 +24,7 @@ static bool UnicodeWhitespace(char16_t ch)
 
 static bool Word(const TypingSource &text, char16_t ch)
 {
-    return (IsASCIIIdentifierPart(ch) && ch != u'$') || (ch >= 0x80 && text.alphanumeric(ch));
+    return (is_ascii_identifier_char(ch) && ch != u'$') || (ch >= 0x80 && text.alphanumeric(ch));
 }
 
 static size_t SkipIndent(const TypingSource &text, size_t from, size_t end)
@@ -253,7 +253,7 @@ static bool Escaped(const TypingSource &text, size_t at)
 
 static bool IsCStyle(Language language)
 {
-    return CFamily(language) || JavaScriptFamily(language) || language == Language::Rust ||
+    return is_c_family(language) || is_javascript_family(language) || language == Language::Rust ||
            language == Language::CSharp || language == Language::Java || language == Language::GML;
 }
 
@@ -318,7 +318,7 @@ static size_t LispListColumn(const TypingSource &text, CommentLine line, size_t 
     const auto first = SkipIndent(text, opening + 1, end);
     auto head = first;
     auto headEnd = head;
-    while (headEnd < end && IsLispSymbolPart(text.at(headEnd))) {
+    while (headEnd < end && is_lisp_symbol_char(text.at(headEnd))) {
         if (text.at(headEnd) == u':')
             head = headEnd + 1;
         ++headEnd;
@@ -414,7 +414,7 @@ static std::optional<TypingRange> OpeningTag(const TypingSource &text, size_t en
     }
     if (nameEnd == start && start != end)
         return {};
-    if (nameEnd > start && !IsASCIIIdentifierStart(text.at(start)) && text.at(start) < 0x80)
+    if (nameEnd > start && !is_ascii_identifier_start(text.at(start)) && text.at(start) < 0x80)
         return {};
     auto tail = end;
     while (tail > nameEnd && Blank(text.at(tail - 1)))
@@ -606,7 +606,7 @@ static TypingPlan LineBreak(const TypingSource &text, Language language, const L
     }
 
     if (context.mode == LexMode::LineComment && next < tail.end) {
-        const auto prefix = InfoForLanguage(language).comments.line;
+        const auto prefix = language_info(language).comments.line;
         if (!prefix.empty() && first + prefix.size() <= at && StartsWith(text, first, prefix)) {
             indent += prefix;
             indent += u' ';
@@ -801,7 +801,7 @@ static bool CanPairApostrophe(const TypingSource &text, size_t at, Language lang
             --at;
         return at > start && std::u16string_view(u"=([,").find(text.at(at - 1)) != std::u16string_view::npos;
     }
-    return !Word(text, prior) || language == Language::Python || CFamily(language);
+    return !Word(text, prior) || language == Language::Python || is_c_family(language);
 }
 
 static std::optional<TypingPlan> AlignColon(const TypingSource &text, Language language,
@@ -873,7 +873,7 @@ static std::optional<TypingPlan> CompleteCharacter(const TypingSource &text, Lan
     const bool inCode = context.mode == LexMode::Code, markupTag = context.mode == LexMode::MarkupTag;
     const bool jsx = language == Language::JSX || language == Language::TSX;
     const bool jsxBrace = jsx && ch == u'{' && (markupTag || context.mode == LexMode::MarkupText);
-    const bool backticks = JavaScriptFamily(language) || language == Language::Plain || language == Language::Go ||
+    const bool backticks = is_javascript_family(language) || language == Language::Plain || language == Language::Go ||
         language == Language::Odin || language == Language::Luau || language == Language::Bash || language == Language::Zsh ||
         language == Language::Swift || language == Language::Kotlin || language == Language::SQL || language == Language::Markdown;
     const bool apostrophe = language == Language::GML ? at && text.at(at - 1) == u'@' :
@@ -881,7 +881,7 @@ static std::optional<TypingPlan> CompleteCharacter(const TypingSource &text, Lan
         language != Language::VisualBasic && language != Language::Clojure && language != Language::CommonLisp;
     const bool quote = TypingQuote(ch) && (ch != 0x60 || backticks) && (ch != u'\'' || apostrophe);
 
-    if (ch == u'>' && !selection.length && markupTag && !context.markup.endTag &&
+    if (ch == u'>' && !selection.length && markupTag && !context.markup.end_tag &&
         (!next || Blank(next) || next == u'<' || next == u'\r' || next == u'\n')) {
         if (const auto name = OpeningTag(text, at); name && (name->length || jsx)) {
             const auto tag = Slice(text, name->location, name->end());
@@ -937,9 +937,9 @@ static std::optional<TypingPlan> CompleteCharacter(const TypingSource &text, Lan
         }
     }
 
-    const bool header = ch == u'<' && CFamily(language) && inCode && IncludeDirective(text, at);
+    const bool header = ch == u'<' && is_c_family(language) && inCode && IncludeDirective(text, at);
     const bool templateBrace = ch == u'{' && !inCode &&
-        ((JavaScriptFamily(language) && context.closing == u"\x60" &&
+        ((is_javascript_family(language) && lex_closing_is(context.closing, u"\x60") &&
           at && text.at(at - 1) == u'$' && !Escaped(text, at - 1)) ||
          (language == Language::GML && context.interpolation == Interpolation::Braces && !Escaped(text, at)));
     const auto close = quote ? ch : header ? u'>' : TypingCloseFor(ch);
@@ -985,7 +985,7 @@ std::optional<TypingPlan> PlanTyping(const TypingSource &text, Language language
 {
     if (selection.location > text.length || selection.length > text.length - selection.location)
         return {};
-    language = LanguageInContext(language, context);
+    language = language_in_context(language, context);
     switch (key) {
         case TypingKey::Enter: return LineBreak(text, language, context, style, selection);
         case TypingKey::Backspace: return Backspace(text, style, pairs, selection);

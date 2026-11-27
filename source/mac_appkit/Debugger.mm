@@ -895,7 +895,7 @@ static NSString *DebugText(std::string_view bytes)
     if (_phase != DebugPhase::Paused || !frameID)
         return;
     NSString *path = _frame[@"source"][@"path"];
-    Language language = DetectLanguage(DebugUTF8(path));
+    Language language = detect_language(DebugUTF8(path));
     if (language == Language::Plain)
         language = _language;
 

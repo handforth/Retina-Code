@@ -50,7 +50,7 @@ NSArray<NSString *> *EditorLanguageNames()
     static NSArray<NSString *> *names = [] {
         NSMutableArray<NSString *> *list = [NSMutableArray arrayWithCapacity:size_t(Language::Count)];
         for (size_t index = 0; index < size_t(Language::Count); ++index)
-            [list addObject:@(InfoForLanguage(Language(index)).name)];
+            [list addObject:@(language_info(Language(index)).name)];
         return [list copy];
     }();
     return names;
@@ -107,7 +107,7 @@ static Language LanguageForSource(NSURL *url, NSString *text = nil)
     const char *path = url.fileSystemRepresentation;
     NSString *beginning = [text substringToIndex:std::min<NSUInteger>(text.length, 512)];
     const char *prefix = beginning.UTF8String;
-    return DetectLanguage(path ? path : "", prefix ? prefix : "");
+    return detect_language(path ? path : "", prefix ? prefix : "");
 }
 
 static Language LegacyFileLanguage(NSURL *url)
@@ -924,7 +924,7 @@ static NSRange LineContents(NSString *text, NSUInteger start)
                                  range:NSMakeRange(start, offset - start)];
     LexState state = IncomingState(_lines[line]);
     std::vector<Token> tokens;
-    TokenizeLine(prefix, _language == Language::Plain ? Language::C : _language, state, tokens, false);
+    tokenize_line(prefix, _language == Language::Plain ? Language::C : _language, state, tokens, false);
     return state;
 }
 
@@ -1114,15 +1114,15 @@ static NSRange LineContents(NSString *text, NSUInteger start)
         while (resume < _lines.size() && NSInteger(_lines[resume].offset) + delta < NSInteger(offset))
             ++resume;
         if (resume < _lines.size() && NSInteger(_lines[resume].offset) + delta == NSInteger(offset) &&
-            IncomingState(_lines[resume]) == state && (!colorize || _bracketStarts[resume] == bracketStack))
+            lex_states_equal(IncomingState(_lines[resume]), state) && (!colorize || _bracketStarts[resume] == bracketStack))
             break;
 
         if (updateIndex) {
-            if (state == defaultLexState)
+            if (lex_states_equal(state, defaultLexState))
                 savedState.reset();
-            else if (!savedState || *savedState != state) {
+            else if (!savedState || !lex_states_equal(*savedState, state)) {
                 auto previous = std::find_if(recentStates.begin(), recentStates.end(),
-                    [&](const auto &candidate) { return candidate && *candidate == state; });
+                    [&](const auto &candidate) { return candidate && lex_states_equal(*candidate, state); });
                 if (previous != recentStates.end()) {
                     savedState = *previous;
                 } else {
@@ -1144,7 +1144,7 @@ static NSRange LineContents(NSString *text, NSUInteger start)
         [text getLineStart:nullptr end:&end contentsEnd:&contentsEnd forRange:NSMakeRange(offset, 0)];
         line.resize(contentsEnd - offset);
         [text getCharacters:reinterpret_cast<unichar *>(line.data()) range:NSMakeRange(offset, line.size())];
-        TokenizeLine(line, plain ? Language::C : _language, state, tokens);
+        tokenize_line(line, plain ? Language::C : _language, state, tokens);
 
         @autoreleasepool {
             if (!full)
@@ -1702,9 +1702,9 @@ static bool WordCharacterAt(NSString *text, NSUInteger offset, bool lisp = false
 {
     unichar character = [text characterAtIndex:offset];
     if (lisp)
-        return IsLispSymbolPart(character);
+        return is_lisp_symbol_char(character);
     if (character < 0x80)
-        return IsASCIIIdentifierPart(character);
+        return is_ascii_identifier_char(character);
 
     UTF32Char scalar = character;
     if (CFStringIsSurrogateHighCharacter(character) && offset + 1 < text.length) {
@@ -1823,7 +1823,7 @@ static bool IsHideableUnusedWarning(SyntaxBuffer *buffer, NSUInteger offset, NSS
             return false;
     }
 
-    if (JavaScriptFamily(buffer.language)) {
+    if (is_javascript_family(buffer.language)) {
         // TypeScript uses the same code and message for unused bindings and individual imports.
         static NSRegularExpression *const importPrefix = [NSRegularExpression regularExpressionWithPattern:@"(?m)(?:^|;)\\h*import\\b\\s*(?:(?:type\\s+)?(?:[$\\w]+\\s*,\\s*)?\\{[^{};]*|[\\w$*][^\\r\\n;{}]*)?\\z" options:0 error:nil];
         NSUInteger length = std::min(offset, NSUInteger(2048));
@@ -1930,7 +1930,7 @@ static CallParameters ParametersInSignature(NSString *signature, Language langua
             if (argumentStart)
                 *argumentStart = opening;
             auto parameters = TrimSignature(std::u16string_view(text).substr(opening + 1, i - opening - 1));
-            if (parameters.empty() || (CFamily(language) && parameters == u"void"))
+            if (parameters.empty() || (is_c_family(language) && parameters == u"void"))
                 return CallParameters::None;
             return language == Language::Rust && RustReceiverOnly(parameters) ? CallParameters::Receiver : CallParameters::Arguments;
         } else if (!parentheses && character == u'<') {
@@ -1967,7 +1967,7 @@ static NSString *CompletionDisplayLabel(const CompletionItem &item, Language lan
 
     NSCharacterSet *whitespace = NSCharacterSet.whitespaceAndNewlineCharacterSet;
     NSString *name = [item.label stringByTrimmingCharactersInSet:whitespace];
-    if (CFamily(language) && [name hasPrefix:@"operator"] && (name.length == 8 || !IsASCIIIdentifierPart([name characterAtIndex:8])))
+    if (is_c_family(language) && [name hasPrefix:@"operator"] && (name.length == 8 || !is_ascii_identifier_char([name characterAtIndex:8])))
         return name;
     if ([name containsString:@"("]) {
         NSUInteger opening = NSNotFound;
@@ -2026,7 +2026,7 @@ static bool ImportStatementAt(NSString *source, NSUInteger offset, Language lang
     if (end == start || end == offset)
         return false;
     NSRange word = NSMakeRange(start, end - start);
-    if ((CFamily(language) || language == Language::CSharp) &&
+    if ((is_c_family(language) || language == Language::CSharp) &&
         [source compare:@"using" options:NSLiteralSearch range:word] == NSOrderedSame)
         return true;
     if (language == Language::Python && [source compare:@"from" options:NSLiteralSearch range:word] == NSOrderedSame)
@@ -2592,7 +2592,7 @@ NSArray<NSMenuItem *> *LanguageFeatureCommands()
     const Language language = self.syntax.language;
     if (CommentContextDependsOnLexer(language))
         return CommentsInContext(language, [self.syntax contextAtOffset:offset]);
-    return InfoForLanguage(language).comments;
+    return language_info(language).comments;
 }
 
 - (Vim::Comments)vimComments
@@ -2603,7 +2603,7 @@ NSArray<NSMenuItem *> *LanguageFeatureCommands()
 
 - (BOOL)canToggleLineComment
 {
-    const auto &comments = InfoForLanguage(self.syntax.language).comments;
+    const auto &comments = language_info(self.syntax.language).comments;
     return self.editable && !self.hasMarkedText && !self.vimCommandLine &&
            (!comments.line.empty() || !comments.open.empty());
 }
@@ -2644,7 +2644,7 @@ NSArray<NSMenuItem *> *LanguageFeatureCommands()
 
 static bool IdentifierAt(NSString *text, NSUInteger offset)
 {
-    return offset < text.length && IsASCIIIdentifierPart([text characterAtIndex:offset]);
+    return offset < text.length && is_ascii_identifier_char([text characterAtIndex:offset]);
 }
 
 - (NSUInteger)vimDefinitionAt:(NSUInteger)position
@@ -2675,7 +2675,7 @@ static bool IdentifierAt(NSString *text, NSUInteger offset)
 
         NSUInteger wordEnd = hit.location;
         while (wordEnd && ([spaces characterIsMember:[text characterAtIndex:wordEnd - 1]] ||
-               (CFamily(language) &&
+               (is_c_family(language) &&
                 ([text characterAtIndex:wordEnd - 1] == '*' || [text characterAtIndex:wordEnd - 1] == '&'))))
             --wordEnd;
         NSUInteger wordStart = wordEnd;
@@ -2684,7 +2684,7 @@ static bool IdentifierAt(NSString *text, NSUInteger offset)
         NSString *previous = [text substringWithRange:NSMakeRange(wordStart, wordEnd - wordStart)];
         bool declaration = [previous isEqualToString:@"class"] || [previous isEqualToString:@"struct"] ||
                            [previous isEqualToString:@"enum"];
-        if (JavaScriptFamily(language)) {
+        if (is_javascript_family(language)) {
             declaration |= [@[@"function", @"const", @"let", @"var", @"type", @"interface", @"namespace"]
                             containsObject:previous];
         } else if (language == Language::Python) {
@@ -2692,7 +2692,7 @@ static bool IdentifierAt(NSString *text, NSUInteger offset)
         } else if (language == Language::Rust) {
             declaration |= [@[@"fn", @"trait", @"let", @"mut", @"const", @"static", @"mod", @"type"]
                             containsObject:previous];
-        } else if (CFamily(language)) {
+        } else if (is_c_family(language)) {
             declaration |= [@[@"using", @"namespace", @"union", @"void", @"bool", @"char", @"short", @"int",
                               @"long", @"signed", @"unsigned", @"float", @"double", @"auto", @"size_t"]
                             containsObject:previous] || [previous hasSuffix:@"_t"];
@@ -3041,13 +3041,13 @@ static bool IdentifierAt(NSString *text, NSUInteger offset)
     auto inserted = TrimSignature(edit.text);
     if (inserted.empty() || inserted.find_first_of(u"\r\n") != inserted.npos)
         return;
-    if (CFamily(language) && inserted.starts_with(u"operator") &&
-        (inserted.size() == 8 || !IsASCIIIdentifierPart(inserted[8])))
+    if (is_c_family(language) && inserted.starts_with(u"operator") &&
+        (inserted.size() == 8 || !is_ascii_identifier_char(inserted[8])))
         return;
     NSUInteger call = inserted.back() == u')' ? LastCallOpening(inserted) : NSNotFound;
     if (call != NSNotFound)
         call += inserted.data() - edit.text.data();
-    else if (!IsASCIIIdentifierPart(inserted.back()) && inserted.back() < 0x80 && inserted.back() != u'>')
+    else if (!is_ascii_identifier_char(inserted.back()) && inserted.back() < 0x80 && inserted.back() != u'>')
         return;
 
     bool boundReceiver = CallHasReceiver(source, edit.range.location) || inserted.starts_with(u"self.");
@@ -3056,7 +3056,7 @@ static bool IdentifierAt(NSString *text, NSUInteger offset)
     NSUInteger nameEnd = at;
     while (nameEnd < source.length && WordCharacterAt(source, nameEnd))
         ++nameEnd;
-    bool acrossLines = language == Language::Rust || CFamily(language);
+    bool acrossLines = language == Language::Rust || is_c_family(language);
     NSUInteger afterName = SkipCallSpaces(source, nameEnd, acrossLines);
     NSUInteger typeEnd = CallTypeArgumentsEnd(source, afterName, language);
     NSUInteger opening = SkipCallSpaces(source, typeEnd, acrossLines);
@@ -3206,7 +3206,7 @@ static bool IdentifierAt(NSString *text, NSUInteger offset)
         ![self.syntax codeAtOffset:end - 1] || ![self cursorsShareCompletionPrefix:_completionPrefix])
         return NO;
     if (language == Language::HTML || language == Language::Markdown || language == Language::PHP)
-        language = LanguageInContext(language, [self.syntax contextAtOffset:end]);
+        language = language_in_context(language, [self.syntax contextAtOffset:end]);
     std::array<std::u16string_view, completionLimit> words;
     size_t count = [self.syntax completionWords:LSPText(prefix) language:language results:words];
     std::array<CompletionItem, completionLimit> items;
@@ -3214,7 +3214,7 @@ static bool IdentifierAt(NSString *text, NSUInteger offset)
     for (size_t i = 0; i < count; ++i) {
         std::u16string_view word = words[i];
         LexState state;
-        TokenizeLine(word, language, state, tokens);
+        tokenize_line(word, language, state, tokens);
         CompletionKind kind = CompletionKind::Word;
         if (tokens.size() == 1) {
             switch (tokens.front().ink) {
@@ -3317,7 +3317,7 @@ static bool IdentifierAt(NSString *text, NSUInteger offset)
     }
     if (range.length) {
         unichar first = [text characterAtIndex:start];
-        if (!lisp && first < 0x80 && !IsASCIIIdentifierStart(first)) {
+        if (!lisp && first < 0x80 && !is_ascii_identifier_start(first)) {
             [self dismissCompletion];
             return;
         }
@@ -5907,7 +5907,7 @@ static bool RunHasBreakpoint(RunProject project, Language language, NSURL *file)
             continue;
         NSURL *source = [NSURL fileURLWithPath:path];
         Language sourceLanguage = LanguageForSource(source);
-        if ((sourceLanguage == language || (CFamily(language) && CFamily(sourceLanguage))) &&
+        if ((sourceLanguage == language || (is_c_family(language) && is_c_family(sourceLanguage))) &&
             [NSFileManager.defaultManager fileExistsAtPath:path])
             return true;
     }

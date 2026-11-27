@@ -17,7 +17,7 @@ inline bool CommentContextDependsOnLexer(Language language)
 inline CommentSyntax CommentsInContext(Language language, const LexState &context)
 {
     if (CommentContextDependsOnLexer(language)) {
-        language = LanguageInContext(language, context);
+        language = language_in_context(language, context);
         if (context.mode == LexMode::MarkupText) {
             if (language == Language::JSX || language == Language::TSX)
                 return {{}, u"{/*", u"*/}"};
@@ -25,7 +25,7 @@ inline CommentSyntax CommentsInContext(Language language, const LexState &contex
                 language = Language::HTML;
         }
     }
-    return InfoForLanguage(language).comments;
+    return language_info(language).comments;
 }
 
 inline size_t CommentInsertionAdvance(std::u16string_view text)

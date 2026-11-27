@@ -105,7 +105,7 @@ RunProject LocateRunProject(Language language, NSURL *file, NSURL *folder)
         if (NSURL *manifest = DotNetProject(directory, limit, projectExtension))
             return {RunKind::DotNet, manifest.URLByDeletingLastPathComponent, manifest};
     }
-    if (folder && (CFamily(language) || (language == Language::Plain && !file)))
+    if (folder && (is_c_family(language) || (language == Language::Plain && !file)))
         return {RunKind::NativeProject, folder};
     if (folder && file && RunnableLanguage(language))
         return {RunKind::Script, folder};
@@ -148,7 +148,7 @@ static bool DefinesMain(NSURL *file, Language language)
         row.resize(content - start);
         [text getCharacters:reinterpret_cast<unichar *>(row.data()) range:NSMakeRange(start, row.size())];
         start = end;
-        TokenizeLine(row, language, state, tokens);
+        tokenize_line(row, language, state, tokens);
         if (!tokens.empty() && tokens.front().ink == Ink::Directive)
             continue;
         size_t token = 0;
@@ -188,9 +188,9 @@ static bool DefinesMain(NSURL *file, Language language)
             } else if (unit == u'}') {
                 if (braces)
                     --braces;
-            } else if (IsASCIIIdentifierStart(unit)) {
+            } else if (is_ascii_identifier_start(unit)) {
                 size_t first = i - 1;
-                while (i < row.size() && IsASCIIIdentifierPart(row[i]))
+                while (i < row.size() && is_ascii_identifier_char(row[i]))
                     ++i;
                 if (!braces && std::u16string_view(row).substr(first, i - first) == u"main")
                     stage = Stage::Open;
@@ -367,7 +367,7 @@ bool RunnableLanguage(Language language)
 
 bool DebuggableLanguage(Language language, NSURL *file)
 {
-    return CFamily(language) || language == Language::Rust || language == Language::Swift ||
+    return is_c_family(language) || language == Language::Rust || language == Language::Swift ||
            language == Language::Go || language == Language::Odin || language == Language::Zig ||
            language == Language::CommonLisp || language == Language::Python ||
            (language == Language::Assembly && [file.pathExtension.lowercaseString isEqualToString:@"s"]);
@@ -692,7 +692,7 @@ static RunMessage CompilerMessage(RunMessage message, std::string_view text, con
                    [url.URLByResolvingSymlinksInPath isEqual:context.input.URLByResolvingSymlinksInPath];
     message.location = {current ? context.original : url, match.line, match.column,
                         match.firstColumn, match.endColumn, current, context.byteColumns,
-                        runtime && JavaScriptFamily(context.language)};
+                        runtime && is_javascript_family(context.language)};
     if (runtime) {
         NSRange range = [message.text rangeOfString:path options:NSLiteralSearch];
         if (range.location != NSNotFound) {
@@ -726,7 +726,7 @@ static RunMessage CompilerMessage(RunMessage message, std::string_view text, con
     ReplaceOutputText(message, NSMakeRange(0, prefix), display);
     if (message.tone != OutputTone::Text) {
         message.diagnostic = [details stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
-        if (CFamily(context.language) && [message.diagnostic hasSuffix:@"]"]) {
+        if (is_c_family(context.language) && [message.diagnostic hasSuffix:@"]"]) {
             NSRange option = [message.diagnostic rangeOfString:@"[-W" options:NSBackwardsSearch];
             if (option.location != NSNotFound) {
                 NSUInteger start = option.location + 1;
@@ -2034,7 +2034,7 @@ static SyntaxIssue CheckLispText(NSString *text, const std::atomic_bool &stop)
         if (row == 1 && !line.empty() && line.front() == u'\uFEFF')
             line.erase(0, 1);
 
-        TokenizeLine(line, Language::CommonLisp, state, tokens);
+        tokenize_line(line, Language::CommonLisp, state, tokens);
         size_t token = 0;
         for (size_t column = 0; column < line.size(); ++column) {
             char16_t ch = line[column];
@@ -2044,7 +2044,7 @@ static SyntaxIssue CheckLispText(NSString *text, const std::atomic_bool &stop)
             while (token < tokens.size() && tokens[token].start + tokens[token].length <= column)
                 ++token;
 
-            if (token < tokens.size() && tokens[token].start <= column && tokens[token].nonCode)
+            if (token < tokens.size() && tokens[token].start <= column && tokens[token].non_code)
                 continue;
 
             if (ch == u'(') {
@@ -2175,7 +2175,7 @@ static void CheckSourceFile(RunProject project, Language language, NSURL *file, 
     NSString *path = input.path;
     NSArray<NSString *> *args = nil;
     std::optional<ScriptDiagnostic> script;
-    if (CFamily(language)) {
+    if (is_c_family(language)) {
         args = [NativeFlags(language) arrayByAddingObjectsFromArray:@[@"-fsyntax-only", @"-iquote", directory.path, path]];
     } else {
         switch (language) {
@@ -2267,7 +2267,7 @@ static void CheckSourceFile(RunProject project, Language language, NSURL *file, 
         return;
     }
 
-    bool bytes = CFamily(language) || language == Language::Go || language == Language::Swift ||
+    bool bytes = is_c_family(language) || language == Language::Go || language == Language::Swift ||
                  language == Language::Zig || language == Language::Odin;
     DiagnosticContext diagnostics{input, file, directory, name, bytes, language, mirror};
     RunCommand(tool, args, directory, &diagnostics, stop, log);
@@ -2288,7 +2288,7 @@ static void RunSource(Language language, NSURL *file, NSString *name, NSString *
     NSURL *directory = file.URLByDeletingLastPathComponent;
     NSString *extension = file.pathExtension.lowercaseString;
     NSString *tool = nil, *launcher = nil;
-    bool build = CFamily(language) || language == Language::Rust || language == Language::Swift ||
+    bool build = is_c_family(language) || language == Language::Rust || language == Language::Swift ||
         language == Language::Go || language == Language::Odin || language == Language::Assembly;
     bool kotlin = language == Language::Kotlin && ![extension isEqualToString:@"kts"];
     bool mono = false;
@@ -2352,13 +2352,13 @@ static void RunSource(Language language, NSURL *file, NSString *name, NSString *
     directory = workingFolder ? workingFolder : directory ? directory : files.folder;
     NSString *path = input.path;
     DiagnosticContext diagnostics{input, file, directory, name,
-        CFamily(language) || language == Language::Go || language == Language::Zig || language == Language::Assembly, language};
+        is_c_family(language) || language == Language::Go || language == Language::Zig || language == Language::Assembly, language};
     if (dotnet) {
         BuildAndRunDotNet(tool, input, directory, diagnostics, stop, log, inputChannel, ready);
         return;
     }
     if (!build) {
-        diagnostics.runtimeLocations = language == Language::Python || JavaScriptFamily(language);
+        diagnostics.runtimeLocations = language == Language::Python || is_javascript_family(language);
         bool diagnosticsInOutput = diagnostics.runtimeLocations || language == Language::Java || language == Language::Kotlin ||
             language == Language::Zig || language == Language::Dart || language == Language::CSharp || language == Language::FSharp;
         RunProgram(tool, ScriptArguments(language, path), directory, stop, log, inputChannel, ready,
@@ -2438,7 +2438,7 @@ static DebugExecutable *BuildDebugExecutable(RunProject project, Language langua
                                               project.kind == RunKind::OdinPackage, true);
         }
         DiagnosticContext diagnostics{file, file, directory, file.lastPathComponent,
-            CFamily(language) || language == Language::Go || language == Language::Zig, language};
+            is_c_family(language) || language == Language::Go || language == Language::Zig, language};
         if (!BuildProgram(tool, arguments, directory, diagnostics, stop, log))
             return nil;
     }

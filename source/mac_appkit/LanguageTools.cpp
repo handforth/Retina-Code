@@ -49,7 +49,7 @@ const Tool *ToolForLanguage(Language language)
     static constexpr Tool cmake{"cmake-language-server", nullptr, "cmake-language-server", InstallKind::Python};
     static constexpr Tool docker{"docker-langserver", "--stdio", "dockerfile-language-server-nodejs", InstallKind::Npm};
     static constexpr Tool toml{"taplo", "lsp", "taplo", InstallKind::Brew, "stdio"};
-    if (CFamily(language))
+    if (is_c_family(language))
         return &clangd;
     switch (language) {
     case Language::Rust: return &rust;
@@ -96,7 +96,7 @@ std::string_view LanguageID(Language language, char (&lowercase)[64])
     case Language::CommonLisp: return "lisp";
     default: break;
     }
-    std::string_view name = InfoForLanguage(language).name;
+    std::string_view name = language_info(language).name;
     if (name.size() > sizeof(lowercase))
         return name;
     std::ranges::transform(name, lowercase, [](char ch) {
@@ -125,9 +125,9 @@ static std::span<const char *const> ProjectMarkers(Language language)
     static constexpr const char *dart[]{"pubspec.yaml"};
     static constexpr const char *haskell[]{"hie.yaml", "cabal.project", "stack.yaml"};
     static constexpr const char *cmake[]{"CMakeLists.txt"};
-    if (CFamily(language))
+    if (is_c_family(language))
         return clang;
-    if (JavaScriptFamily(language))
+    if (is_javascript_family(language))
         return js;
     switch (language) {
     case Language::Rust: return rustMarkers;
@@ -445,10 +445,10 @@ std::string FindExecutable(const ToolPaths &paths, const Tool *tool, Language la
             return result.succeeded ? Executable(std::move(result.output)) : std::string{};
         }
     }
-    if (CFamily(language) || language == Language::Swift) {
+    if (is_c_family(language) || language == Language::Swift) {
         if (!installed.empty() && !installed.starts_with("/usr/bin/"))
             return installed;
-        if (CFamily(language)) {
+        if (is_c_family(language)) {
             for (const char *prefix : {"/opt/homebrew", "/usr/local"}) {
                 auto file = Executable(std::string(prefix) + "/opt/llvm/bin/clangd");
                 if (!file.empty())

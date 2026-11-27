@@ -1086,7 +1086,7 @@ static void WithDocumentFileAccess(NSArray<SourceDocument *> *documents, NSUInte
 
 - (void)addStarter:(Language)language toMenu:(NSMenu *)menu
 {
-    NSString *title = [@(InfoForLanguage(language).name) stringByAppendingString:@" Hello World"];
+    NSString *title = [@(language_info(language).name) stringByAppendingString:@" Hello World"];
     NSMenuItem *item = [menu addItemWithTitle:title action:@selector(makeNewItem:) keyEquivalent:@""];
     item.target = self;
     item.tag = NSInteger(language);
@@ -1113,7 +1113,7 @@ static void WithDocumentFileAccess(NSArray<SourceDocument *> *documents, NSUInte
             other.push_back(language);
     }
     std::sort(other.begin(), other.end(), [](Language a, Language b) {
-        return std::string_view(InfoForLanguage(a).name) < InfoForLanguage(b).name;
+        return std::string_view(language_info(a).name) < language_info(b).name;
     });
     NSMenu *more = [[NSMenu alloc] initWithTitle:@"More Languages"];
     for (Language language : other)
