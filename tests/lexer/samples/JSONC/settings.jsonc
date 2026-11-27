@@ -1,0 +1,159 @@
+// JSONC lexer stress: comments, trailing commas, escapes, numbers, nesting
+/* Block comment at the top
+   with "strings" and 'quotes' and // slashes inside */
+{
+  // Line comment before a key
+  "editor.fontFamily": "'Fira Code', Consolas, \"Courier New\", monospace",
+  "editor.fontSize": 14,
+  "editor.lineHeight": 1.5,
+  "editor.tabSize": 4, // trailing line comment after a value
+  "editor.rulers": [80, 100, 120,], /* trailing comma in array */
+  "editor.wordSeparators": "`~!@#$%^&*()-=+[{]}\\|;:'\",.<>/?",
+  "files.exclude": {
+    "**/.git": true,
+    "**/node_modules": true,
+    "**/*.{js,map}": { "when": "$(basename).ts" },
+  },
+  "files.associations": {
+    "*.jsonc": "jsonc",
+    "Dockerfile.*": "dockerfile",
+    ".env*": "properties"
+  },
+
+  /* Escapes in strings */
+  "escapes": {
+    "quote": "she said \"hi\"",
+    "backslash": "C:\\Users\\name\\",
+    "slash": "http:\/\/example.com\/path",
+    "controls": "\b\f\n\r\t",
+    "unicode": "\u0041\u00e9\u4E2D\uD83D\uDE00",
+    "commentLike": "// not a comment /* nor this */",
+    "endsWithBackslash": "trailing \\",
+    "empty": "",
+    "spaces": "   ",
+    "braces": "{ [ ] } : ,"
+  },
+
+  // Numbers
+  "numbers": {
+    "zero": 0,
+    "negZero": -0,
+    "int": 42,
+    "neg": -42,
+    "float": 3.14159,
+    "exp": 1e10,
+    "expUpper": 1E10,
+    "expNeg": 1.5e-3,
+    "expPos": 2.5E+7,
+    "big": 12345678901234567890,
+    "tiny": 0.000000001,
+    "hexLike": "0xFF" // hex is not valid JSON, so it is a string here
+  },
+
+  "literals": [true, false, null, "true", "null"],
+  "nested": {
+    "level1": {
+      "level2": {
+        "level3": {
+          "array": [[1, 2], [3, [4, [5, []]]], {}],
+          "deep": { "x": { "y": { "z": "bottom" } } }
+        }
+      }
+    }
+  },
+
+  "emptyObject": {},
+  "emptyArray": [],
+  "arrayOfObjects": [
+    { "name": "a", "value": 1 },
+    { "name": "b", "value": 2 }, // comment between elements
+    /* block comment between elements */
+    { "name": "c", "value": 3 },
+  ],
+
+  "launch": {
+    "version": "0.2.0",
+    "configurations": [
+      {
+        "type": "node",
+        "request": "launch",
+        "name": "Launch Program",
+        "program": "${workspaceFolder}/src/index.ts",
+        "args": ["--port", "3000", "--flag=\"quoted\""],
+        "env": {
+          "NODE_ENV": "development",
+          "DEBUG": "app:*",
+          "PATH": "${env:PATH};C:\\tools\\bin"
+        },
+        "preLaunchTask": "tsc: build - tsconfig.json",
+        "outFiles": ["${workspaceFolder}/dist/**/*.js"],
+        "skipFiles": ["<node_internals>/**"],
+      }
+    ],
+    "compounds": []
+  },
+
+  "keybindings": [
+    { "key": "ctrl+shift+/", "command": "editor.action.blockComment", "when": "editorTextFocus && !editorReadonly" },
+    { "key": "ctrl+k ctrl+c", "command": "editor.action.addCommentLine" },
+    { "key": "alt+`", "command": "workbench.action.terminal.toggleTerminal" }
+  ],
+
+  "regexPatterns": {
+    "email": "^[\\w.+-]+@[\\w-]+\\.[\\w.]+$",
+    "path": "^(?:/[^/]+)+/?$",
+    "escapedQuote": "\\\"[^\\\"]*\\\""
+  },
+
+  "unicodeKeys": {
+    "日本語": "Japanese",
+    "emoji😀": "smile",
+    "with space": 1,
+    "with\"quote": 2,
+    "with\\backslash": 3,
+    "": "empty key"
+  },
+
+  /*
+   * Multi-line block comment in the middle of an object.
+   * {"fake": "json inside comment"}
+   */
+  "tsconfig": {
+    "compilerOptions": {
+      "target": "ES2022",
+      "module": "NodeNext",
+      "strict": true,
+      "paths": { "@/*": ["./src/*"] },
+      "lib": ["ES2022", "DOM", "DOM.Iterable"],
+      // "commentedOut": true,
+      /* "alsoCommentedOut": false, */
+    },
+    "include": ["src/**/*", "types/**/*.d.ts"],
+    "exclude": ["node_modules", "**/*.spec.ts"],
+  },
+
+  "[typescript]": {
+    "editor.defaultFormatter": "esbenp.prettier-vscode",
+    "editor.codeActionsOnSave": {
+      "source.organizeImports": "explicit",
+      "source.fixAll.eslint": "always"
+    }
+  },
+  "[markdown]": { "editor.wordWrap": "on", "files.trimTrailingWhitespace": false },
+  "terminal.integrated.profiles.windows": {
+    "PowerShell": { "source": "PowerShell", "args": ["-NoLogo"] },
+    "Git Bash": { "path": "C:\\Program Files\\Git\\bin\\bash.exe", "args": ["--login", "-i"] }
+  },
+  "workbench.colorCustomizations": {
+    "editor.background": "#1e1e1e",
+    "editorCursor.foreground": "#FFCC00AA"
+  },
+  "search.exclude": { "**/dist": true, "**/*.min.{js,css}": true },
+  "emptyComment": /**/ "value after empty block comment",
+  "starsComment": /*** many stars ***/ 1,
+
+  "lastKey": "value with url http://example.com/a//b and a comment-looking // tail"
+  // comment after the last property without a comma
+}
+// Trailing comment after the root value
+/* And a trailing block comment */

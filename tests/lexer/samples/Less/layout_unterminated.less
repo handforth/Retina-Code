@@ -1,0 +1,161 @@
+// Second Less sample: grid generation, escaping, detached rulesets,
+// and an unterminated block comment at EOF.
+
+@import "mixins.less";
+@import (multiple) "repeated.less";
+
+@container-widths: 540px, 720px, 960px, 1140px;
+@breakpoint-names: sm, md, lg, xl;
+@spacers: 0, 4px, 8px, 16px, 24px, 48px;
+@prefix: ~"app";
+@sel-list: ~".a, .b";
+@quote: "'";
+@dq: '"';
+
+.generate-containers(@i: 1) when (@i =< length(@container-widths)) {
+  @name: extract(@breakpoint-names, @i);
+  @width: extract(@container-widths, @i);
+  @media (min-width: (@width + 36px)) {
+    .@{prefix}-container-@{name} {
+      max-width: @width;
+      margin-inline: auto;
+    }
+  }
+  .generate-containers(@i + 1);
+}
+.generate-containers();
+
+.generate-spacers(@i: 1) when (@i =< length(@spacers)) {
+  @value: extract(@spacers, @i);
+  @n: (@i - 1);
+  .m-@{n} { margin: @value !important; }
+  .p-@{n} { padding: @value !important; }
+  .mx-@{n} { margin-left: @value; margin-right: @value; }
+  .generate-spacers((@i + 1));
+}
+.generate-spacers();
+
+.flex(@dir: row; @justify: flex-start; @align: stretch) {
+  display: flex;
+  flex-direction: @dir;
+  justify-content: @justify;
+  align-items: @align;
+}
+
+.media(@query; @rules) {
+  @media @query {
+    @rules();
+  }
+}
+
+.layout {
+  .flex(column; space-between);
+  min-height: 100vh;
+
+  .media(~"(min-width: 768px)"; {
+    flex-direction: row;
+    .sidebar { width: 240px; }
+  });
+
+  &__header,
+  &__footer {
+    flex: 0 0 auto;
+    padding: extract(@spacers, 3) extract(@spacers, 4);
+  }
+
+  &__main {
+    flex: 1 1 auto;
+    overflow: auto;
+    // nested comment inside rule
+    /* block comment inside rule */
+  }
+
+  &__sidebar when (@enable-sidebar = true) {
+    display: block;
+  }
+}
+
+@enable-sidebar: true;
+
+.escaping {
+  width: ~"calc(100% - 10px)";
+  filter: ~"progid:DXImageTransform.Microsoft.gradient(startColorstr='#80000000', endColorstr='#80000000')";
+  content: "@{quote}quoted@{quote}";
+  font-family: e(%("%s, sans-serif", "Inter"));
+  grid-template-areas:
+    "header header"
+    "sidebar main"
+    "footer footer";
+}
+
+@{sel-list} {
+  color: red;
+}
+
+.selectors {
+  &:not(.disabled):hover > a[href*="example"]::after {
+    content: "\2192";
+  }
+  &:nth-of-type(3n+1) { clear: left; }
+  @media print { display: none; }
+  @supports (position: sticky) { position: sticky; top: 0; }
+}
+
+.important-mixin() { color: red; }
+.uses-important { .important-mixin() !important; }
+
+.recursive-colors(@list; @i: 1) when (@i <= length(@list)) {
+  @c: extract(@list, @i);
+  .swatch-@{i} {
+    background: @c;
+    color: contrast(@c);
+    border: 1px solid darken(@c, 15%);
+  }
+  .recursive-colors(@list; @i + 1);
+}
+.recursive-colors(red, #0f0, rgb(0, 0, 255), hsl(60, 100%, 50%));
+
+@plugin "math-plugin";
+.plugin-use {
+  width: pi() * 2px;
+}
+
+.property-merge {
+  background+: url(1.png);
+  background+: url(2.png);
+  transform+_: scale(2);
+  transform+_: rotate(15deg);
+}
+
+.when-chains(@mode) when (@mode = dark) { background: #000; }
+.when-chains(@mode) when not (@mode = dark) { background: #fff; }
+.themed { .when-chains(dark); }
+
+.numbers {
+  a: 0.5em;
+  b: .5em;
+  c: -1.25rem;
+  d: +2px;
+  e: 1e-3s;
+  f: 100%;
+  g: 360deg;
+  h: 2x;
+  i: #abc;
+  j: #AABBCCDD;
+}
+
+.strings {
+  a: "double with \"escapes\"";
+  b: 'single with \'escapes\'';
+  c: "multi-line via \
+backslash";
+  d: "unterminated at end of line
+  e: after;
+}
+
+/* The following block comment never closes:
+   .not-real { color: blue; }
+   @not-a-var: 1;
+   .mixin();
+   "string" 'string' ~"escaped"
+   end of file reached inside comment

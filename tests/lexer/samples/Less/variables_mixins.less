@@ -1,0 +1,204 @@
+// Less lexer stress: @variables, mixins, guards, interpolation, escaping, operations
+@import (reference) "bootstrap/less/variables.less";
+@import (css, optional) url("theme.css");
+@plugin "my-plugin";
+
+/* Block comment with 'quotes' and "doubles" and // slashes */
+// Line comment with /* opener that does not open
+
+@primary: #428bca;
+@primary-dark: darken(@primary, 10%);
+@font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+@base-font-size: 14px;
+@line-height: 1.428571429;
+@grid-columns: 12;
+@grid-gutter: 30px;
+@screen-sm: ~"(min-width: 768px)";
+@screen-md: ~'(min-width: 992px)';
+@selector: ~".banner";
+@property: color;
+@images: "../img";
+@var-name: "primary";
+@detached: {
+  background: red;
+  color: white;
+};
+@list: 1px 2px 3px;
+@comma-list: a, b, c;
+@min768: (min-width: 768px);
+@url-unquoted: url(images/bg.png);
+@url-quoted: url("@{images}/bg.png");
+@math-ops: (@base-font-size * 2) + 4px - (10px / 2);
+@percentage: percentage(0.5);
+@hex: #FFF;
+@hex8: #00000080;
+@negative: -@grid-gutter;
+@important-var: 10px !important;
+
+.mixin-plain() {
+  margin: 0;
+  padding: 0;
+}
+
+.bordered(@width: 2px; @style: solid; @color: black) {
+  border: @width @style @color;
+}
+
+.box-shadow(@shadow) {
+  -webkit-box-shadow: @shadow;
+          box-shadow: @shadow;
+}
+
+.mixin-with-rest(@a; @rest...) {
+  transition: @arguments;
+  margin: @rest;
+}
+
+.guarded(@a) when (lightness(@a) >= 50%) {
+  background-color: black;
+}
+.guarded(@a) when (lightness(@a) < 50%) {
+  background-color: white;
+}
+.guarded(@a) when (default()) {
+  color: @a;
+}
+
+.size(@w; @h) when (isnumber(@w)) and (ispixel(@h)), (iskeyword(@w)) {
+  width: @w;
+  height: @h;
+}
+
+#namespace {
+  .inner-mixin() {
+    color: blue;
+  }
+}
+
+.loop(@i) when (@i > 0) {
+  .col-@{i} {
+    width: (@i * 100% / @grid-columns);
+  }
+  .loop(@i - 1);
+}
+.loop(@grid-columns);
+
+@{selector} {
+  @{property}: @primary;
+  background-@{property}: @primary-dark;
+  background-image: url("@{images}/banner.png");
+  font: @base-font-size/@line-height @font-family;
+  width: ~"calc(100% - @{grid-gutter})";
+  height: calc(~"100vh - " @grid-gutter);
+  filter: ~"ms:alwaysHasItsOwnSyntax.For.Stuff()";
+  content: "escaped \"quotes\" and @{var-name} interpolation";
+  @r: { color: red };
+  @detached();
+}
+
+.card {
+  .mixin-plain();
+  .bordered(1px; dashed);
+  .box-shadow(0 1px 2px rgba(0, 0, 0, .075));
+  .guarded(#ddd);
+  #namespace > .inner-mixin();
+  #namespace.inner-mixin();
+  color: @@var-name;  // variable variable
+
+  &-header {
+    font-weight: bold;
+    &:hover { color: @primary; }
+    & + & { margin-top: 0; }
+  }
+
+  &:extend(.mixin-plain all);
+
+  .theme-dark & {
+    background: #222;
+  }
+
+  @media @screen-sm {
+    padding: (@grid-gutter / 2);
+    @media (orientation: landscape) {
+      padding: @grid-gutter;
+    }
+  }
+
+  @media @min768 and (max-width: 991px) {
+    display: none;
+  }
+
+  > .child { margin-left: 4px; }
+  ~ .sibling { opacity: .5; }
+
+  &[data-type="primary"],
+  &[data-type='secondary'] {
+    border-color: fade(@primary, 50%);
+  }
+}
+
+.button {
+  .button-variant(@color; @background; @border) {
+    color: @color;
+    background-color: @background;
+    border-color: @border;
+  }
+  &-primary { .button-variant(#fff; @primary; @primary-dark); }
+  &-default { .button-variant(#333; #fff; #ccc) !important; }
+}
+
+@plugin "plugin";
+.lazy-eval {
+  width: @var;
+  @var: @a;
+  @a: 9%;
+}
+
+@my-ruleset: {
+  .my-selector {
+    background-color: black;
+  }
+};
+
+.uses-ruleset {
+  @my-ruleset();
+}
+
+.map-usage {
+  @config: {
+    option1: true;
+    option2: false;
+  }
+  value: @config[option1];
+  other: if((@config[option2]), yes, no);
+}
+
+.operations {
+  a: 2 + 5px - 3cm;
+  b: 2 * 3 * 4px;
+  c: 2px / 2;
+  d: ./2px;
+  e: -@base-font-size;
+  f: (@base-font-size + 2) * 1.5;
+  g: ~`"@{var-name}".toUpperCase()`;  // inline JavaScript
+  h: e("escaped");
+  i: %("%d/%d", 1, 2);
+  j: unit(5, px);
+  k: 1.5e3px;
+}
+
+@font-face {
+  font-family: "Icons";
+  src: url(fonts/icons.woff2) format("woff2"), url('fonts/icons.woff') format('woff');
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: .5; }
+}
+
+.url-edge-cases {
+  background: url(//cdn.example.com/a.png);
+  background: url(data:image/png;base64,iVBORw0KGgo=);
+  background: url( spaced/path.png );
+}

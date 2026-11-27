@@ -1,0 +1,152 @@
+# YAML lexer stress: block scalars, anchors, tags, flow collections, multi-doc
+%YAML 1.2
+%TAG !e! tag:example.com,2024:
+---
+# First document: a CI pipeline
+name: "CI Pipeline"
+on:
+  push:
+    branches: [main, 'release/**', "feature/*"]
+    paths-ignore:
+      - '**.md'
+      - docs/**
+  pull_request:
+    types: [opened, synchronize]
+  schedule:
+    - cron: '0 3 * * 1-5'   # weekdays at 03:00
+
+env: &default-env
+  NODE_VERSION: 20
+  PYTHON_VERSION: "3.12"
+  DEBUG: false
+  EMPTY:
+  TILDE: ~
+  NULL_WORD: null
+  URL: http://example.com:8080/path?a=1#frag
+  COLON_IN_VALUE: a:b:c
+  HASH_IN_VALUE: value#not-a-comment
+  HASH_AFTER_SPACE: value # this is a comment
+  QUOTED_HASH: "value # not a comment"
+  SINGLE: 'it''s escaped by doubling'
+  DOUBLE: "escapes: \n \t \" \\ \x41 é \U0001F600"
+  MULTILINE_PLAIN: this is a plain scalar
+    that continues on the next line
+  MULTILINE_QUOTED: "a double-quoted string
+    that folds across lines"
+
+defaults: &defaults
+  runs-on: ubuntu-latest
+  timeout-minutes: 30
+  env: *default-env
+
+jobs:
+  build:
+    <<: *defaults
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        node: [18, 20, 22]
+        include:
+          - {os: ubuntu-latest, node: 22, experimental: true}
+        exclude:
+          - os: windows-latest
+            node: 18
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 0, submodules: recursive}
+      - name: Install
+        run: npm ci
+      - name: Literal block script
+        run: |
+          echo "Building on ${{ matrix.os }}"
+          if [ "$CI" = "true" ]; then
+            npm run build -- --mode=production
+          fi
+          # this is a shell comment inside a literal block, not a YAML comment
+      - name: Folded block
+        run: >
+          echo this long command
+          is folded into one line
+          with spaces
+      - name: Strip chomping
+        run: |-
+          no trailing newline kept
+      - name: Keep chomping
+        run: |+
+          trailing newlines kept
+
+      - name: Indentation indicator
+        run: |2-
+            leading spaces are preserved beyond the indicator
+          this line has the base indentation
+      - name: Folded keep with indicator
+        description: >1+
+          indented by one
+
+  test:
+    <<: *defaults
+    needs: [build]
+    if: ${{ github.event_name == 'push' && !contains(github.ref, 'skip') }}
+    steps:
+      - run: npm test -- --coverage
+      - uses: codecov/codecov-action@v4
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+...
+---
+# Second document: tags and complex keys
+!!map
+? complex key
+: complex value
+? [flow, sequence, key]
+: value for sequence key
+? |
+  block scalar key
+: value
+"quoted key": 1
+'single quoted key': 2
+"key with: colon": 3
+key with spaces: 4
+123: numeric key
+true: boolean key
+~: null key
+string: !!str 123
+integer: !!int "42"
+float: !!float 1e3
+binary: !!binary |
+  R0lGODlhDAAMAIQAAP//9/X17unp5WZmZgAAAOfn515eXvPz7Y6OjuDg4J+fn5
+custom: !e!widget {size: 10, color: blue}
+local: !mytag value
+set: !!set {a, b, c}
+omap: !!omap [one: 1, two: 2]
+date: 2024-01-01
+datetime: 2024-01-01T12:34:56.789Z
+spaced_datetime: 2024-01-01 12:34:56 +01:00
+numbers:
+  decimal: 12345
+  negative: -42
+  octal: 0o14
+  hex: 0xC
+  float: 3.14
+  exp: 6.02e+23
+  inf: .inf
+  neg_inf: -.Inf
+  nan: .NaN
+  underscore: 1_000
+booleans: [true, false, yes, no, on, off, True, FALSE]
+--- !!str
+"Third document: a single scalar with a tag"
+---
+# Fourth document: anchors on sequences and nested flow
+base: &base [1, 2, 3]
+copy: *base
+nested_flow: {a: [1, {b: 2, c: [3, 4]}], d: {e: f}}
+empty_flow: {list: [], map: {}}
+multi_line_flow: [
+  one,
+  two, # comment inside flow
+  three
+]
+- this is not valid here but the lexer should continue
+key: value

@@ -1,0 +1,191 @@
+# TOML lexer stress: tables, arrays of tables, multi-line strings, dates, inline tables
+# Comment with "quotes" and 'apostrophes' and = signs and [brackets]
+
+title = "TOML \"Example\" with escapes \t \n \\ \u00e9 \U0001F600"
+literal = 'C:\Users\path\no\escapes and "double" quotes'
+empty = ""
+empty_literal = ''
+trailing_backslash = "ends with \\"
+hash_in_string = "value # not a comment"
+hash_in_literal = 'value # also not a comment'
+unicode_key_value = "日本語"
+
+multi_basic = """
+Multi-line basic string with "quotes" and ""two quotes""
+and a line-ending backslash that trims \
+    whitespace on the next line
+and escapes \t \u0041."""
+
+multi_basic_quotes = """Here are two quotation marks: "". Simple enough."""
+multi_basic_ending = """Here are three quotation marks: ""\"."""
+multi_basic_five = """"This," she said, "is just a pointless statement.""""
+
+multi_literal = '''
+Multi-line literal: no \escapes, "quotes" fine,
+and 'single' quotes fine too.
+'''
+multi_literal_quotes = '''Here are fifteen quotation marks: """""""""""""""'''
+multi_literal_ending = ''''That,' she said, 'is still pointless.''''
+
+[package]
+name = "lexer-stress"
+version = "0.1.0"
+edition = "2021"
+authors = ["Someone <someone@example.com>", 'Another <a@example.com>']
+description = """
+A sample package used to stress
+the TOML lexer."""
+license = "MIT OR Apache-2.0"
+keywords = ["lexer", "toml", "test",]   # trailing comma allowed in arrays
+categories = [
+  "development-tools",   # comment inside array
+  "parsing",
+]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+tokio = { version = "1", features = ["full"], optional = true }
+regex = "1.10"
+local-crate = { path = "../local-crate" }
+git-crate = { git = "https://github.com/user/repo", branch = "main" }
+
+[dependencies.complex]
+version = "2.0"
+default-features = false
+features = ["a", "b"]
+
+[dev-dependencies]
+criterion = "0.5"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target."cfg(windows)".dependencies.windows-sys]
+version = "0.52"
+features = ["Win32_Foundation", "Win32_System_Threading"]
+
+[features]
+default = ["tokio"]
+full = ["tokio", "complex/a"]
+"quoted-feature" = []
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+debug = false
+strip = true
+
+[profile.dev.package."*"]
+opt-level = 2
+
+# Numbers
+[numbers]
+int = 42
+positive = +99
+negative = -17
+zero = 0
+underscored = 1_000_000
+hex = 0xDEAD_BEEF
+hex_lower = 0xdeadbeef
+octal = 0o755
+binary = 0b1101_0110
+float = 3.1415
+float_exp = 5e+22
+float_neg_exp = 1e-06
+float_both = -2E-2
+float_underscore = 224_617.445_991_228
+inf = inf
+pos_inf = +inf
+neg_inf = -inf
+nan = nan
+neg_nan = -nan
+
+# Booleans
+[booleans]
+yes = true
+no = false
+
+# Dates and times
+[dates]
+odt1 = 1979-05-27T07:32:00Z
+odt2 = 1979-05-27T00:32:00-07:00
+odt3 = 1979-05-27T00:32:00.999999-07:00
+odt4 = 1979-05-27 07:32:00Z
+ldt1 = 1979-05-27T07:32:00
+ldt2 = 1979-05-27T00:32:00.999999
+ld1 = 1979-05-27
+lt1 = 07:32:00
+lt2 = 00:32:00.999999
+
+# Keys
+[keys]
+bare_key = "value"
+bare-key = "value"
+1234 = "numeric bare key"
+"127.0.0.1" = "quoted key with dots"
+"character encoding" = "value"
+'key2' = "single-quoted key"
+"ʎǝʞ" = "unicode key"
+"" = "empty quoted key"
+site."google.com" = true
+physical.color = "orange"
+physical.shape = "round"
+3.14159 = "pi as dotted key"
+
+# Inline tables and nested arrays
+[inline]
+point = { x = 1, y = 2 }
+nested = { a = { b = { c = "deep" } } }
+animal = { type.name = "pug" }
+empty_inline = {}
+matrix = [[1, 2], [3, 4], [5, [6, 7]]]
+mixed = [1, "two", 3.0, true, 1979-05-27, { x = 1 }, [ ]]
+strings_array = ["all", 'strings', """are the same""", '''type''']
+
+# Arrays of tables
+[[bin]]
+name = "main"
+path = "src/main.rs"
+
+[[bin]]
+name = "tool"
+path = "src/bin/tool.rs"
+required-features = ["full"]
+
+[[products]]
+name = "Hammer"
+sku = 738594937
+
+[[products]]  # empty table within the array
+
+[[products]]
+name = "Nail"
+sku = 284758393
+color = "gray"
+
+[[fruits]]
+name = "apple"
+
+  [fruits.physical]
+  color = "red"
+  shape = "round"
+
+  [[fruits.varieties]]
+  name = "red delicious"
+
+  [[fruits.varieties]]
+  name = "granny smith"
+
+[[fruits]]
+name = "banana"
+
+  [[fruits.varieties]]
+  name = "plantain"
+
+[ spaced . table . "header" ]
+key = "whitespace around table header parts is allowed"

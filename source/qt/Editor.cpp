@@ -828,7 +828,8 @@ public:
 
         dismissCompletion();
         int anchor = selection.anchor(), head = selection.position(), delta = 0;
-        QTextCursor cursor(doc);
+        // The edit block starts at the caret, which is where Qt puts the caret back when the toggle is undone.
+        QTextCursor cursor = selection;
         QString insertion;
         std::u16string_view previousInsertion;
         cursor.beginEditBlock();
@@ -1033,6 +1034,23 @@ protected:
             showCompletions(2);
     }
 
+    // Pastes the way the editor's other edits work: one edit block that starts at the caret, with insertText. Qt's own
+    // paste uses insertFragment, which also records a block format change when it pastes at the very start of the
+    // text, and undoing that leaves the caret after the first line instead of where the paste was.
+    void insertFromMimeData(const QMimeData *source) override
+    {
+        const QString text = source->text();
+        if (text.isEmpty())
+            return;
+
+        QTextCursor cursor = textCursor();
+        cursor.beginEditBlock();
+        cursor.insertText(text);
+        cursor.endEditBlock();
+        setTextCursor(cursor);
+        ensureCursorVisible();
+    }
+
     void focusOutEvent(QFocusEvent *event) override
     {
         dismissCompletion();
@@ -1224,7 +1242,8 @@ private:
         for (size_t i = 0; !changed && i < plan->text.size(); ++i)
             changed = source.at(plan->range.location + i) != plan->text[i];
         const bool reversed = old.position() < old.anchor();
-        QTextCursor cursor(document());
+        // The edit block starts at the caret, which is where Qt puts the caret back when the change is undone.
+        QTextCursor cursor = old;
         if (changed) {
             cursor.beginEditBlock();
             cursor.setPosition(int(plan->range.location));

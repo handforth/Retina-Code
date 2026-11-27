@@ -1,0 +1,167 @@
+# Second YAML sample: Kubernetes manifests with embedded config, ends inside an unterminated quoted scalar.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+  namespace: default
+  labels:
+    app.kubernetes.io/name: "my-app"
+    app.kubernetes.io/version: '1.2.3'
+  annotations:
+    description: >-
+      A folded annotation that spans
+      multiple lines and is stripped.
+    checksum/config: 3f2a9c1e0b7d
+data:
+  APP_ENV: production
+  LOG_LEVEL: "info"
+  FEATURE_FLAGS: '{"beta": true, "dark-mode": false}'
+  nginx.conf: |
+    server {
+      listen 80;
+      server_name example.com;  # nginx comment inside literal
+      location / {
+        proxy_pass http://backend:8080;
+        proxy_set_header Host $host;
+      }
+    }
+  script.sh: |-
+    #!/bin/sh
+    set -eu
+    echo "Starting with ${APP_ENV:-dev}"
+    exec "$@"
+  application.yaml: |
+    spring:
+      datasource:
+        url: jdbc:postgresql://db:5432/app
+        username: ${DB_USER}
+    # nested yaml inside a literal block is just text
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-app
+spec:
+  replicas: 3
+  revisionHistoryLimit: 0x0A
+  selector:
+    matchLabels: &labels
+      app: my-app
+      tier: backend
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: {maxSurge: 25%, maxUnavailable: 0}
+  template:
+    metadata:
+      labels: *labels
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+    spec:
+      serviceAccountName: my-app
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 2000
+      containers:
+        - name: app
+          image: "registry.example.com/my-app:1.2.3@sha256:abcdef0123456789"
+          imagePullPolicy: IfNotPresent
+          args: ["--config", "/etc/app/application.yaml", "--port=8080"]
+          command:
+            - /bin/sh
+            - -c
+            - |
+              echo "multi-line command in a sequence item"
+              exec /app/server
+          ports:
+            - {name: http, containerPort: 8080, protocol: TCP}
+            - name: metrics
+              containerPort: 9090
+          env:
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: db-secret, key: password}
+            - name: JAVA_OPTS
+              value: "-Xms256m -Xmx512m -Dfile.encoding=UTF-8"
+            - name: QUOTED_COLON
+              value: "host: port"
+            - name: PLAIN_WITH_COLON
+              value: host:port
+            - name: EMPTY_STRING
+              value: ""
+            - name: SPECIAL
+              value: '@at-sign and `backtick` and %percent'
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          volumeMounts:
+            - name: config
+              mountPath: /etc/app
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: app-config
+            items:
+              - key: application.yaml
+                path: application.yaml
+---
+apiVersion: v1
+kind: Service
+metadata: {name: my-app, labels: {app: my-app}}
+spec:
+  type: ClusterIP
+  selector:
+    app: my-app
+  ports:
+    - port: 80
+      targetPort: http
+---
+# Helm-ish template expressions (not valid YAML, but common)
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ .Release.Name }}-ingress
+  annotations:
+    {{- with .Values.ingress.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  rules:
+    - host: "{{ .Values.host | default "example.com" }}"
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: my-app
+                port: {number: 80}
+---
+weird_keys:
+  "": empty key
+  ? explicit
+  : value
+  -dash-start: valid plain scalar key
+  :colon-start: also allowed
+  key with trailing spaces   : value
+  "multi
+    line key": value
+anchors_and_aliases:
+  - &first {a: 1}
+  - *first
+  - &second
+    b: 2
+  - <<: [*first, *second]
+    c: 3
+unterminated_double: "this double-quoted scalar never closes
+  and continues across lines
+  key: not a key, still inside the string
+  - not a list item

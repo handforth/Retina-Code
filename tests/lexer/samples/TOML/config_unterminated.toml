@@ -1,0 +1,153 @@
+# config_unterminated.toml — second TOML sample.
+# Application config with edge cases and errors; ends inside an unterminated multi-line string.
+
+[server]
+host = "0.0.0.0"
+port = 8080
+workers = 0x10
+timeout = "30s"
+tls = { enabled = true, cert = "/etc/ssl/cert.pem", key = '/etc/ssl/key.pem' }
+allowed_origins = [
+  "https://example.com",
+  "https://*.example.com",  # wildcard subdomain
+  'http://localhost:3000',
+]
+
+[server.headers]
+"X-Frame-Options" = "DENY"
+"Content-Security-Policy" = "default-src 'self'; script-src 'self' 'unsafe-inline'"
+"X-Custom-Quote" = "she said \"hello\""
+
+[database]
+url = "postgres://user:p%40ss@db:5432/app?sslmode=require"
+pool = { min = 2, max = 20, idle_timeout = 300.5 }
+migrations = '''
+CREATE TABLE IF NOT EXISTS users (
+  id SERIAL PRIMARY KEY,
+  name TEXT NOT NULL DEFAULT '',  -- SQL comment inside a TOML literal
+  "quoted column" INT
+);
+'''
+seed_query = """
+INSERT INTO users (name) VALUES ('Ada'), ('Grace'); \
+SELECT count(*) FROM users;"""
+
+[logging]
+level = "info"
+format = "json"
+fields = { service = "api", env = "${ENV}" }
+filters = ["hyper=warn", "tokio=info", 'my_app::db=debug']
+
+[logging.file]
+path = 'C:\logs\app.log'
+rotate = "daily"
+keep = 7
+
+[cache]
+backend = "redis"
+ttl_seconds = 3_600
+max_entries = 1e6
+hit_ratio_target = 0.95
+negative_ttl = -1
+eviction = "lru"
+
+[features]
+dark_mode = true
+beta_signup = false
+experimental = ["fast-path", "new-ui"]
+rollout = { percent = 25, groups = ["staff", "beta"] }
+
+[[jobs]]
+name = "cleanup"
+schedule = "0 3 * * *"
+enabled = true
+last_run = 2024-06-01T03:00:00Z
+
+[[jobs]]
+name = "report"
+schedule = "0 */6 * * *"
+enabled = false
+last_run = 2024-06-01 06:00:00.123+02:00
+args = { format = "pdf", recipients = ["ops@example.com", "dev@example.com"] }
+
+[[jobs]]
+name = "local-time-only"
+start = 09:30:00
+day = 2024-06-03
+
+[i18n]
+default = "en"
+fallbacks = { "pt-BR" = "pt", "zh-Hant" = "zh" }
+
+[i18n.messages.en]
+greeting = "Hello, {name}!"
+farewell = 'Goodbye — see you soon.'
+multiline = """
+Line one
+Line two with "quotes"
+"""
+
+[i18n.messages.ja]
+greeting = "こんにちは、{name}さん！"
+emoji = "\u2603 \U0001F600"
+
+[metrics]
+enabled = true
+endpoint = "http://otel-collector:4317"
+interval = 15.0
+labels = { region = "us-east-1", az = 'us-east-1a', "k8s.namespace" = "default" }
+histogram_buckets = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]
+
+[metrics.exporters.prometheus]
+port = 9_090
+path = "/metrics"
+
+[[metrics.rules]]
+match = '^http_requests_total\{.*status="5\d\d".*\}$'
+action = "alert"
+threshold = 1e-2
+
+[[metrics.rules]]
+match = """^db_(query|exec)_seconds$"""
+action = "record"
+
+# Strings at line boundaries that DO close
+[strings]
+basic_ml_trailing_ws = """
+one \
+    two \
+    three"""
+literal_ml_first_newline = '''
+the first newline is trimmed'''
+basic_with_quotes_at_end = """""quoted"""""
+escaped_unicode = "é\U0001F4A9\b\f\r"
+
+# Edge cases and invalid lines the lexer must survive
+[edge]
+dotted.key.with."quoted part".end = 1
+key_with_comment = "value"   # trailing comment
+key_no_spaces="value"
+key_tab	=	"tab separated"
+number_with_plus = +0.0
+weird_float = 6.626e-34
+leading_zero_invalid = 0123
+bad_underscore = 1__000
+missing_value =
+= "missing key"
+"unclosed quoted key = "value"
+unclosed_inline = { a = 1, b = 2
+unclosed_array = [1, 2, 3
+after_errors = "the lexer should recover here"
+bare string value without quotes
+[unclosed table header
+[[unclosed array table
+[valid.after.errors]
+ok = true
+
+[last]
+notes = """
+This multi-line basic string is never closed.
+[not.a.table]
+key = "not a key"
+# not a comment
+''' not a literal delimiter here

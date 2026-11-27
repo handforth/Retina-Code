@@ -1,0 +1,153 @@
+/* Second JSONC sample: deliberately malformed in places, to exercise error recovery.
+   It ends with an unterminated string and an unterminated block comment. */
+[
+  {
+    "id": 1,
+    "title": "Normal entry",
+    "tags": ["a", "b", "c"],
+    "meta": { "created": "2024-01-01T00:00:00Z", "score": 9.5 }
+  },
+  {
+    "id": 2,
+    "title": "Entry with a string that spans
+two lines (invalid JSON, but the lexer must cope)",
+    "valid": false
+  },
+  {
+    "id": 3,
+    'singleQuoted': 'not valid JSON but common in the wild',
+    unquotedKey: "also invalid",
+    "hex": 0x1F,
+    "leadingDot": .5,
+    "trailingDot": 5.,
+    "plus": +1,
+    "infinity": Infinity,
+    "nan": NaN,
+    "leadingZero": 007
+  },
+  {
+    "id": 4,
+    "comment-in-value": /* inline block comment */ "value",
+    "comment-before-colon" /* here */ : "value2",
+    "comment-after-colon": // line comment
+      "value3",
+    "many-commas": [1,,2,,,3],
+    "double-trailing": [1, 2,,],
+  },
+  {
+    "id": 5,
+    "escapes": "\a \v \x41 \' \0",
+    "validEscapes": "\" \\ \/ \b \f \n \r \t \u0041",
+    "loneSurrogate": "\uD800",
+    "shortUnicode": "\u41",
+    "endsWithEscapedQuote": "abc\"",
+    "endsWithDoubleBackslash": "abc\\",
+    "endsWithTripleBackslash": "abc\\\"still inside\""
+  },
+  {
+    "id": 6,
+    "nested": {
+      "unbalanced": [1, 2, {"a": 1]
+    },
+    "afterUnbalanced": true
+  },
+  {
+    "id": 7,
+    "deep": [[[[[[[[[[["ten levels"]]]]]]]]]]],
+    "deepObjects": {"a":{"b":{"c":{"d":{"e":{"f":{}}}}}}}
+  },
+  {
+    "id": 8,
+    "commentMarkersInStrings": [
+      "//",
+      "/*",
+      "*/",
+      "/* */",
+      "// /* */ //",
+      "#not a comment",
+      "-- not sql"
+    ]
+  },
+  // A line comment between array elements
+  {
+    "id": 9,
+    "numbers": [0, -0, 0.0, -0.0, 1e0, 1E-0, 1e+0, 123.456e-789, -1.7976931348623157e308]
+  },
+  /* A block comment
+     spanning lines
+     between array elements */
+  {
+    "id": 10,
+    "keywordsAsKeys": {"true": true, "false": false, "null": null},
+    "keywordLookalikes": [truely, falsey, nullish, True, FALSE, Null]
+  },
+  {
+    "id": 11,
+    "whitespace":	"tab before value",
+    "crlf": "line ends may differ"
+  },
+  {
+    "id": 12,
+    "emptyKey": {"": ""},
+    "spaceKey": {" ": " "},
+    "colonInKey": {"a:b": "c:d"},
+    "commaInKey": {"a,b": "c,d"},
+    "braceInKey": {"{": "}", "[": "]"}
+  },
+  {
+    "id": 13,
+    "json-in-string": "{\"inner\": [1, 2, {\"x\": \"y\"}]}",
+    "html-in-string": "<div class=\"a\">text</div>",
+    "path-in-string": "C:\\Program Files\\App\\app.exe"
+  },
+  {
+    "id": 14,
+    "urls": [
+      "http://example.com",
+      "https://example.com/path?query=1&b=2#frag",
+      "file:///C:/path/to/file",
+      "//protocol-relative"
+    ]
+  },
+  {
+    "id": 15,
+    "missingComma": "a"
+    "nextKey": "b",
+    "missingColon" "c",
+    "extraColon":: "d"
+  },
+  {
+    "id": 16,
+    "lastValid": "this entry is fine"
+  },
+  {
+    "id": 16.5,
+    "commentsAtBoundaries": [
+      1, // comment right after a value
+      2 /* block right after a value */,
+      /* block before a value */ 3,
+      "string" // comment
+      ,
+      4
+    ],
+    "slashesNotComments": "a / b",
+    "lonelySlash": "/",
+    "singleSlashOutsideString": 0
+  },
+  /* block comment that looks like it
+     contains a closing */ "stray string between elements",
+  // comment with "quotes" and a trailing backslash \
+  "next line is NOT a comment in JSONC (no line continuation)",
+  {
+    "id": 17,
+    "unterminated": "this string never closes, so the rest of the line is string
+  },
+  {
+    "id": 18,
+    "afterBrokenString": true
+  }
+]
+/* This trailing block comment never closes.
+{
+  "fake": "json inside an unterminated comment"
+}

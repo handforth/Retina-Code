@@ -1,0 +1,191 @@
+// SCSS lexer stress: variables, maps, mixins, interpolation, nesting, comments
+@use "sass:math";
+@use 'sass:map' as m;
+@forward "src/list" hide list-reset, $horizontal-list-gap;
+@import 'legacy/reset', "legacy/typography";
+
+/* Standard CSS block comment with "strings" and 'quotes' and // slashes */
+/*! Loud comment preserved in output */
+// Silent line comment with /* block opener that does not open */
+
+$primary: #3498db !default;
+$secondary: rgba(46, 204, 113, 0.8);
+$font-stack: "Helvetica Neue", Helvetica, Arial, sans-serif;
+$base-size: 16px;
+$ratio: math.div(1, 1.618);
+$breakpoints: (
+  "small": 576px,
+  "medium": 768px,
+  'large': 992px,
+  xlarge: 1200px,
+);
+$z-layers: (modal: 100, dropdown: 50, "tooltip": 75);
+$empty-list: ();
+$space-list: 1px 2px 3px;
+$comma-list: 1px, 2px, 3px;
+$important: red !important;
+$global-flag: null !global;
+$url-unquoted: url(images/bg.png);
+$url-quoted: url("images/bg.png");
+$url-data: url(data:image/svg+xml;base64,PHN2Zz48L3N2Zz4=);
+$url-with-slashes: url(//cdn.example.com/a.png);
+$selector-var: ".card";
+$prop: "margin";
+$unit-values: 1em 2rem 3vh 4vw 5% 6ch 7ex 8vmin 9vmax 10deg 11s 12ms 13fr 1.5e-3px -0.5px +2px;
+$hex-colors: #fff #FFFFFF #12345678 #abc;
+
+@function rem($px, $base: $base-size) {
+  @if math.unit($px) != "px" {
+    @error "Expected px, got #{math.unit($px)} in rem(#{$px})";
+  }
+  @return math.div($px, $base) * 1rem;
+}
+
+@function z($layer) {
+  @if not map-has-key($z-layers, $layer) {
+    @warn "No layer `#{$layer}` found in $z-layers";
+  }
+  @return map-get($z-layers, $layer);
+}
+
+@mixin respond-to($bp) {
+  $value: m.get($breakpoints, $bp);
+  @if $value != null {
+    @media (min-width: $value) {
+      @content;
+    }
+  } @else {
+    @debug "Unknown breakpoint: #{$bp}";
+  }
+}
+
+@mixin button-variant($bg, $fg: white, $args...) {
+  background-color: $bg;
+  color: $fg;
+  border: 1px solid darken($bg, 10%);
+  &:hover:not(.disabled) {
+    background-color: lighten($bg, 5%);
+  }
+  &.active,
+  &:active {
+    box-shadow: inset 0 3px 5px rgba(0, 0, 0, .125);
+  }
+}
+
+%placeholder-base {
+  margin: 0;
+  padding: 0;
+}
+
+#{$selector-var} {
+  @extend %placeholder-base;
+  #{$prop}-top: rem(24px);
+  #{$prop}-bottom: rem(12px);
+  font: #{$base-size}/#{1.5} $font-stack;
+  width: calc(100% - #{$base-size * 2});
+  height: calc(100vh - var(--header-height, 64px));
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  background: $url-unquoted no-repeat center / cover, linear-gradient(to right, $primary 0%, $secondary 100%);
+  content: "quoted content with #{$prop} interpolation and \"escapes\" and \\";
+  quotes: '\201C' '\201D';
+
+  &__header {
+    display: flex;
+    align-items: center;
+    > .title { font-weight: 700; }
+    + .sibling { margin-left: 4px; }
+    ~ .general-sibling { opacity: .5; }
+  }
+
+  &--featured {
+    @include button-variant($primary);
+    border-color: m.get((a: red, b: blue), a);
+  }
+
+  .theme-dark & {
+    background: #222;
+  }
+
+  & + & {
+    margin-top: 1em;
+  }
+
+  @include respond-to("medium") {
+    padding: rem(32px);
+    &__header { flex-direction: column; }
+  }
+
+  @at-root .standalone-#{&} {
+    color: red;
+  }
+
+  &:nth-child(2n + 1)::before {
+    content: '';
+  }
+
+  a[href^="http://"],
+  a[href$='.pdf'],
+  input[type=checkbox] {
+    text-decoration: underline;
+  }
+}
+
+@each $name, $size in $breakpoints {
+  .container-#{$name} {
+    max-width: $size;
+    @media screen and (max-width: #{$size - 1px}) and (orientation: landscape) {
+      max-width: 100%;
+    }
+  }
+}
+
+@for $i from 1 through 5 {
+  .mt-#{$i} { margin-top: #{$i * 4}px; }
+  .col-#{$i}-of-5 { width: math.percentage(math.div($i, 5)); }
+}
+
+$i: 6;
+@while $i > 0 {
+  .item-#{$i} { width: 2em * $i; }
+  $i: $i - 2;
+}
+
+@supports (display: grid) and (not (display: inline-grid)) {
+  .grid { display: grid; }
+}
+
+@font-face {
+  font-family: "Custom Font";
+  src: url(fonts/custom.woff2) format("woff2"),
+       url('fonts/custom.woff') format('woff');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153;
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  50.5% { transform: rotate(180deg) scale(1.1); }
+  to { transform: rotate(360deg); }
+}
+
+:root {
+  --primary: #{$primary};
+  --spacing: 8px;
+  --empty:;
+  --json-like: { "a": 1 };
+  --calc: calc(var(--spacing) * 2);
+}
+
+.math {
+  width: 10px + 5px;
+  height: 10px * 2;
+  margin: -$base-size;
+  padding: - $base-size;
+  line-height: (1 + 2) * 3;
+  top: 10px/2;          // ambiguous slash: plain CSS division
+  left: math.div(10px, 2);
+  right: 50% - 10px;
+  z-index: z(modal);
+}
+
+// Unterminated-looking but valid: a string containing // and /*
+.tricky { content: "// not a comment /* nor this */"; background: url(http://example.com/a.png); }

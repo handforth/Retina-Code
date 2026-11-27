@@ -1,0 +1,178 @@
+// Second SCSS sample: modules, control flow, placeholder selectors; ends in an unterminated block comment.
+@use "sass:color";
+@use "sass:list";
+@use "sass:string";
+@use "./tokens" with ($brand: #ff5722, $radius: 4px);
+
+$themes: (
+  light: (bg: #ffffff, fg: #111111, accent: tokens.$brand),
+  dark: (bg: #121212, fg: #eeeeee, accent: color.adjust(tokens.$brand, $lightness: 10%)),
+  "high contrast": (bg: black, fg: yellow, accent: white),
+);
+
+$shadows: 0 1px 2px rgba(#000, .2), 0 2px 8px rgba(#000, .1);
+$font-weights: (thin: 100, regular: 400, bold: 700);
+$selectors: "h1", "h2", "h3";
+
+@function theme($name, $key) {
+  @return map-get(map-get($themes, $name), $key);
+}
+
+@function str-replace($string, $search, $replace: "") {
+  $index: string.index($string, $search);
+  @if $index {
+    @return string.slice($string, 1, $index - 1) + $replace +
+      str-replace(string.slice($string, $index + string.length($search)), $search, $replace);
+  }
+  @return $string;
+}
+
+@mixin theme-vars($name) {
+  @each $key, $value in map-get($themes, $name) {
+    --#{$key}: #{$value};
+  }
+}
+
+@mixin truncate($lines: 1) {
+  @if $lines == 1 {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  } @else if $lines > 1 {
+    display: -webkit-box;
+    -webkit-line-clamp: $lines;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  } @else {
+    @error "Invalid line count #{$lines}";
+  }
+}
+
+@mixin hover-focus {
+  &:hover,
+  &:focus-visible {
+    @content;
+  }
+}
+
+@each $name, $_ in $themes {
+  $safe: str-replace(#{$name}, " ", "-");
+  .theme-#{$safe} {
+    @include theme-vars($name);
+    background: var(--bg);
+    color: var(--fg);
+  }
+}
+
+%card-base {
+  border-radius: tokens.$radius;
+  box-shadow: $shadows;
+  padding: 1rem 1.25rem;
+}
+
+.card {
+  @extend %card-base;
+  position: relative;
+
+  &__title {
+    @include truncate;
+    font-weight: map-get($font-weights, bold);
+  }
+
+  &__body {
+    @include truncate(3);
+  }
+
+  &__link {
+    color: var(--accent);
+    @include hover-focus {
+      text-decoration: underline;
+      outline: 2px solid color.mix(tokens.$brand, white, 50%);
+    }
+  }
+
+  &[data-state="loading"]::after {
+    content: "Loading\2026";
+    position: absolute;
+    inset: 0;
+    display: grid;
+    place-items: center;
+    background: rgba(255 255 255 / 70%);
+  }
+
+  @media (prefers-reduced-motion: no-preference) {
+    transition: transform 150ms cubic-bezier(.2, .8, .2, 1), box-shadow 150ms;
+    &:hover { transform: translateY(-2px); }
+  }
+
+  @container card (min-width: 400px) {
+    display: grid;
+    grid-template-columns: 120px 1fr;
+  }
+}
+
+#{$selectors} {
+  margin-block: 0 .5em;
+  line-height: 1.2;
+}
+
+@each $sel in $selectors {
+  $i: list.index($selectors, $sel);
+  #{$sel} { font-size: #{2.5 - $i * .375}rem; }
+}
+
+.btn {
+  $self: &;
+  display: inline-flex;
+  gap: .5ch;
+
+  &-group > #{$self} + #{$self} {
+    margin-left: -1px;
+  }
+
+  @at-root #{selector-append(&, "--icon")} {
+    padding: .25rem;
+  }
+
+  &:is(:disabled, [aria-disabled="true"]) {
+    pointer-events: none;
+    opacity: .6;
+  }
+
+  &:where(.small, .tiny) {
+    font-size: 87.5%;
+  }
+}
+
+@layer components {
+  .badge {
+    padding: 0 .5em;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--accent) 20%, transparent);
+  }
+}
+
+.urls {
+  background-image: url(/img/a.png);
+  background-image: url( "img/b.png" );
+  background-image: url(img/with spaces?.png);
+  background-image: url(#{$asset-root}/c.png);
+  background-image: image-set("a.png" 1x, "a@2x.png" 2x);
+}
+
+.strings {
+  content: "double \"escaped\" string";
+  content: 'single \'escaped\' string';
+  content: "line continuation \
+inside a string";
+  content: "unterminated string at end of line
+  color: red;
+  content: "#{$name} interpolated #{"nested #{1 + 1}"}";
+}
+
+/* This block comment runs to EOF without closing.
+   .not-a-rule { color: red; }
+   $not-a-variable: 1;
+   // not a line comment either, we are inside a block comment
+   @include not-a-mixin;
+   "strings" 'inside' #{interpolation}
