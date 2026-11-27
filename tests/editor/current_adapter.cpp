@@ -8,7 +8,7 @@
 #include "RunText.cpp"
 #include "qt/RunPane.cpp"
 #include "qt/TextView.cpp"
-#include "qt/Editor.cpp"
+#include "qt/Window.cpp"
 
 #include "editor_test.cpp"
 
@@ -20,7 +20,7 @@ static TextView &text_view(QWidget *editor)
 static void adapter_setup_application(QApplication &application)
 {
     application.setApplicationName(QStringLiteral("Retina Code"));
-    useDarkWidgets(application);
+    use_dark_widgets(application);
 }
 
 static QWidget *adapter_create_editor(const QString &name, const QString &text, int theme, int font_size, TestAppearance appearance)
@@ -43,21 +43,18 @@ static QWidget *adapter_create_window(const QStringList &paths, int theme)
         settings.setValue(QStringLiteral("EditorTheme"), QString::fromLatin1(themes[theme].name));
     }
 
-    EditorWindow *window = EditorWindow::create();
+    EditorWindow *window = create_window(nullptr);
     end_scratch_registry();
 
-    window->openFiles(paths);
+    open_files(*window, paths);
     return window;
 }
 
 // The memory readout changes every two seconds, so its timer stops and it shows a fixed reading.
 static void adapter_freeze_window(QWidget *window)
 {
-    QList<QTimer *> timers = window->findChildren<QTimer *>(Qt::FindDirectChildrenOnly);
-    for (QTimer *timer : timers) {
-        if (timer->interval() == 2000)
-            timer->stop();
-    }
+    EditorWindow *editor_window = static_cast<EditorWindow *>(window);
+    editor_window->killTimer(editor_window->memory_timer);
 
     QList<QLabel *> labels = window->findChildren<QLabel *>();
     for (QLabel *label : labels) {

@@ -13,23 +13,23 @@
 // Qt platform layer.
 #include "qt/RunPane.cpp"
 #include "qt/TextView.cpp"
-#include "qt/Editor.cpp"
+#include "qt/Window.cpp"
 
 int main(int argc, char **argv)
 {
     QApplication app(argc, argv);
     app.setApplicationName(QStringLiteral("Retina Code"));
-    useDarkWidgets(app);
+    use_dark_widgets(app);
 
-    EditorWindow *window = EditorWindow::create();
+    EditorWindow *window = create_window(nullptr);
     window->show();
 
     // Open the files named on the command line, or the sample files when there are none.
     QStringList files = app.arguments().mid(1);
     if (files.isEmpty())
-        window->loadSamples();
+        load_samples(*window);
     else
-        window->openFiles(files);
+        open_files(*window, files);
 
     return app.exec();
 }
