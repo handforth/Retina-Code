@@ -677,8 +677,9 @@ static bool StartWorker(ReceivePipeEvent receive)
     transport.inbox = dispatch_source_create(DISPATCH_SOURCE_TYPE_DATA_ADD, 0, 0, dispatch_get_main_queue());
     if (!transport.inbox || pthread_create(&transport.thread, nullptr, RunWorker, nullptr) != 0) {
         if (transport.inbox) {
+            // GCD can't free an inactive source. ARC releases it when the pointer is cleared.
             dispatch_activate(transport.inbox);
-            dispatch_release(std::exchange(transport.inbox, nullptr));
+            transport.inbox = nullptr;
         }
         CloseDescriptor(transport.queue);
         return false;
@@ -766,7 +767,7 @@ void StopPipes()
     pthread_join(transport.thread, nullptr);
     CloseDescriptor(transport.queue);
     dispatch_source_cancel(transport.inbox);
-    dispatch_release(std::exchange(transport.inbox, nullptr));
+    transport.inbox = nullptr; // ARC releases the source.
     transport.outgoing = {};
     transport.incoming = {};
 }

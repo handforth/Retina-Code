@@ -1731,7 +1731,7 @@ void StopAll()
     client.diagnosticJSON = {};
     if (client.timer) {
         dispatch_source_cancel(client.timer);
-        dispatch_release(std::exchange(client.timer, nullptr));
+        client.timer = nullptr; // ARC releases the timer.
     }
     client.timerDue = noDeadline;
 }
