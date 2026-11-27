@@ -6,11 +6,13 @@
 // Shared editor code.
 #include "Languages.cpp"
 #include "Lexer.cpp"
+#include "TextBuffer.cpp"
 #include "Typing.cpp"
 #include "RunText.cpp"
 
 // Qt platform layer.
 #include "qt/RunPane.cpp"
+#include "qt/TextView.cpp"
 #include "qt/Editor.cpp"
 
 int main(int argc, char **argv)

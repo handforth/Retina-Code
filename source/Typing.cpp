@@ -995,3 +995,127 @@ std::optional<TypingPlan> PlanTyping(const TypingSource &text, Language language
     }
     return {};
 }
+
+//
+// Comment toggling.
+//
+
+static size_t FirstNonBlank(const TypingSource &text, CommentLine line)
+{
+    size_t first = line.start;
+    while (first < line.end && Blank(text.at(first)))
+        ++first;
+    return first;
+}
+
+// True when the text in [first, last) begins with the marker.
+static bool StartsWithMarker(const TypingSource &text, size_t first, size_t last, std::u16string_view marker)
+{
+    if (marker.size() > last - first)
+        return false;
+
+    for (char16_t ch : marker) {
+        if (text.at(first++) != ch)
+            return false;
+    }
+    return true;
+}
+
+static size_t ColumnStep(char16_t ch, size_t column, size_t tabWidth)
+{
+    return ch == u'\t' ? tabWidth - column % tabWidth : 1;
+}
+
+// Languages without line comments wrap the lines in one block comment, or unwrap them when they already are.
+static void ToggleBlockComment(const TypingSource &text, size_t start, size_t end, CommentSyntax comments,
+                               std::vector<CommentEdit> &edits)
+{
+    size_t first = FirstNonBlank(text, LineAt(text, start));
+    size_t last = end;
+    while (last > first && Blank(text.at(last - 1)))
+        --last;
+
+    std::u16string open(comments.open), close(comments.close);
+    if (last - first >= open.size() + close.size() && StartsWithMarker(text, first, last, open) &&
+        StartsWithMarker(text, last - close.size(), last, close)) {
+        size_t left = first + open.size();
+        size_t right = last - close.size();
+        if (left < right && text.at(left) == u' ')
+            ++left;
+        if (right > left && text.at(right - 1) == u' ')
+            --right;
+        edits.push_back({first, left, {}});
+        edits.push_back({right, last, {}});
+    } else if (first == end) {
+        edits.push_back({first, first, open + u"  " + close});
+    } else {
+        edits.push_back({first, first, open + u" "});
+        edits.push_back({end, end, u" " + close});
+    }
+}
+
+void ToggleCommentLines(const TypingSource &text, size_t start, size_t end, CommentSyntax comments, size_t tabWidth,
+                        size_t indentWidth, std::vector<CommentEdit> &edits)
+{
+    if (comments.line.empty()) {
+        if (!comments.open.empty() && !comments.close.empty())
+            ToggleBlockComment(text, start, end, comments, edits);
+        return;
+    }
+
+    // Comments go in at the smallest indentation of the lines with text, or of the blank lines when there are only
+    // blank ones. They come out when every line with text already starts with one.
+    size_t indent = std::u16string_view::npos, blankIndent = indent;
+    bool remove = true;
+    for (CommentLine line = LineAt(text, start);; line = LineAt(text, line.next)) {
+        size_t first = line.start, column = 0;
+        while (first < line.end && Blank(text.at(first))) {
+            column += ColumnStep(text.at(first), column, tabWidth);
+            ++first;
+        }
+
+        if (first == line.end) {
+            blankIndent = std::min(blankIndent, column);
+        } else {
+            indent = std::min(indent, column);
+            remove = remove && StartsWithMarker(text, first, line.end, comments.line);
+        }
+
+        if (line.end == end)
+            break;
+    }
+
+    bool onlyBlank = indent == std::u16string_view::npos;
+    if (onlyBlank) {
+        indent = blankIndent;
+        remove = false;
+    }
+    indent -= indent % indentWidth;
+
+    std::u16string prefix = std::u16string(comments.line) + u" ";
+    for (CommentLine line = LineAt(text, start);; line = LineAt(text, line.next)) {
+        size_t first = FirstNonBlank(text, line);
+        if (first < line.end || onlyBlank) {
+            if (remove) {
+                size_t last = first + comments.line.size();
+                if (last < line.end && text.at(last) == u' ')
+                    ++last;
+                edits.push_back({first, last, {}});
+            } else {
+                // The comment goes at the indentation column, without splitting a tab.
+                size_t offset = line.start, column = 0;
+                while (offset < first && column < indent) {
+                    size_t advance = ColumnStep(text.at(offset), column, tabWidth);
+                    if (advance > indent - column)
+                        break;
+                    column += advance;
+                    ++offset;
+                }
+                edits.push_back({offset, offset, prefix});
+            }
+        }
+
+        if (line.end == end)
+            break;
+    }
+}

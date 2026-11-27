@@ -20,10 +20,13 @@ if not exist build\platforms\qwindows.dll copy "%QT%\plugins\platforms\qwindows.
 
 rc /nologo /fo build\retina-code.res resources\retina-code.rc
 
-rem One translation unit: main_qt.cpp includes everything else.
+rem One translation unit: main_qt.cpp includes everything else. The editor also uses three of Qt's private headers,
+rem which live under the version-numbered folders.
 cl /nologo /O2 /std:c++20 /utf-8 /permissive- /Zc:__cplusplus /MD /EHs-c- /D_HAS_EXCEPTIONS=0 ^
    /DNDEBUG /DQT_NO_DEBUG /DUNICODE /D_UNICODE ^
    /I "%QT%\include" /I "%QT%\include\QtCore" /I "%QT%\include\QtGui" /I "%QT%\include\QtWidgets" ^
+   /I "%QT%\include\QtCore\6.12.1" /I "%QT%\include\QtCore\6.12.1\QtCore" ^
+   /I "%QT%\include\QtGui\6.12.1" /I "%QT%\include\QtGui\6.12.1\QtGui" ^
    source\main_qt.cpp build\retina-code.res /Fobuild\ /Febuild\RetinaCode.exe ^
    /link /SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup /INCREMENTAL:NO /MANIFEST:NO ^
    /LIBPATH:"%QT%\lib" Qt6Core.lib Qt6Gui.lib Qt6Widgets.lib

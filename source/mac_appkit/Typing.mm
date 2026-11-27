@@ -44,17 +44,6 @@ std::vector<Vim::Range> CommentLineRanges(NSString *text, std::vector<Vim::Range
     return selections;
 }
 
-void AppendLineCommentEdits(NSString *text, Vim::Range lines, CommentSyntax comments, const Indentation &indentation,
-                            std::vector<Vim::CursorEdit> &edits)
-{
-    ToggleCommentLines(lines.first, lines.last, comments, indentation.tabWidth, indentation.width,
-        [text](size_t offset) { return LineAt(text, offset); },
-        [text](size_t offset) { return At(text, offset); },
-        [&edits](size_t first, size_t last, std::u16string_view replacement) {
-            edits.push_back({{first, last}, std::u16string(replacement)});
-        });
-}
-
 struct AppKitTypingText {
     NSString *text;
     NSAttributedString *storage;
@@ -104,6 +93,17 @@ struct AppKitTypingText {
             [](char16_t ch) -> bool { return [NSCharacterSet.alphanumericCharacterSet characterIsMember:ch]; }};
     }
 };
+
+void AppendLineCommentEdits(NSString *text, Vim::Range lines, CommentSyntax comments, const Indentation &indentation,
+                            std::vector<Vim::CursorEdit> &edits)
+{
+    AppKitTypingText source{text, nil};
+    std::vector<CommentEdit> commentEdits;
+    ToggleCommentLines(source.source(), lines.first, lines.last, comments, indentation.tabWidth, indentation.width,
+                       commentEdits);
+    for (const CommentEdit &edit : commentEdits)
+        edits.push_back({{edit.start, edit.end}, edit.text});
+}
 
 Indentation DetectIndentation(NSString *text, Indentation fallback)
 {

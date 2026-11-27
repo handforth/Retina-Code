@@ -41,6 +41,12 @@ struct UndoRecord {
     bool ends_group;         // the last record of its group
 };
 
+// A range of changed text, merged the way QTextDocument reports an edit: where it starts, how many units it held, and
+// how many it holds now. start is NO_POSITION when nothing changed.
+struct TextChange {
+    uint32_t start, old_length, new_length;
+};
+
 struct TextBuffer {
     std::vector<char16_t> units;
     std::vector<TextLine> lines;    // never empty: an empty text is one empty line
@@ -54,6 +60,9 @@ struct TextBuffer {
     // Where Qt would keep each unit in its string, with QT_FRAGMENT_START set on units that begin one of its fragments.
     std::vector<uint32_t> qt_positions;
     uint32_t qt_string_length;
+
+    TextChange changed;          // what changed since the editor last looked
+    uint32_t lexed_end_line;     // the last line lexed again for those changes, or NO_POSITION
 
     std::vector<UndoRecord> undo_records;
     std::vector<char16_t> undo_text;
@@ -75,6 +84,10 @@ void set_text_language(TextBuffer &text, Language language);
 // Replaces the units in [start, start + length) with inserted, as QTextCursor::insertText does. Undo gets the records
 // Qt would make, and each one merges into the record before it when Qt's would.
 void replace_text(TextBuffer &text, uint32_t start, uint32_t length, std::u16string_view inserted);
+
+// Marks [start, start + length) as changed without changing its text, as QTextDocumentPrivate::documentChange does
+// when a line's formats or the text being composed in it change. The range grows to cover the old one and this one.
+void note_document_change(TextChange &change, uint32_t start, uint32_t length);
 
 // Makes the changes until the matching end_undo_group() one undo step. Groups nest, and only the outermost group's
 // caret counts: undoing the group puts the caret back there, unless it is NO_POSITION.

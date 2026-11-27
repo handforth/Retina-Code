@@ -4,16 +4,21 @@
 // editor, so two recordings can be compared line by line.
 //
 //   editor_test render <output> [--save <folder>] [--only <name>]   one line per scenario: size and pixel hash
-//   editor_test behavior <output> [--only <case>]                   one line per input step: text, caret, scroll, image
+//   editor_test behavior <output> [--save <folder>] [--only <case>]  one line per input step: text, caret, scroll, image
+//   editor_test accessibility <output> [--only <case>]              per input step: screen reader events and answers
+//   editor_test bench                                               time and memory to open, page through, and type in a large file
 //   editor_test compare <reference> <current>
 //   editor_test onscreen                                            checks hidden rendering against a shown window
 //
 // The display scale comes from QT_SCALE_FACTOR. Windows stay hidden (WA_DontShowOnScreen) and are made active through
 // Qt's window-system interface, so the caret and focus colors draw the same way they do on screen.
 
+#include <QAbstractScrollArea>
+#include <QAccessible>
 #include <QApplication>
 #include <QClipboard>
 #include <QDir>
+#include <QElapsedTimer>
 #include <QFile>
 #include <QImage>
 #include <QInputMethodEvent>
@@ -23,6 +28,7 @@
 #include <QMouseEvent>
 #include <QPixmap>
 #include <QScreen>
+#include <QScrollBar>
 #include <QStyleHints>
 #include <QTextCharFormat>
 #include <QTimer>
@@ -33,6 +39,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <psapi.h>
 
 #include <cstdio>
 #include <cstdint>
@@ -834,7 +841,7 @@ static int run_render(const char *output_path, const char *save_folder, const ch
 //
 
 enum class StepKind : uint8_t {
-    Key, Text, Click, ShiftClick, DoubleClick, TripleClick, Drag, Wheel, Complete, ToggleComment, Clipboard, Preedit, Commit,
+    Key, Text, Click, ShiftClick, DoubleClick, TripleClick, Drag, Wheel, ScrollBar, Complete, ToggleComment, Clipboard, Preedit, Commit,
 };
 
 // Mouse steps aim at a text position, clamped to the text length when the step runs, or, when at_point is set,
@@ -1015,6 +1022,19 @@ static void add_scripted_cases(std::vector<BehaviorCase> &cases, std::vector<Tes
     add_wheel(mouse, -240);
     add_wheel(mouse, 120);
     cases.push_back(mouse);
+
+    // The scroll bars scroll without moving the caret, a page at a time in the trough.
+    BehaviorCase scroll_bars = make_case(QStringLiteral("scroll_bars"), DOCUMENT_CPP, position_at(cpp, 3, 4));
+    add_step(scroll_bars, StepKind::ScrollBar, QString(), 1);
+    add_step(scroll_bars, StepKind::ScrollBar, QString(), 1);
+    add_step(scroll_bars, StepKind::ScrollBar, QString(), -1);
+    add_step(scroll_bars, StepKind::ScrollBar, QString(), 2);
+    add_step(scroll_bars, StepKind::ScrollBar, QString(), 2);
+    add_step(scroll_bars, StepKind::ScrollBar, QString(), -2);
+    add_keys(scroll_bars, Qt::Key_Down);
+    add_step(scroll_bars, StepKind::ScrollBar, QString(), 1);
+    add_keys(scroll_bars, Qt::Key_PageDown);
+    cases.push_back(scroll_bars);
 
     for (int index = 0; index < typing_count; ++index) {
         BehaviorCase script = make_case(QString::fromUtf8(TYPING_CASES[index].name), first_typing_document + index, 0);
@@ -1263,6 +1283,18 @@ static void run_step(QWidget *editor, const Step &step)
             break;
         }
 
+        // A click on a scroll bar's arrows or trough: key 1 and -1 turn a page down and up, 2 and -2 step right and left.
+        case StepKind::ScrollBar: {
+            QAbstractScrollArea *area = static_cast<QAbstractScrollArea *>(editor);
+            bool page = step.key == 1 || step.key == -1;
+            QScrollBar *bar = page ? area->verticalScrollBar() : area->horizontalScrollBar();
+            if (page)
+                bar->triggerAction(step.key > 0 ? QAbstractSlider::SliderPageStepAdd : QAbstractSlider::SliderPageStepSub);
+            else
+                bar->triggerAction(step.key > 0 ? QAbstractSlider::SliderSingleStepAdd : QAbstractSlider::SliderSingleStepSub);
+            break;
+        }
+
         case StepKind::Complete:
             adapter_show_completions(editor);
             break;
@@ -1298,6 +1330,7 @@ static const char *step_name(StepKind kind)
         case StepKind::TripleClick: return "triple_click";
         case StepKind::Drag: return "drag";
         case StepKind::Wheel: return "wheel";
+        case StepKind::ScrollBar: return "scroll_bar";
         case StepKind::Complete: return "complete";
         case StepKind::ToggleComment: return "toggle_comment";
         case StepKind::Clipboard: return "clipboard";
@@ -1308,21 +1341,26 @@ static const char *step_name(StepKind kind)
     return "?";
 }
 
-static void record_state(FILE *out, const QString &name, int step_index, const Step *step, QWidget *editor)
+// Writes one line for the editor's state after a step, and saves the step's image when save_folder names a folder.
+static void record_state(FILE *out, const QString &name, int step_index, const Step *step, QWidget *editor,
+                         const char *save_folder)
 {
     int anchor, caret, scroll_x, scroll_y;
     adapter_selection(editor, anchor, caret);
     adapter_scroll(editor, scroll_x, scroll_y);
     QString text = adapter_text(editor);
+    QImage image = capture(editor);
+    if (save_folder)
+        image.save(QStringLiteral("%1/%2_%3.png").arg(QString::fromUtf8(save_folder), name).arg(step_index));
 
     fprintf(out, "%s %d %s %d %x | text %016llx %d caret %d anchor %d scroll %d %d overwrite %d popup %d image %016llx\n",
             name.toUtf8().constData(), step_index, step ? step_name(step->kind) : "start", step ? step->key : 0,
             step ? unsigned(step->modifiers.toInt()) : 0u, (unsigned long long)hash_text(text), int(text.size()), caret,
             anchor, scroll_x, scroll_y, adapter_overwrite(editor), adapter_completion_visible(editor),
-            (unsigned long long)hash_image(capture(editor)));
+            (unsigned long long)hash_image(image));
 }
 
-static int run_behavior(const char *output_path, const char *only)
+static int run_behavior(const char *output_path, const char *save_folder, const char *only)
 {
     std::vector<TestDocument> documents = make_documents();
     std::vector<BehaviorCase> cases;
@@ -1354,11 +1392,11 @@ static int run_behavior(const char *output_path, const char *only)
         activate(editor, editor);
         adapter_set_selection(editor, script.caret, script.caret);
         process_events();
-        record_state(out, script.name, 0, nullptr, editor);
+        record_state(out, script.name, 0, nullptr, editor, save_folder);
 
         for (size_t index = 0; index < script.steps.size(); ++index) {
             run_step(editor, script.steps[index]);
-            record_state(out, script.name, int(index + 1), &script.steps[index], editor);
+            record_state(out, script.name, int(index + 1), &script.steps[index], editor, save_folder);
         }
         step_count += script.steps.size();
 
@@ -1516,6 +1554,254 @@ static int run_onscreen()
     return failures ? 1 : 0;
 }
 
+//
+// Screen readers.
+//
+
+static QObject *accessibility_editor;
+static QString accessibility_text_events;    // the step's text events so far, as they are written
+static bool accessibility_told_of_move;      // a caret or selection event came during the step
+
+// Qt's QPlainTextEdit put U+2029 between lines in the text it sent with events, where the text itself has \n.
+static uint64_t hash_accessible_text(QString text)
+{
+    text.replace(QChar::ParagraphSeparator, u'\n');
+    return hash_text(text);
+}
+
+// QAccessible's update handler. Text events must match Qt's exactly. Caret and selection events reach Windows screen
+// readers as the same notice with nothing in it, which makes them ask for the caret and selection, and Qt sent extra
+// and duplicate ones; for those it only matters that one came when something moved.
+static void record_accessibility_event(QAccessibleEvent *event)
+{
+    if (event->object() != accessibility_editor)
+        return;
+
+    switch (event->type()) {
+        case QAccessible::TextCaretMoved:
+        case QAccessible::TextSelectionChanged:
+            accessibility_told_of_move = true;
+            break;
+
+        case QAccessible::TextInserted: {
+            QAccessibleTextInsertEvent *insert = static_cast<QAccessibleTextInsertEvent *>(event);
+            accessibility_text_events += QStringLiteral(" inserted %1 %2").arg(insert->changePosition())
+                                             .arg(hash_accessible_text(insert->textInserted()), 16, 16, u'0');
+            break;
+        }
+
+        case QAccessible::TextRemoved: {
+            QAccessibleTextRemoveEvent *remove = static_cast<QAccessibleTextRemoveEvent *>(event);
+            accessibility_text_events += QStringLiteral(" removed %1 %2").arg(remove->changePosition()).arg(remove->textRemoved().size());
+            break;
+        }
+
+        case QAccessible::TextUpdated: {
+            QAccessibleTextUpdateEvent *update = static_cast<QAccessibleTextUpdateEvent *>(event);
+            accessibility_text_events += QStringLiteral(" updated %1 %2 %3").arg(update->changePosition()).arg(update->textRemoved().size())
+                                             .arg(hash_accessible_text(update->textInserted()), 16, 16, u'0');
+            break;
+        }
+
+        default:
+            break;
+    }
+}
+
+// The spans before, at, and after an offset, for each kind of span.
+static void record_spans(FILE *out, QAccessibleTextInterface *text, int offset)
+{
+    QAccessible::TextBoundaryType types[] = {QAccessible::CharBoundary, QAccessible::WordBoundary, QAccessible::SentenceBoundary,
+                                             QAccessible::LineBoundary, QAccessible::ParagraphBoundary};
+    fprintf(out, "  spans at %d:", offset);
+    for (QAccessible::TextBoundaryType type : types) {
+        int start, end;
+        QString before = text->textBeforeOffset(offset, type, &start, &end);
+        fprintf(out, " %d,%d,%016llx", start, end, (unsigned long long)hash_text(before));
+        QString at = text->textAtOffset(offset, type, &start, &end);
+        fprintf(out, " %d,%d,%016llx", start, end, (unsigned long long)hash_text(at));
+        QString after = text->textAfterOffset(offset, type, &start, &end);
+        fprintf(out, " %d,%d,%016llx", start, end, (unsigned long long)hash_text(after));
+    }
+    fprintf(out, "\n");
+}
+
+static void record_accessible_state(FILE *out, const QString &name, int step_index, QAccessibleInterface *accessible)
+{
+    QAccessibleTextInterface *text = accessible->textInterface();
+    QAccessible::State state = accessible->state();
+    int start, end;
+    text->selection(0, &start, &end);
+    fprintf(out, "%s %d | role %d editable %d multiline %d selectable %d count %d caret %d selections %d %d %d value %016llx\n",
+            name.toUtf8().constData(), step_index, int(accessible->role()), int(state.editable), int(state.multiLine),
+            int(state.selectableText), text->characterCount(), text->cursorPosition(), text->selectionCount(), start, end,
+            (unsigned long long)hash_text(accessible->text(QAccessible::Value)));
+    record_spans(out, text, text->cursorPosition());
+}
+
+// Replays the behavior cases and writes, for each step, what the editor tells screen readers: the text events it
+// sends, whether it told them when the caret or selection moved, and its answers about the caret, the selection, and
+// the text around the caret. The navigation cases also get the spans at every offset.
+static int run_accessibility(const char *output_path, const char *only)
+{
+    std::vector<TestDocument> documents = make_documents();
+    std::vector<BehaviorCase> cases;
+    add_scripted_cases(cases, documents);
+    add_fuzz_cases(cases);
+
+    FILE *out = fopen(output_path, "wb");
+    if (!out)
+        return 1;
+
+    QAccessible::installUpdateHandler(record_accessibility_event);
+    QAccessible::setActive(true);
+
+    for (const BehaviorCase &script : cases) {
+        if (only && script.name != QString::fromUtf8(only))
+            continue;
+
+        const TestDocument &document = documents[script.document];
+        QWidget *editor = adapter_create_editor(document.name, document.text, theme_index("Monokai"), 15, DEFAULT_APPEARANCE);
+        show_hidden(editor, 720, 400);
+        activate(editor, editor);
+        adapter_set_selection(editor, script.caret, script.caret);
+        process_events();
+        accessibility_editor = editor;
+
+        QAccessibleInterface *accessible = QAccessible::queryAccessibleInterface(editor);
+        QAccessibleTextInterface *text = accessible->textInterface();
+        record_accessible_state(out, script.name, 0, accessible);
+        if (script.name.startsWith(QStringLiteral("navigate_"))) {
+            for (int offset = 0; offset <= text->characterCount(); ++offset)
+                record_spans(out, text, offset);
+
+            // Qt's QPlainTextEdit gave wrong character rectangles and no point lookups, so these aren't compared. The
+            // middle of each character in view must find a position on the same line within the character's width, or
+            // the end of the cluster the character belongs to, since the units inside an emoji sequence or a cluster of
+            // marks can't be told apart on screen.
+            QWidget *viewport = adapter_mouse_target(editor);
+            QRect visible(viewport->mapToGlobal(QPoint(0, 0)), viewport->size());
+            int checked = 0, wrong = 0;
+            for (int offset = 0; offset < text->characterCount(); ++offset) {
+                QRect rect = text->characterRect(offset);
+                if (!visible.contains(rect.center()))
+                    continue;
+                int found = text->offsetAtPoint(rect.center());
+                QRect at = text->characterRect(found);
+                bool on_character = at.y() == rect.y() && at.left() >= rect.left() && at.left() <= rect.left() + rect.width();
+                checked += 1;
+                wrong += !on_character && text->characterRect(found - 1) != rect;
+            }
+            printf("%s: %d characters in view, %d found somewhere else\n", script.name.toUtf8().constData(), checked, wrong);
+        }
+
+        int caret = text->cursorPosition(), start, end;
+        text->selection(0, &start, &end);
+        for (size_t index = 0; index < script.steps.size(); ++index) {
+            accessibility_text_events.clear();
+            accessibility_told_of_move = false;
+            run_step(editor, script.steps[index]);
+
+            int new_caret = text->cursorPosition(), new_start, new_end;
+            text->selection(0, &new_start, &new_end);
+            bool moved = new_caret != caret || new_start != start || new_end != end;
+            caret = new_caret;
+            start = new_start;
+            end = new_end;
+
+            record_accessible_state(out, script.name, int(index + 1), accessible);
+            fprintf(out, "  text events:%s\n  told of the move: %s\n", accessibility_text_events.toUtf8().constData(),
+                    moved ? (accessibility_told_of_move ? "yes" : "no") : "-");
+        }
+
+        accessibility_editor = nullptr;
+        deactivate();
+        delete editor;
+        process_events();
+    }
+
+    fclose(out);
+    return 0;
+}
+
+//
+// Measurements.
+//
+
+static double private_megabytes()
+{
+    PROCESS_MEMORY_COUNTERS_EX counters = {};
+    GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&counters, sizeof counters);
+    return double(counters.PrivateUsage) / 1e6;
+}
+
+static double elapsed_ms(QElapsedTimer &timer)
+{
+    double ms = double(timer.nsecsElapsed()) / 1e6;
+    timer.restart();
+    return ms;
+}
+
+// Opens a large file made of the lexer samples, pages through all of it, and types in it, painting after every step.
+static int run_bench()
+{
+    std::vector<TestDocument> samples;
+    add_language_samples(samples);
+    QString big;
+    while (big.count(u'\n') < 100000) {
+        for (const TestDocument &sample : samples)
+            big += sample.text + u'\n';
+    }
+    big.squeeze();
+    printf("text: %lld lines, %.1f MB of UTF-16\n", (long long)big.count(u'\n') + 1, double(big.size()) * 2 / 1e6);
+
+    QElapsedTimer timer;
+    double before = private_megabytes();
+    timer.start();
+    QWidget *editor = adapter_create_editor(QStringLiteral("bench.cpp"), big, theme_index("Monokai"), 15, DEFAULT_APPEARANCE);
+    double create_ms = elapsed_ms(timer);
+    show_hidden(editor, 1000, 800);
+    activate(editor, editor);
+    editor->repaint();
+    double show_ms = elapsed_ms(timer);
+    printf("open: created in %.0f ms, shown and painted in %.0f ms, %.1f MB private\n", create_ms, show_ms,
+           private_megabytes() - before);
+
+    int pages = 0, anchor, caret = 0, last_caret = -1;
+    while (caret != last_caret) {
+        last_caret = caret;
+        send_key(editor, Qt::Key_PageDown, Qt::NoModifier, QString());
+        adapter_mouse_target(editor)->repaint();
+        adapter_selection(editor, anchor, caret);
+        pages += 1;
+    }
+    double paging_ms = elapsed_ms(timer);
+    printf("paged to the end: %d pages, %.2f ms a page, %.1f MB private\n", pages, paging_ms / pages,
+           private_megabytes() - before);
+
+    adapter_set_selection(editor, int(big.size() / 2), int(big.size() / 2));
+    process_events();
+    timer.restart();
+    const int KEY_COUNT = 300;
+    for (int key = 0; key < KEY_COUNT; ++key) {
+        type_character(editor, QStringLiteral("x"));
+        adapter_mouse_target(editor)->repaint();
+    }
+    double typing_ms = elapsed_ms(timer);
+    for (int key = 0; key < KEY_COUNT; ++key) {
+        send_key(editor, Qt::Key_Backspace, Qt::NoModifier, QString());
+        adapter_mouse_target(editor)->repaint();
+    }
+    double backspace_ms = elapsed_ms(timer);
+    printf("typing in the middle with a paint each key: %.2f ms a key, backspace %.2f ms, %.1f MB private\n",
+           typing_ms / KEY_COUNT, backspace_ms / KEY_COUNT, private_megabytes() - before);
+
+    deactivate();
+    delete editor;
+    process_events();
+    return 0;
+}
+
 int main(int argument_count, char **arguments)
 {
     if (argument_count >= 4 && !strcmp(arguments[1], "compare")) {
@@ -1540,9 +1826,13 @@ int main(int argument_count, char **arguments)
     if (argument_count >= 3 && !strcmp(arguments[1], "render"))
         return run_render(arguments[2], save_folder, only);
     if (argument_count >= 3 && !strcmp(arguments[1], "behavior"))
-        return run_behavior(arguments[2], only);
+        return run_behavior(arguments[2], save_folder, only);
     if (argument_count >= 2 && !strcmp(arguments[1], "onscreen"))
         return run_onscreen();
+    if (argument_count >= 2 && !strcmp(arguments[1], "bench"))
+        return run_bench();
+    if (argument_count >= 3 && !strcmp(arguments[1], "accessibility"))
+        return run_accessibility(arguments[2], only);
 
     printf("usage: editor_test render|behavior <output> [--save <folder>] [--only <name>] | compare <reference> <current> | onscreen\n");
     return 2;

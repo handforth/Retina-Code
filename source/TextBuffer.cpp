@@ -137,7 +137,8 @@ static void lex_lines(TextBuffer &text, uint32_t first_line, uint32_t last_chang
     Language language = text.language == Language::Plain ? Language::C : text.language;
     LexState state = lex_state_before_line(text, first_line);
 
-    for (uint32_t line = first_line; line < text.lines.size(); ++line) {
+    uint32_t line = first_line;
+    for (; line < text.lines.size(); ++line) {
         tokenize_line(line_text(text, line), language, state, text.tokens);
 
         uint32_t old_index = text.lines[line].end_state;
@@ -146,6 +147,10 @@ static void lex_lines(TextBuffer &text, uint32_t first_line, uint32_t last_chang
         if (index == old_index && line >= last_changed_line)
             break;
     }
+
+    uint32_t last_line = line < text.lines.size() ? line : uint32_t(text.lines.size() - 1);
+    if (text.lexed_end_line == NO_POSITION || last_line > text.lexed_end_line)
+        text.lexed_end_line = last_line;
 
     if (text.lex_states.size() >= text.lex_state_limit)
         drop_unused_lex_states(text);
@@ -188,6 +193,42 @@ static void mark_qt_fragments(TextBuffer &text, uint32_t start, uint32_t inserte
                  qt_position(text, start - 1) + 1 == qt_position(text, start);
     if (joins)
         set_qt_fragment_start(text, start, false);
+}
+
+// Merges one insertion or removal into the changed range, as QTextDocumentPrivate::adjustDocumentChangesAndCursors
+// does. The range grows to cover both, along with any text between them.
+static void note_changed_range(TextChange &change, uint32_t start, uint32_t removed, uint32_t added)
+{
+    if (change.start == NO_POSITION) {
+        change = {start, removed, added};
+        return;
+    }
+
+    int64_t from = start, old_start = change.start, old_end = old_start + change.new_length;
+    int64_t gap = from + removed < old_start ? old_start - from - removed : from > old_end ? from - old_end : 0;
+
+    int64_t overlap_start = from > old_start ? from : old_start;
+    int64_t overlap_end = from + removed < old_end ? from + removed : old_end;
+    int64_t removed_inside = overlap_end > overlap_start ? overlap_end - overlap_start : 0;
+
+    change.start = uint32_t(from < old_start ? from : old_start);
+    change.old_length += uint32_t(removed - removed_inside + gap);
+    change.new_length += uint32_t(added - removed_inside + gap);
+}
+
+void note_document_change(TextChange &change, uint32_t start, uint32_t length)
+{
+    if (change.start == NO_POSITION) {
+        change = {start, length, length};
+        return;
+    }
+
+    uint32_t range_start = start < change.start ? start : change.start;
+    uint32_t end = start + length > change.start + change.new_length ? start + length : change.start + change.new_length;
+    uint32_t grown = end - range_start > change.new_length ? end - range_start - change.new_length : 0;
+    change.start = range_start;
+    change.old_length += grown;
+    change.new_length += grown;
 }
 
 // Replaces the units in [start, start + length) with inserted, and keeps the rest in step: Qt's string and fragments,
@@ -245,6 +286,12 @@ static void change_text(TextBuffer &text, uint32_t start, uint32_t length, std::
     text.lines[first_line + inserted_line_count].end_state = end_state_after_change;
     mark_qt_fragments(text, start, uint32_t(inserted.size()));
 
+    // Qt notes the removal and the insertion one after the other.
+    if (length)
+        note_changed_range(text.changed, start, length, 0);
+    if (!inserted.empty())
+        note_changed_range(text.changed, start, 0, uint32_t(inserted.size()));
+
     // The lines after the change move by its change in length. When the text got shorter, the unsigned shift wraps
     // around, and adding it still moves the starts back by the right amount.
     uint32_t shift = uint32_t(inserted.size()) - length;
@@ -260,6 +307,8 @@ void set_text(TextBuffer &text, std::u16string_view units, Language language)
     text.qt_positions.clear();
     text.lines.assign(1, TextLine{0, NOT_LEXED});
     text.language = language;
+    text.changed.start = NO_POSITION;
+    text.lexed_end_line = NO_POSITION;
     forget_lex_states(text);
 
     // QTextDocument::setPlainText stores the text with insertText.
@@ -274,6 +323,8 @@ void set_text(TextBuffer &text, std::u16string_view units, Language language)
     text.undo_group_depth = 0;
     text.undo_group_caret = NO_POSITION;
     text.modified = false;
+    text.changed.start = NO_POSITION;
+    text.lexed_end_line = NO_POSITION;
 }
 
 void set_text_language(TextBuffer &text, Language language)
@@ -284,6 +335,7 @@ void set_text_language(TextBuffer &text, Language language)
         line.end_state = NOT_LEXED;
 
     lex_lines(text, 0, uint32_t(text.lines.size() - 1));
+    text.lexed_end_line = NO_POSITION;
 }
 
 //
@@ -382,6 +434,9 @@ static void record_change(TextBuffer &text, UndoKind kind, uint32_t start, std::
 
 void replace_text(TextBuffer &text, uint32_t start, uint32_t length, std::u16string_view inserted)
 {
+    if (!length && inserted.empty())
+        return;
+
     // Qt records a removal as one change for each of its fragments. Each one is gone before the next is removed, so
     // they are all at start.
     uint32_t piece_start = start;

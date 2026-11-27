@@ -129,6 +129,17 @@ inline bool MapTypedRange(TypingRange &part, TypingRange edited, size_t inserted
     return true;
 }
 
+// One change a comment toggle makes: replace [start, end) with text. Offsets are in the text before any change.
+struct CommentEdit {
+    size_t start, end;
+    std::u16string text;
+};
+
+// Comments or uncomments the lines from start to end, adding the changes in text order. A caller applying them one
+// by one moves each later offset by how much the earlier changes grew or shrank the text.
+void ToggleCommentLines(const TypingSource &text, size_t start, size_t end, CommentSyntax comments, size_t tabWidth,
+                        size_t indentWidth, std::vector<CommentEdit> &edits);
+
 void RememberTypedPair(std::vector<TypedPair> &pairs, const std::optional<TypedPair> &pair,
                        size_t passedCloser, size_t length);
 Indentation DetectTypingIndentation(const TypingSource &text, Indentation fallback = {});
