@@ -8,6 +8,7 @@
 //   editor_test accessibility <output> [--only <case>]              per input step: screen reader events and answers
 //   editor_test window <output>                                     per step on whole windows: tabs, status, dialogs, files, runs
 //   editor_test bench                                               time and memory to open, page through, and type in a large file
+//   editor_test runbench                                            time and memory to build and run, and to show a flood of output
 //   editor_test compare <reference> <current>
 //   editor_test onscreen                                            checks hidden rendering against a shown window
 //
@@ -25,6 +26,7 @@
 #include <QDir>
 #include <QDockWidget>
 #include <QElapsedTimer>
+#include <QEventLoop>
 #include <QFile>
 #include <QFileDialog>
 #include <QImage>
@@ -49,7 +51,8 @@
 #include <QStyleHints>
 #include <QTabWidget>
 #include <QTextBlock>
-#include <QTextBrowser>
+#include <QPlainTextEdit>
+#include <QTextEdit>
 #include <QTextCharFormat>
 #include <QTimer>
 #include <QUrl>
@@ -1841,10 +1844,20 @@ static void trigger(QWidget *window, const char *text)
     process_events();
 }
 
-static QTextBrowser *window_output(QWidget *window)
+// The output pane's text widget, a QTextEdit or a QPlainTextEdit, and its document.
+static QWidget *window_output(QWidget *window)
 {
     QDockWidget *dock = window->findChild<QDockWidget *>();
-    return dock ? qobject_cast<QTextBrowser *>(dock->widget()) : nullptr;
+    return dock ? dock->widget() : nullptr;
+}
+
+static QTextDocument *output_document(QWidget *output)
+{
+    QTextEdit *edit = qobject_cast<QTextEdit *>(output);
+    if (edit)
+        return edit->document();
+    QPlainTextEdit *plain = qobject_cast<QPlainTextEdit *>(output);
+    return plain ? plain->document() : nullptr;
 }
 
 // A key press and release through the window system, so shortcuts see it the way they see a real key.
@@ -1952,12 +1965,12 @@ static void record_menus(QWidget *window)
 // The output pane's lines, with each run of one color, background, or link in braces.
 static void record_output(QWidget *window)
 {
-    QTextBrowser *output = window_output(window);
+    QWidget *output = window_output(window);
     if (!output)
         return;
 
-    window_print(QStringLiteral("output %1, read only %2").arg(output->parentWidget()->isVisible() ? "shown" : "hidden").arg(int(output->isReadOnly())));
-    for (QTextBlock block = output->document()->begin(); block.isValid(); block = block.next()) {
+    window_print(QStringLiteral("output %1, read only %2").arg(output->parentWidget()->isVisible() ? "shown" : "hidden").arg(int(output->property("readOnly").toBool())));
+    for (QTextBlock block = output_document(output)->begin(); block.isValid(); block = block.next()) {
         QString line, last_style;
         for (QTextBlock::iterator at = block.begin(); !at.atEnd(); ++at) {
             QTextFragment fragment = at.fragment();
@@ -2050,18 +2063,27 @@ static void control_wheel(QWidget *window, int delta, Qt::KeyboardModifiers modi
     process_events();
 }
 
+// Runs the event loop for a few milliseconds. processEvents with WaitForMoreEvents can handle an event and then sleep
+// on until something else wakes it, which made waits up to a couple of seconds too long.
+static void run_events_briefly()
+{
+    QEventLoop loop;
+    QTimer::singleShot(5, &loop, &QEventLoop::quit);
+    loop.exec();
+}
+
 // Lets a run go on until its output shows the text, for at most a minute.
 static void wait_for_output(QWidget *window, const char *text)
 {
-    QTextBrowser *output = window_output(window);
+    QWidget *output = window_output(window);
     QElapsedTimer timer;
     timer.start();
-    while (!output || !output->toPlainText().contains(QString::fromUtf8(text))) {
+    while (!output || !output_document(output)->toPlainText().contains(QString::fromUtf8(text))) {
         if (timer.elapsed() > 60000) {
             window_print(QStringLiteral("timed out waiting for ") + QString::fromUtf8(text));
             return;
         }
-        QCoreApplication::processEvents(QEventLoop::WaitForMoreEvents);
+        run_events_briefly();
         output = window_output(window);
     }
     process_events();
@@ -2073,18 +2095,39 @@ static void run_and_wait(QWidget *window, const char *ending)
     wait_for_output(window, ending);
 }
 
-// Clicks the first link in the output whose address starts with the text.
+// Clicks the first link in the output whose address starts with the text, in the middle of the link, after scrolling
+// it into view.
 static void click_link(QWidget *window, const char *start)
 {
-    QTextBrowser *output = window_output(window);
-    for (QTextBlock block = output->document()->begin(); block.isValid(); block = block.next()) {
+    QWidget *output = window_output(window);
+    QTextDocument *document = output_document(output);
+    for (QTextBlock block = document->begin(); block.isValid(); block = block.next()) {
         for (QTextBlock::iterator at = block.begin(); !at.atEnd(); ++at) {
-            QTextCharFormat format = at.fragment().charFormat();
-            if (format.isAnchor() && format.anchorHref().startsWith(QString::fromUtf8(start))) {
-                output->anchorClicked(QUrl(format.anchorHref()));
-                process_events();
-                return;
+            QTextFragment fragment = at.fragment();
+            if (!fragment.charFormat().isAnchor() || !fragment.charFormat().anchorHref().startsWith(QString::fromUtf8(start)))
+                continue;
+
+            QTextCursor cursor(document);
+            cursor.setPosition(fragment.position() + fragment.length() / 2);
+            QRect rect;
+            QTextEdit *edit = qobject_cast<QTextEdit *>(output);
+            QPlainTextEdit *plain = qobject_cast<QPlainTextEdit *>(output);
+            if (edit) {
+                edit->setTextCursor(cursor);
+                edit->ensureCursorVisible();
+                rect = edit->cursorRect(cursor);
+            } else {
+                plain->setTextCursor(cursor);
+                plain->ensureCursorVisible();
+                rect = plain->cursorRect(cursor);
             }
+
+            QWidget *viewport = static_cast<QAbstractScrollArea *>(output)->viewport();
+            QPoint point(rect.left() + 1, rect.center().y());
+            send_mouse(viewport, QEvent::MouseButtonPress, point, Qt::LeftButton, Qt::NoModifier);
+            send_mouse(viewport, QEvent::MouseButtonRelease, point, Qt::NoButton, Qt::NoModifier);
+            process_events();
+            return;
         }
     }
 
@@ -2251,7 +2294,7 @@ static int run_window(const char *output_path)
     QElapsedTimer settle;
     settle.start();
     while (settle.elapsed() < 100)
-        QCoreApplication::processEvents(QEventLoop::WaitForMoreEvents);
+        run_events_briefly();
     record_appearance(appearance);
     appearance->findChild<QDialogButtonBox *>()->button(QDialogButtonBox::Reset)->click();
     record_appearance(appearance);
@@ -2269,8 +2312,13 @@ static int run_window(const char *output_path)
             second = widget;
     }
     record_window(second, "new window");
+    const char *open_in_first[] = {"main.rs"};
+    drop_files(second, open_in_first, 1);
+    window_print(QStringLiteral("dropped a file the first window has open: the second window has %1 tabs, the first shows %2")
+                     .arg(second->findChild<QTabWidget *>()->count()).arg(window->windowTitle()));
     second->close();
     process_events();
+    select_tab(window, "* crlf.cpp");
     activate(window, current_editor(window));
     record_window(window, "close the new window");
 
@@ -2283,7 +2331,7 @@ static int run_window(const char *output_path)
 
     select_tab(window, "ask.py");
     run_and_wait(window, "Name? ");
-    QTextBrowser *output = window_output(window);
+    QWidget *output = window_output(window);
     send_key(output, Qt::Key_Backspace, Qt::NoModifier, key_text(Qt::Key_Backspace));
     type_text(output, QStringLiteral("Ada Lovelace"));
     send_key(output, Qt::Key_Backspace, Qt::ControlModifier, QString());
@@ -2391,6 +2439,56 @@ static double elapsed_ms(QElapsedTimer &timer)
     return ms;
 }
 
+// The run pane: the first C build and run, which finds the compiler, a second one, then a Python program that writes
+// 200,000 lines, every tenth in color, and paging through the output it keeps.
+static int run_run_bench()
+{
+    window_out = stdout;
+    window_folder = QCoreApplication::applicationDirPath() + QStringLiteral("/tests/run_bench");
+    QDir(window_folder).removeRecursively();
+    QDir().mkpath(window_folder);
+    write_window_file("hello.c", "#include <stdio.h>\n\nint main(void)\n{\n    puts(\"hello\");\n    return 0;\n}\n");
+    write_window_file("flood.py", "for i in range(200000):\n    if i % 10 == 0:\n        print(f\"\\x1b[32m{i:6}\\x1b[0m a line of output, about as long as a log line\")\n"
+                                  "    else:\n        print(f\"{i:6} a line of output, about as long as a log line\")\n");
+
+    QWidget *window = adapter_create_window({window_file("hello.c"), window_file("flood.py")}, theme_index("Monokai"));
+    show_hidden(window, 1040, 720);
+    activate(window, current_editor(window));
+    QElapsedTimer timer;
+    timer.start();
+    select_tab(window, "hello.c");
+    run_and_wait(window, "Exited with code");
+    double first_ms = elapsed_ms(timer);
+    run_and_wait(window, "Exited with code");
+    printf("C build and run: first %.0f ms, second %.0f ms\n", first_ms, elapsed_ms(timer));
+
+    select_tab(window, "flood.py");
+    double before = private_megabytes();
+    timer.restart();
+    run_and_wait(window, "Exited with code");
+    double flood_ms = elapsed_ms(timer);
+    QTextDocument *document = output_document(window_output(window));
+    printf("200,000 lines of output: %.0f ms, %d lines kept, %.1f MB more private\n", flood_ms, document->blockCount(),
+           private_megabytes() - before);
+
+    QAbstractScrollArea *output = static_cast<QAbstractScrollArea *>(window_output(window));
+    QScrollBar *bar = output->verticalScrollBar();
+    int pages = 0;
+    for (int value = 0; value <= bar->maximum(); value += bar->pageStep()) {
+        bar->setValue(value);
+        output->viewport()->repaint();
+        pages += 1;
+    }
+    double paging_ms = elapsed_ms(timer);
+    printf("paged through the output: %d pages, %.2f ms a page, %.1f MB more private\n", pages, paging_ms / pages,
+           private_megabytes() - before);
+
+    deactivate();
+    delete window;
+    process_events();
+    return 0;
+}
+
 // Opens a large file made of the lexer samples, pages through all of it, and types in it, painting after every step.
 static int run_bench()
 {
@@ -2489,6 +2587,8 @@ int main(int argument_count, char **arguments)
         return run_onscreen();
     if (argument_count >= 2 && !strcmp(arguments[1], "bench"))
         return run_bench();
+    if (argument_count >= 2 && !strcmp(arguments[1], "runbench"))
+        return run_run_bench();
     if (argument_count >= 3 && !strcmp(arguments[1], "accessibility"))
         return run_accessibility(arguments[2], only);
 
