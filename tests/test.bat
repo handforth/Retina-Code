@@ -28,6 +28,8 @@ if not exist %REFERENCE%\source (
 set FLAGS=/nologo /O2 /Zi /std:c++20 /utf-8 /permissive- /Zc:__cplusplus /MD /EHs-c- /D_HAS_EXCEPTIONS=0 /DNDEBUG /DQT_NO_DEBUG /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS
 rem The editor uses some of Qt's private headers, and the tests use the window-system interface and the font cache.
 set QT_FLAGS=/I "%QT%\include" /I "%QT%\include\QtCore" /I "%QT%\include\QtGui" /I "%QT%\include\QtWidgets" /I "%QT%\include\QtGui\6.12.1\QtGui" /I "%QT%\include\QtGui\6.12.1" /I "%QT%\include\QtCore\6.12.1" /I "%QT%\include\QtCore\6.12.1\QtCore"
+rem The window tests run on the offscreen platform, so their dialogs never show.
+if not exist build\platforms\qoffscreen.dll copy "%QT%\plugins\platforms\qoffscreen.dll" build\platforms >nul
 set QT_LINK=/DEBUG /LIBPATH:"%QT%\lib" Qt6Core.lib Qt6Gui.lib Qt6Widgets.lib user32.lib gdi32.lib advapi32.lib
 
 rem Lexer: the same tool built against each tree.
@@ -56,8 +58,9 @@ for %%s in (%SCALES%) do (
     build\editor_reference.exe behavior %OUT%\reference\behavior_%%s.txt || exit /b 1
 )
 set QT_SCALE_FACTOR=
-rem What screen readers hear doesn't depend on the display scale.
+rem What screen readers hear and what windows do don't depend on the display scale.
 build\editor_reference.exe accessibility %OUT%\reference\accessibility.txt || exit /b 1
+build\editor_reference.exe window %OUT%\reference\window.txt || exit /b 1
 exit /b 0
 
 :check
@@ -79,4 +82,6 @@ for %%s in (%SCALES%) do (
 set QT_SCALE_FACTOR=
 build\editor_current.exe accessibility %OUT%\current\accessibility.txt
 build\editor_current.exe compare %OUT%\reference\accessibility.txt %OUT%\current\accessibility.txt
+build\editor_current.exe window %OUT%\current\window.txt
+build\editor_current.exe compare %OUT%\reference\window.txt %OUT%\current\window.txt
 exit /b 0

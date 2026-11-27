@@ -6,6 +6,7 @@
 //   editor_test render <output> [--save <folder>] [--only <name>]   one line per scenario: size and pixel hash
 //   editor_test behavior <output> [--save <folder>] [--only <case>]  one line per input step: text, caret, scroll, image
 //   editor_test accessibility <output> [--only <case>]              per input step: screen reader events and answers
+//   editor_test window <output>                                     per step on whole windows: tabs, status, dialogs, files, runs
 //   editor_test bench                                               time and memory to open, page through, and type in a large file
 //   editor_test compare <reference> <current>
 //   editor_test onscreen                                            checks hidden rendering against a shown window
@@ -13,25 +14,45 @@
 // The display scale comes from QT_SCALE_FACTOR. Windows stay hidden (WA_DontShowOnScreen) and are made active through
 // Qt's window-system interface, so the caret and focus colors draw the same way they do on screen.
 
+#include <QAbstractButton>
 #include <QAbstractScrollArea>
 #include <QAccessible>
 #include <QApplication>
 #include <QClipboard>
+#include <QComboBox>
+#include <QDialog>
+#include <QDialogButtonBox>
 #include <QDir>
+#include <QDockWidget>
 #include <QElapsedTimer>
 #include <QFile>
+#include <QFileDialog>
 #include <QImage>
 #include <QInputMethodEvent>
 #include <QKeyEvent>
 #include <QLabel>
+#include <QLineEdit>
+#include <QListView>
+#include <QMainWindow>
+#include <QMenu>
+#include <QMenuBar>
+#include <QMessageBox>
 #include <QMimeData>
 #include <QMouseEvent>
 #include <QPixmap>
+#include <QRegularExpression>
 #include <QScreen>
 #include <QScrollBar>
+#include <QSettings>
+#include <QSlider>
+#include <QStatusBar>
 #include <QStyleHints>
+#include <QTabWidget>
+#include <QTextBlock>
+#include <QTextBrowser>
 #include <QTextCharFormat>
 #include <QTimer>
+#include <QUrl>
 #include <QWheelEvent>
 #include <qpa/qwindowsysteminterface.h>
 #include <QtGui/private/qfont_p.h>
@@ -1725,6 +1746,634 @@ static int run_accessibility(const char *output_path, const char *only)
 }
 
 //
+// Window behavior: a whole window driven through its menus, tabs, dialogs, and run pane. It runs on Qt's offscreen
+// platform, so no dialog shows on screen, and a timer answers each modal dialog with the next answer a step queued.
+// After each step the record has the window's title, tabs, status bar, and output pane.
+//
+
+static FILE *window_out;
+static QString window_folder;                // the files the steps open, save, and run
+static QStringList dialog_answers;           // for the next modal dialogs, in order
+
+// One record per line, without the paths and temporary names that differ between machines and runs.
+static void window_print(QString line)
+{
+    static const QRegularExpression temporary(QStringLiteral("(RetinaCode-|retina-code-)\\w{6}"));
+    line.replace(QDir::toNativeSeparators(window_folder), QStringLiteral("<folder>"));
+    line.replace(window_folder, QStringLiteral("<folder>"));
+    line.replace(temporary, QStringLiteral("\\1XXXXXX"));
+    line.replace(u'\n', QStringLiteral("\\n"));
+    fprintf(window_out, "%s\n", line.toUtf8().constData());
+}
+
+static QString window_file(const char *name)
+{
+    return window_folder + u'/' + QString::fromUtf8(name);
+}
+
+static void write_window_file(const char *name, const QByteArray &bytes)
+{
+    QFile file(window_file(name));
+    if (file.open(QIODevice::WriteOnly | QIODevice::Truncate))
+        file.write(bytes);
+}
+
+// A file's bytes, with line endings and bytes outside ASCII written as escapes.
+static void record_file(const char *name)
+{
+    QFile file(window_file(name));
+    if (!file.open(QIODevice::ReadOnly)) {
+        window_print(QStringLiteral("file %1 is missing").arg(QString::fromUtf8(name)));
+        return;
+    }
+
+    QByteArray bytes = file.readAll();
+    QString shown;
+    for (char byte : bytes) {
+        unsigned char value = (unsigned char)byte;
+        if (value >= 0x20 && value < 0x7f && value != '\\')
+            shown += QChar(value);
+        else
+            shown += QStringLiteral("\\x%1").arg(unsigned(value), 2, 16, QChar(u'0'));
+    }
+    window_print(QStringLiteral("file %1, %2 bytes: %3").arg(QString::fromUtf8(name)).arg(bytes.size()).arg(shown));
+}
+
+static void record_settings()
+{
+    QSettings settings(QStringLiteral("Retina Code"), QStringLiteral("Qt Prototype"));
+    QStringList keys = settings.allKeys();
+    keys.sort();
+    for (const QString &key : keys)
+        window_print(QStringLiteral("setting %1 = %2").arg(key, settings.value(key).toString()));
+}
+
+static int count_windows()
+{
+    int count = 0;
+    QWidgetList widgets = QApplication::topLevelWidgets();
+    for (QWidget *widget : widgets) {
+        if (qobject_cast<QMainWindow *>(widget) && widget->isVisible())
+            count += 1;
+    }
+
+    return count;
+}
+
+static QAction *window_action(QWidget *window, const char *text)
+{
+    QList<QAction *> actions = window->findChildren<QAction *>();
+    for (QAction *action : actions) {
+        if (action->text() == QString::fromUtf8(text))
+            return action;
+    }
+
+    window_print(QStringLiteral("no action ") + QString::fromUtf8(text));
+    return nullptr;
+}
+
+// Runs a menu command. One that opens a modal dialog returns once the dialog is answered and closed.
+static void trigger(QWidget *window, const char *text)
+{
+    QAction *action = window_action(window, text);
+    if (action)
+        action->trigger();
+    process_events();
+}
+
+static QTextBrowser *window_output(QWidget *window)
+{
+    QDockWidget *dock = window->findChild<QDockWidget *>();
+    return dock ? qobject_cast<QTextBrowser *>(dock->widget()) : nullptr;
+}
+
+// A key press and release through the window system, so shortcuts see it the way they see a real key.
+static void press_key(QWidget *window, int key)
+{
+    QWindowSystemInterface::handleKeyEvent<QWindowSystemInterface::SynchronousDelivery>(window->windowHandle(), QEvent::KeyPress, key, Qt::NoModifier);
+    QWindowSystemInterface::handleKeyEvent<QWindowSystemInterface::SynchronousDelivery>(window->windowHandle(), QEvent::KeyRelease, key, Qt::NoModifier);
+    process_events();
+}
+
+// Answers the open modal dialog: a message box gets the button named, a file dialog the path or "cancel", and the
+// theme picker "<filter> <downs> ok|cancel", which types the filter, presses Down, then Return or Escape. A click
+// that closes a dialog runs after this returns, because it may open the next dialog. A dialog is answered once: one
+// that opened another, like Save As asking to replace a file, is still modal for a moment after the other closes.
+static void answer_dialog()
+{
+    QWidget *modal = QApplication::activeModalWidget();
+    if (!modal || modal->property("answered").toBool())
+        return;
+    modal->setProperty("answered", true);
+
+    if (dialog_answers.isEmpty()) {
+        window_print(QStringLiteral("dialog without an answer: ") + modal->windowTitle());
+        QTimer::singleShot(0, modal, &QWidget::close);
+        return;
+    }
+    QString answer = dialog_answers.takeFirst();
+
+    QMessageBox *box = qobject_cast<QMessageBox *>(modal);
+    if (box) {
+        window_print(QStringLiteral("message %1: %2 [%3] -> %4").arg(box->windowTitle(), box->text(), box->detailedText(), answer));
+        QMessageBox::StandardButton button = QMessageBox::Ok;
+        if (answer == QStringLiteral("Save"))
+            button = QMessageBox::Save;
+        if (answer == QStringLiteral("Discard"))
+            button = QMessageBox::Discard;
+        if (answer == QStringLiteral("Cancel"))
+            button = QMessageBox::Cancel;
+        if (answer == QStringLiteral("Yes"))
+            button = QMessageBox::Yes;
+        if (box->button(button)) {
+            QTimer::singleShot(0, box->button(button), &QAbstractButton::click);
+        } else {
+            window_print(QStringLiteral("the message has no button ") + answer);
+            QTimer::singleShot(0, box, &QWidget::close);
+        }
+        return;
+    }
+
+    QFileDialog *files = qobject_cast<QFileDialog *>(modal);
+    if (files) {
+        window_print(QStringLiteral("file dialog %1 -> %2").arg(files->windowTitle(), answer));
+        if (answer == QStringLiteral("cancel")) {
+            QTimer::singleShot(0, files, &QDialog::reject);
+        } else {
+            files->selectFile(answer);
+            QTimer::singleShot(0, files, &QDialog::accept);
+        }
+        return;
+    }
+
+    // The theme picker. Return and Escape close it, and nothing opens after it.
+    QStringList parts = answer.split(u' ');
+    QLineEdit *filter = modal->findChild<QLineEdit *>();
+    QListView *list = modal->findChild<QListView *>();
+    QWindowSystemInterface::handleFocusWindowChanged(modal->windowHandle(), Qt::ActiveWindowFocusReason);
+    process_events();
+    for (QChar character : parts[0])
+        filter->insert(QString(character));
+    for (int index = 0; index < parts[1].toInt(); ++index)
+        press_key(modal, Qt::Key_Down);
+
+    int shown = 0;
+    for (int row = 0; row < list->model()->rowCount(); ++row) {
+        if (!list->isRowHidden(row))
+            shown += 1;
+    }
+    window_print(QStringLiteral("theme picker \"%1\": %2, %3 shown, filter focused %4 -> %5")
+                     .arg(parts[0], list->currentIndex().data().toString()).arg(shown).arg(int(filter->hasFocus())).arg(parts[2]));
+    press_key(modal, parts[2] == QStringLiteral("ok") ? Qt::Key_Return : Qt::Key_Escape);
+}
+
+static void record_menus(QWidget *window)
+{
+    QList<QAction *> menus = qobject_cast<QMainWindow *>(window)->menuBar()->actions();
+    for (QAction *menu : menus) {
+        window_print(QStringLiteral("menu ") + menu->text());
+        QList<QAction *> actions = menu->menu()->actions();
+        for (QAction *action : actions) {
+            if (action->isSeparator()) {
+                window_print(QStringLiteral("  ---"));
+                continue;
+            }
+
+            QStringList keys;
+            QList<QKeySequence> shortcuts = action->shortcuts();
+            for (const QKeySequence &shortcut : shortcuts)
+                keys.append(shortcut.toString(QKeySequence::PortableText));
+            window_print(QStringLiteral("  %1 [%2] enabled %3 repeat %4 icon %5 context %6").arg(action->text(), keys.join(QStringLiteral(", ")))
+                             .arg(int(action->isEnabled())).arg(int(action->autoRepeat())).arg(int(!action->icon().isNull())).arg(int(action->shortcutContext())));
+        }
+    }
+}
+
+// The output pane's lines, with each run of one color, background, or link in braces.
+static void record_output(QWidget *window)
+{
+    QTextBrowser *output = window_output(window);
+    if (!output)
+        return;
+
+    window_print(QStringLiteral("output %1, read only %2").arg(output->parentWidget()->isVisible() ? "shown" : "hidden").arg(int(output->isReadOnly())));
+    for (QTextBlock block = output->document()->begin(); block.isValid(); block = block.next()) {
+        QString line, last_style;
+        for (QTextBlock::iterator at = block.begin(); !at.atEnd(); ++at) {
+            QTextFragment fragment = at.fragment();
+            QTextCharFormat format = fragment.charFormat();
+            QString style = format.foreground().color().name();
+            if (format.background().style() != Qt::NoBrush)
+                style += QStringLiteral(" on ") + format.background().color().name();
+            if (format.isAnchor())
+                style += QStringLiteral(" link ") + format.anchorHref();
+            if (style != last_style)
+                line += QStringLiteral("{%1}").arg(style);
+            line += fragment.text();
+            last_style = style;
+        }
+        window_print(QStringLiteral("| ") + line);
+    }
+}
+
+static void record_window(QWidget *window, const char *step)
+{
+    process_events();
+    window_print(QStringLiteral("== ") + QString::fromUtf8(step));
+    window_print(QStringLiteral("title %1, %2 windows").arg(window->windowTitle()).arg(count_windows()));
+
+    QTabWidget *tabs = window->findChild<QTabWidget *>();
+    for (int index = 0; index < tabs->count(); ++index)
+        window_print(QStringLiteral("tab%1 %2 | %3").arg(index == tabs->currentIndex() ? "*" : " ", tabs->tabText(index), tabs->tabToolTip(index)));
+
+    QWidget *editor = tabs->currentWidget();
+    if (editor) {
+        int anchor, caret;
+        adapter_selection(editor, anchor, caret);
+        QString text = adapter_text(editor);
+        window_print(QStringLiteral("text %1 %2 caret %3 anchor %4 focus %5 popup %6").arg(text.size()).arg(hash_text(text), 16, 16, QChar(u'0'))
+                         .arg(caret).arg(anchor).arg(int(editor->hasFocus())).arg(int(adapter_completion_visible(editor))));
+    }
+
+    QStatusBar *status = qobject_cast<QMainWindow *>(window)->statusBar();
+    QStringList labels;
+    QList<QLabel *> status_labels = status->findChildren<QLabel *>();
+    for (QLabel *label : status_labels) {
+        if (!label->toolTip().startsWith(QStringLiteral("Resident memory")))
+            labels.append(label->text());
+    }
+    QComboBox *picker = status->findChild<QComboBox *>();
+    window_print(QStringLiteral("status %1 | picker %2 \"%3\", %4 rows, first \"%5\"").arg(labels.join(QStringLiteral(" | ")), picker->isEnabled() ? "on" : "off", picker->currentText())
+                     .arg(picker->count()).arg(picker->itemText(0)));
+    window_print(QStringLiteral("save %1, save as %2").arg(int(window_action(window, "&Save")->isEnabled())).arg(int(window_action(window, "Save &As…")->isEnabled())));
+    record_output(window);
+}
+
+// Drops files from a file manager on the window. The window opens them once the drop is done.
+static void drop_files(QWidget *window, const char *const *names, int count)
+{
+    QList<QUrl> urls;
+    for (int index = 0; index < count; ++index)
+        urls.append(QUrl::fromLocalFile(window_file(names[index])));
+    QMimeData mime;
+    mime.setUrls(urls);
+
+    QDragEnterEvent enter(QPoint(200, 200), Qt::CopyAction | Qt::MoveAction, &mime, Qt::LeftButton, Qt::NoModifier);
+    QApplication::sendEvent(window, &enter);
+    QDropEvent drop(QPointF(200, 200), Qt::CopyAction | Qt::MoveAction, &mime, Qt::LeftButton, Qt::NoModifier);
+    QApplication::sendEvent(window, &drop);
+    window_print(QStringLiteral("drop: enter accepted %1, drop accepted %2, action %3").arg(int(enter.isAccepted())).arg(int(drop.isAccepted())).arg(int(drop.dropAction())));
+    process_events();
+}
+
+static void select_tab(QWidget *window, const char *label)
+{
+    QTabWidget *tabs = window->findChild<QTabWidget *>();
+    for (int index = 0; index < tabs->count(); ++index) {
+        if (tabs->tabText(index) == QString::fromUtf8(label))
+            tabs->setCurrentIndex(index);
+    }
+    process_events();
+}
+
+static QWidget *current_editor(QWidget *window)
+{
+    return window->findChild<QTabWidget *>()->currentWidget();
+}
+
+static void control_wheel(QWidget *window, int delta, Qt::KeyboardModifiers modifiers)
+{
+    QWidget *target = adapter_mouse_target(current_editor(window));
+    QPoint middle(target->width() / 2, target->height() / 2);
+    QWheelEvent wheel(QPointF(middle), QPointF(target->mapToGlobal(middle)), QPoint(), QPoint(0, delta), Qt::NoButton, modifiers, Qt::NoScrollPhase, false);
+    QApplication::sendEvent(target, &wheel);
+    process_events();
+}
+
+// Lets a run go on until its output shows the text, for at most a minute.
+static void wait_for_output(QWidget *window, const char *text)
+{
+    QTextBrowser *output = window_output(window);
+    QElapsedTimer timer;
+    timer.start();
+    while (!output || !output->toPlainText().contains(QString::fromUtf8(text))) {
+        if (timer.elapsed() > 60000) {
+            window_print(QStringLiteral("timed out waiting for ") + QString::fromUtf8(text));
+            return;
+        }
+        QCoreApplication::processEvents(QEventLoop::WaitForMoreEvents);
+        output = window_output(window);
+    }
+    process_events();
+}
+
+static void run_and_wait(QWidget *window, const char *ending)
+{
+    trigger(window, "&Run Current File");
+    wait_for_output(window, ending);
+}
+
+// Clicks the first link in the output whose address starts with the text.
+static void click_link(QWidget *window, const char *start)
+{
+    QTextBrowser *output = window_output(window);
+    for (QTextBlock block = output->document()->begin(); block.isValid(); block = block.next()) {
+        for (QTextBlock::iterator at = block.begin(); !at.atEnd(); ++at) {
+            QTextCharFormat format = at.fragment().charFormat();
+            if (format.isAnchor() && format.anchorHref().startsWith(QString::fromUtf8(start))) {
+                output->anchorClicked(QUrl(format.anchorHref()));
+                process_events();
+                return;
+            }
+        }
+    }
+
+    window_print(QStringLiteral("no link starting with ") + QString::fromUtf8(start));
+}
+
+static void record_appearance(QDialog *dialog)
+{
+    QStringList parts;
+    QList<QLabel *> labels = dialog->findChildren<QLabel *>();
+    for (QLabel *label : labels)
+        parts.append(label->text());
+    QList<QSlider *> sliders = dialog->findChildren<QSlider *>();
+    for (QSlider *slider : sliders)
+        parts.append(QString::number(slider->value()));
+    window_print(QStringLiteral("text appearance ") + parts.join(QStringLiteral(" | ")));
+}
+
+static int run_window(const char *output_path)
+{
+    window_out = fopen(output_path, "wb");
+    if (!window_out)
+        return 1;
+
+    // The files: a C++ file with a byte order mark and CRLF line endings, two that aren't UTF-8 text, and programs.
+    window_folder = QCoreApplication::applicationDirPath() + QStringLiteral("/tests/window");
+    QDir(window_folder).removeRecursively();
+    QDir().mkpath(window_folder);
+    write_window_file("main.rs", RUST_SAMPLE);
+    write_window_file("crlf.cpp", "\xef\xbb\xbf#include <stdio.h>\r\n\r\nint main() { return 0; }\r\n");
+    write_window_file("latin1.txt", "caf\xe9\n");
+    write_window_file("nul.txt", QByteArray("a\0b\n", 4));
+    write_window_file("notes.txt", "Plain text can't run.\n");
+    write_window_file("ask.py", "name = input(\"Name? \")\nprint(\"Hello,\", name)\n");
+    write_window_file("eof.py", "import sys\ntext = sys.stdin.read()\nprint(len(text), repr(text))\n");
+    write_window_file("trace.py", "def fail():\n    raise ValueError(\"no\")\n\nfail()\n");
+    write_window_file("sleep.py", "import time\nprint(\"waiting\", flush=True)\ntime.sleep(60)\n");
+    write_window_file("hello.c", "#include <stdio.h>\n\nint main(void)\n{\n    printf(\"café %d\\n\", 6 * 7);\n    return 3;\n}\n");
+    write_window_file("bad.c", "#include \"broken.h\"\n\nint main(void)\n{\n    return missing;\n}\n");
+    write_window_file("broken.h", "int broken(void) { return 1 }\n");
+
+    // The window reads its settings when it's made. Everything it saves after that goes to an empty scratch key.
+    QWidget *window = adapter_create_window({window_file("main.rs"), window_file("crlf.cpp")}, theme_index("Monokai"));
+    begin_scratch_registry();
+    window->show();
+    activate(window, current_editor(window));
+    QTimer answers;
+    QObject::connect(&answers, &QTimer::timeout, answer_dialog);
+    answers.start(10);
+    record_menus(window);
+    record_window(window, "open two files");
+
+    // Tabs and the language picker.
+    select_tab(window, "crlf.cpp");
+    record_window(window, "second tab");
+    QComboBox *picker = window->findChild<QComboBox *>();
+    int python = picker->findText(QStringLiteral("Python"));
+    picker->setCurrentIndex(python);
+    picker->activated(python);
+    record_window(window, "choose Python");
+    picker->setCurrentIndex(0);
+    picker->activated(0);
+    record_window(window, "choose auto detect");
+
+    // Saving keeps the byte order mark and the line endings.
+    type_text(current_editor(window), QStringLiteral("x"));
+    record_window(window, "type");
+    trigger(window, "&Save");
+    record_window(window, "save");
+    record_file("crlf.cpp");
+
+    trigger(window, "&New Tab");
+    type_text(current_editor(window), QStringLiteral("#!/usr/bin/env python3\nprint('hi')\n"));
+    record_window(window, "new tab");
+    dialog_answers << window_file("saved.py");
+    trigger(window, "&Save");
+    record_window(window, "save a new tab");
+    record_file("saved.py");
+    dialog_answers << window_file("main.rs") << QStringLiteral("Yes") << QStringLiteral("Ok");
+    trigger(window, "Save &As…");
+    record_window(window, "save as a file open in another tab");
+    dialog_answers << window_file("missing/saved.py") << QStringLiteral("Ok");
+    trigger(window, "Save &As…");
+    record_window(window, "save as in a missing folder");
+    dialog_answers << QStringLiteral("cancel");
+    trigger(window, "Save &As…");
+    record_window(window, "cancel save as");
+
+    // Opening: from the dialog, again under another case, and files that aren't UTF-8 text.
+    dialog_answers << window_file("ask.py");
+    trigger(window, "&Open…");
+    record_window(window, "open from the dialog");
+    const char *dropped[] = {"ASK.PY", "latin1.txt", "nul.txt", "missing.txt", "notes.txt"};
+    dialog_answers << QStringLiteral("Ok");
+    drop_files(window, dropped, 5);
+    record_window(window, "drop files");
+
+    // Zoom, from the menu and from the wheel with Control held.
+    trigger(window, "Zoom &In");
+    record_window(window, "zoom in");
+    control_wheel(window, 60, Qt::ControlModifier);
+    control_wheel(window, 60, Qt::ControlModifier);
+    record_window(window, "wheel up two half steps");
+    control_wheel(window, 60, Qt::ControlModifier);
+    control_wheel(window, 120, Qt::NoModifier);
+    control_wheel(window, 60, Qt::ControlModifier);
+    record_window(window, "half steps around a plain wheel turn");
+    control_wheel(window, -360, Qt::ControlModifier);
+    record_window(window, "wheel down three steps");
+    control_wheel(window, 4000, Qt::ControlModifier);
+    record_window(window, "wheel far up");
+    trigger(window, "Zoom &Out");
+    record_window(window, "zoom out");
+    trigger(window, "&Reset Zoom");
+    record_window(window, "reset zoom");
+
+    // The Edit menu.
+    trigger(window, "&New Tab");
+    QApplication::clipboard()->setText(QStringLiteral("first line\nsecond line\n"));
+    trigger(window, "&Paste");
+    record_window(window, "paste");
+    trigger(window, "&Undo");
+    record_window(window, "undo");
+    trigger(window, "&Redo");
+    record_window(window, "redo");
+    trigger(window, "Select &All");
+    trigger(window, "Cu&t");
+    record_window(window, "cut everything");
+    window_print(QStringLiteral("clipboard ") + QApplication::clipboard()->text());
+    trigger(window, "&Paste");
+    trigger(window, "Select &All");
+    trigger(window, "&Copy");
+    window_print(QStringLiteral("clipboard ") + QApplication::clipboard()->text());
+    select_tab(window, "crlf.cpp");
+    trigger(window, "Toggle Line &Comment");
+    record_window(window, "toggle comment");
+    trigger(window, "Show &Completions");
+    record_window(window, "show completions");
+    send_key(current_editor(window), Qt::Key_Escape, Qt::NoModifier, key_text(Qt::Key_Escape));
+
+    // The theme picker previews as you go and keeps the theme only on OK.
+    dialog_answers << QStringLiteral("sol 1 ok");
+    trigger(window, "Editor &Theme…");
+    record_window(window, "pick a theme");
+    record_settings();
+    dialog_answers << QStringLiteral("dark 2 cancel");
+    trigger(window, "Editor &Theme…");
+    dialog_answers << QStringLiteral("zzz 0 cancel");
+    trigger(window, "Editor &Theme…");
+    record_window(window, "cancel the theme picker");
+    record_settings();
+
+    // Text appearance: sliders, Reset, and the settings saved when the panel closes.
+    trigger(window, "&Text Appearance…");
+    QDialog *appearance = nullptr;
+    QList<QDialog *> dialogs = window->findChildren<QDialog *>();
+    for (QDialog *dialog : dialogs) {
+        if (dialog->isVisible() && dialog->findChild<QSlider *>())
+            appearance = dialog;
+    }
+    QList<QSlider *> sliders = appearance->findChildren<QSlider *>();
+    sliders[0]->setValue(40);
+    sliders[3]->setValue(120);
+    QElapsedTimer settle;
+    settle.start();
+    while (settle.elapsed() < 100)
+        QCoreApplication::processEvents(QEventLoop::WaitForMoreEvents);
+    record_appearance(appearance);
+    appearance->findChild<QDialogButtonBox *>()->button(QDialogButtonBox::Reset)->click();
+    record_appearance(appearance);
+    sliders[1]->setValue(130);
+    appearance->findChild<QDialogButtonBox *>()->button(QDialogButtonBox::Close)->click();
+    record_window(window, "text appearance");
+    record_settings();
+
+    // A second window, closed again.
+    trigger(window, "New &Window");
+    QWidget *second = nullptr;
+    QWidgetList widgets = QApplication::topLevelWidgets();
+    for (QWidget *widget : widgets) {
+        if (qobject_cast<QMainWindow *>(widget) && widget != window && widget->isVisible())
+            second = widget;
+    }
+    record_window(second, "new window");
+    second->close();
+    process_events();
+    activate(window, current_editor(window));
+    record_window(window, "close the new window");
+
+    // Runs: a file that can't run, input, end of input, a traceback, a build and run, a failed build, and a stop.
+    const char *programs[] = {"eof.py", "trace.py", "sleep.py", "hello.c", "bad.c"};
+    drop_files(window, programs, 5);
+    select_tab(window, "notes.txt");
+    trigger(window, "&Run Current File");
+    record_window(window, "run plain text");
+
+    select_tab(window, "ask.py");
+    run_and_wait(window, "Name? ");
+    QTextBrowser *output = window_output(window);
+    send_key(output, Qt::Key_Backspace, Qt::NoModifier, key_text(Qt::Key_Backspace));
+    type_text(output, QStringLiteral("Ada Lovelace"));
+    send_key(output, Qt::Key_Backspace, Qt::ControlModifier, QString());
+    type_text(output, QStringLiteral("Byron"));
+    record_window(window, "type input");
+    send_key(output, Qt::Key_Return, Qt::NoModifier, key_text(Qt::Key_Return));
+    wait_for_output(window, "Exited with code");
+    record_window(window, "run with input");
+
+    select_tab(window, "eof.py");
+    run_and_wait(window, "Running");
+    type_text(output, QStringLiteral("abc"));
+    send_key(output, Qt::Key_Return, Qt::NoModifier, key_text(Qt::Key_Return));
+    type_text(output, QStringLiteral("de"));
+    send_key(output, Qt::Key_D, Qt::ControlModifier, QString(QChar(4)));
+    wait_for_output(window, "Exited with code");
+    record_window(window, "end of input");
+
+    select_tab(window, "trace.py");
+    run_and_wait(window, "Exited with code");
+    record_window(window, "traceback");
+    click_link(window, "retina-source");
+    record_window(window, "click the traceback");
+    adapter_set_selection(current_editor(window), 0, 0);
+    type_text(current_editor(window), QStringLiteral("# changed\n"));
+    run_and_wait(window, "Exited with code");
+    record_window(window, "traceback from unsaved changes");
+
+    select_tab(window, "hello.c");
+    run_and_wait(window, "Exited with code");
+    record_window(window, "build and run");
+    select_tab(window, "bad.c");
+    run_and_wait(window, "Build failed");
+    record_window(window, "failed build");
+    click_link(window, "file:");
+    record_window(window, "click a diagnostic in another file");
+
+    select_tab(window, "sleep.py");
+    run_and_wait(window, "waiting");
+    run_and_wait(window, "Stopped.");
+    record_window(window, "stop");
+
+    // The output pane: closed and shown again, and the Edit menu acting on it when it has focus.
+    output->parentWidget()->close();
+    trigger(window, "&Output");
+    record_window(window, "show the output");
+    output->setFocus();
+    trigger(window, "Select &All");
+    trigger(window, "&Copy");
+    window_print(QStringLiteral("clipboard ") + QApplication::clipboard()->text());
+    current_editor(window)->setFocus();
+
+    // Closing tabs with and without unsaved changes.
+    select_tab(window, "* trace.py");
+    dialog_answers << QStringLiteral("Cancel");
+    trigger(window, "&Close Tab");
+    record_window(window, "cancel closing a changed tab");
+    dialog_answers << QStringLiteral("Discard");
+    trigger(window, "&Close Tab");
+    record_window(window, "discard a changed tab");
+    select_tab(window, "saved.py");
+    type_text(current_editor(window), QStringLiteral("pass\n"));
+    dialog_answers << QStringLiteral("Save");
+    trigger(window, "&Close Tab");
+    record_window(window, "save a changed tab as it closes");
+    record_file("saved.py");
+    select_tab(window, "notes.txt");
+    trigger(window, "&Close Tab");
+    record_window(window, "close a saved tab");
+
+    // Exit asks about each changed tab, and a Cancel keeps everything open.
+    select_tab(window, "ask.py");
+    type_text(current_editor(window), QStringLiteral("x"));
+    dialog_answers << QStringLiteral("Cancel");
+    trigger(window, "E&xit");
+    record_window(window, "cancel exit");
+    dialog_answers << QStringLiteral("Discard") << QStringLiteral("Discard") << QStringLiteral("Discard") << QStringLiteral("Discard");
+    trigger(window, "E&xit");
+    process_events();
+    window_print(QStringLiteral("after exit: %1 windows, %2 answers left").arg(count_windows()).arg(dialog_answers.size()));
+    record_settings();
+
+    answers.stop();
+    end_scratch_registry();
+    fclose(window_out);
+    printf("ran the window steps\n");
+    return 0;
+}
+
+//
 // Measurements.
 //
 
@@ -1809,8 +2458,17 @@ int main(int argument_count, char **arguments)
         return run_compare(arguments[2], arguments[3]);
     }
 
+    // Window runs open dialogs, so they use the offscreen platform, where nothing shows on screen.
+    bool window_run = argument_count >= 3 && !strcmp(arguments[1], "window");
+    if (window_run) {
+        qputenv("QT_QPA_PLATFORM", "offscreen");
+        QApplication::setAttribute(Qt::AA_DontUseNativeDialogs);
+    }
+
     QApplication application(argument_count, arguments);
     adapter_setup_application(application);
+    if (window_run)
+        return run_window(arguments[2]);
 
     // The caret doesn't blink, so it is in every image.
     QGuiApplication::styleHints()->setCursorFlashTime(0);
