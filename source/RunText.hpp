@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -7,9 +8,18 @@
 
 enum class OutputTone { Text, Warning, Error };
 
+constexpr OutputTone VisibleOutputTone(OutputTone tone, bool usesTerminalColors)
+{
+    return usesTerminalColors ? OutputTone::Text : tone;
+}
+
 // ANSI truecolors are opaque RGBA. The low values hold the default and palette indices.
 inline constexpr uint32_t defaultOutputColor = 0;
 inline constexpr uint32_t outputPaletteStart = 1;
+inline constexpr size_t outputScrollbackCharacters = 192 * 1024;
+inline constexpr size_t outputScrollbackLines = 3000;
+
+uint32_t RunTerminalColor(uint32_t color, bool dark);
 
 struct OutputColors {
     uint32_t foreground = defaultOutputColor;
@@ -39,6 +49,7 @@ struct TerminalDecoder {
 };
 
 void AddOutputColors(std::vector<OutputColorSpan> &spans, size_t location, size_t length, OutputColors colors);
+void ShiftOutputColors(std::vector<OutputColorSpan> &spans, OutputRange replaced, uint32_t replacementLength);
 struct DecodedOutput {
     std::string text;
     std::vector<OutputColorSpan> spans;
@@ -53,13 +64,14 @@ size_t CompleteUTF8Prefix(std::string_view bytes);
 struct RunRecords {
     std::string partial;
     bool dropping = false;
+    bool discarded = false;
 };
 
 using RunRecord = bool (*)(void *, std::string_view);
 // The returned view is the unread portion if the callback stops.
 std::string_view ReadRunRecords(RunRecords &reader, std::string_view bytes, size_t limit, RunRecord receive, void *context);
 
-enum class CompilerFormat { Standard, Go, DotNet, Kotlin };
+enum class CompilerFormat { Standard, Go, Parenthesized, Kotlin, Rust };
 
 struct CompilerLocation {
     std::string_view path;

@@ -1653,10 +1653,10 @@ static NSUInteger PositionAfterCursorEdit(NSUInteger position, const TypingEdit 
 {
     for (auto &edit : _cursorTyping) {
         if (edit.pair) {
-            auto translate = [&](NSRange &range) {
+            auto translate = [&](TypingRange &range) {
                 NSUInteger at = PositionAfterCursorEdit(range.location, edit, batch);
-                NSUInteger end = PositionAfterCursorEdit(NSMaxRange(range), edit, batch);
-                range = NSMakeRange(at, end >= at ? end - at : 0);
+                NSUInteger end = PositionAfterCursorEdit(range.end(), edit, batch);
+                range = {at, end >= at ? end - at : 0};
             };
             translate(edit.pair->opening);
             translate(edit.pair->closing);

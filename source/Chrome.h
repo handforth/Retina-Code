@@ -8,12 +8,6 @@ void DrawWindowBarGradient(NSRect bounds, NSAppearance *appearance);
 
 struct Theme;
 
-struct PopupColors {
-    Col32 paper, border, selection, text, selectedText;
-    bool operator==(const PopupColors &) const = default;
-};
-
-PopupColors EditorPopupColors(const Theme &theme);
 void DrawPopupFrame(NSRect frame, NSRect dirty, Col32 paper, Col32 border);
 
 enum class DockSide { Bottom, Left, Right, Top };

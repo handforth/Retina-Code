@@ -4,6 +4,34 @@
 
 #include <algorithm>
 
+uint32_t RunTerminalColor(uint32_t color, bool dark)
+{
+    if (ColorAlpha(color) == 255)
+        return color;
+    constexpr Col32 darkPalette[] = {
+        rgb(0, 0, 0), rgb(223, 74, 68), rgb(77, 184, 100), rgb(211, 173, 56),
+        rgb(88, 139, 228), rgb(188, 105, 215), rgb(71, 173, 181), rgb(204, 204, 204),
+        rgb(128, 128, 128), rgb(255, 85, 85), rgb(105, 222, 131), rgb(255, 217, 77),
+        rgb(123, 169, 255), rgb(229, 146, 255), rgb(113, 217, 223), rgb(255, 255, 255),
+    };
+    constexpr Col32 lightPalette[] = {
+        rgb(0, 0, 0), rgb(165, 26, 33), rgb(20, 99, 44), rgb(118, 86, 0),
+        rgb(35, 73, 151), rgb(128, 36, 141), rgb(19, 106, 115), rgb(102, 102, 102),
+        rgb(102, 102, 102), rgb(196, 37, 44), rgb(32, 123, 55), rgb(135, 97, 0),
+        rgb(49, 90, 192), rgb(150, 57, 164), rgb(18, 121, 133), rgb(255, 255, 255),
+    };
+    uint32_t index = color - outputPaletteStart;
+    if (index < 16)
+        return (dark ? darkPalette : lightPalette)[index];
+    if (index < 232) {
+        constexpr uint32_t levels[] = {0, 95, 135, 175, 215, 255};
+        index -= 16;
+        return rgb(levels[index / 36], levels[index / 6 % 6], levels[index % 6]);
+    }
+    uint32_t gray = 8 + (index - 232) * 10;
+    return rgb(gray, gray, gray);
+}
+
 void AddOutputColors(std::vector<OutputColorSpan> &spans, size_t location, size_t length, OutputColors colors)
 {
     if (!length || colors == OutputColors{})
@@ -13,6 +41,22 @@ void AddOutputColors(std::vector<OutputColorSpan> &spans, size_t location, size_
         spans.back().range.length += uint32_t(length);
     else
         spans.push_back({{uint32_t(location), uint32_t(length)}, colors});
+}
+
+void ShiftOutputColors(std::vector<OutputColorSpan> &spans, OutputRange replaced, uint32_t replacementLength)
+{
+    const auto offset = [&](uint32_t index) {
+        if (index <= replaced.location)
+            return index;
+        if (index < replaced.location + replaced.length)
+            return replaced.location + std::min(index - replaced.location, replacementLength);
+        return index - replaced.length + replacementLength;
+    };
+    for (auto &span : spans) {
+        const uint32_t start = offset(span.range.location);
+        span.range = {start, offset(span.range.location + span.range.length) - start};
+    }
+    std::erase_if(spans, [](const OutputColorSpan &span) { return !span.range.length; });
 }
 
 static std::string_view TakeColorParameter(std::string_view &parameters, char separator)
@@ -328,6 +372,7 @@ std::string_view ReadRunRecords(RunRecords &reader, std::string_view bytes, size
         if (count > limit - reader.partial.size()) {
             reader.partial.clear();
             reader.dropping = true;
+            reader.discarded = true;
         }
 
         if (!reader.dropping) {
@@ -389,7 +434,7 @@ static bool TakeSeverity(std::string_view &text, OutputTone &tone, bool standard
     } else if (StartsWith(text, "error")) {
         tone = OutputTone::Error;
         text.remove_prefix(5);
-    } else if (standard && StartsWith(text, "fatal error")) {
+    } else if (StartsWith(text, "fatal error")) {
         tone = OutputTone::Error;
         text.remove_prefix(11);
     } else if (standard && StartsWith(text, "syntax error")) {
@@ -445,7 +490,8 @@ static bool ParsePositionLine(std::string_view line, CompilerFormat format, Comp
         SkipSpaces(path);
     }
 
-    char separator = format == CompilerFormat::DotNet ? '(' : ':';
+    const bool parenthesized = format == CompilerFormat::Parenthesized;
+    const char separator = parenthesized ? '(' : ':';
     for (size_t at = path.find(separator, 1); at != path.npos; at = path.find(separator, at + 1)) {
         CompilerLocation candidate{};
         candidate.path = path.substr(0, at);
@@ -455,17 +501,22 @@ static bool ParsePositionLine(std::string_view line, CompilerFormat format, Comp
         if (!TakeNumber(rest, candidate.line))
             continue;
 
-        if (format == CompilerFormat::DotNet) {
-            if (!Take(rest, ',') || !TakeNumber(rest, candidate.column))
-                continue;
-
+        if (parenthesized) {
             if (Take(rest, ',')) {
-                size_t unused;
-                if (!TakeNumber(rest, unused) || !Take(rest, ',') || !TakeNumber(rest, unused))
+                if (!TakeNumber(rest, candidate.column))
                     continue;
+
+                if (Take(rest, ',')) {
+                    size_t unused;
+                    if (!TakeNumber(rest, unused) || !Take(rest, ',') || !TakeNumber(rest, unused))
+                        continue;
+                }
             }
 
-            if (!Take(rest, ')') || !Take(rest, ':'))
+            if (!Take(rest, ')'))
+                continue;
+            SkipSpaces(rest);
+            if (!Take(rest, ':'))
                 continue;
 
             SkipSpaces(rest);
@@ -505,7 +556,7 @@ static bool ParsePositionLine(std::string_view line, CompilerFormat format, Comp
         }
 
         candidate.details = line.size() - rest.size();
-        if (format == CompilerFormat::Standard || format == CompilerFormat::DotNet) {
+        if (format == CompilerFormat::Standard || parenthesized) {
             if (!TakeSeverity(rest, candidate.tone, format == CompilerFormat::Standard))
                 continue;
         } else {
@@ -523,10 +574,50 @@ static bool ParsePositionLine(std::string_view line, CompilerFormat format, Comp
     return false;
 }
 
+static bool ParseLocationAtEnd(std::string_view line, CompilerLocation &location)
+{
+    size_t last = line.rfind(':');
+    if (last == line.npos)
+        return false;
+
+    auto number = line.substr(last + 1);
+    size_t row;
+    if (!TakeNumber(number, row) || !number.empty())
+        return false;
+
+    auto path = line.substr(0, last);
+    size_t middle = path.rfind(':');
+    if (middle != path.npos) {
+        auto earlier = path.substr(middle + 1);
+        size_t first;
+        if (TakeNumber(earlier, first) && earlier.empty()) {
+            location.column = row;
+            row = first;
+            path = path.substr(0, middle);
+        }
+    }
+
+    location.path = path;
+    location.line = row;
+    return row != 0;
+}
+
 bool ParseCompilerLocation(std::string_view text, CompilerFormat fallback, CompilerLocation &location)
 {
-    return ParsePositionLine(text, CompilerFormat::Standard, location) ||
-           (fallback != CompilerFormat::Standard && ParsePositionLine(text, fallback, location));
+    if (ParsePositionLine(text, CompilerFormat::Standard, location))
+        return true;
+    if (fallback == CompilerFormat::Rust) {
+        SkipSpaces(text);
+        if (!text.starts_with("--> ") && !text.starts_with("::: "))
+            return false;
+        text.remove_prefix(4);
+        if (text.ends_with('\n'))
+            text.remove_suffix(1);
+        if (text.ends_with('\r'))
+            text.remove_suffix(1);
+        return ParseLocationAtEnd(text, location);
+    }
+    return fallback != CompilerFormat::Standard && ParsePositionLine(text, fallback, location);
 }
 
 static std::string_view ReadLine(std::string_view &text)
@@ -648,33 +739,16 @@ bool ParseRuntimeLocation(std::string_view text, bool python, CompilerLocation &
         }
     }
 
-    size_t last = line.rfind(':');
-    if (last == line.npos)
+    CompilerLocation candidate{};
+    if (!ParseLocationAtEnd(line, candidate))
         return false;
-
-    auto number = line.substr(last + 1);
-    size_t row;
-    if (!TakeNumber(number, row) || !number.empty())
+    const auto path = candidate.path;
+    const bool drive = path.size() >= 3 && LowerASCII(path[0]) >= 'a' && LowerASCII(path[0]) <= 'z' &&
+        path[1] == ':' && (path[2] == '/' || path[2] == '\\');
+    if (!drive && !path.starts_with('/') && !path.starts_with("file://") && !path.starts_with("\\\\"))
         return false;
-
-    auto path = line.substr(0, last);
-    size_t middle = path.rfind(':');
-    if (middle != path.npos) {
-        auto earlier = path.substr(middle + 1);
-        size_t first;
-        if (TakeNumber(earlier, first) && earlier.empty()) {
-            location.column = row;
-            row = first;
-            path = path.substr(0, middle);
-        }
-    }
-
-    if (!path.starts_with('/') && !path.starts_with("file://"))
-        return false;
-
-    location.path = path;
-    location.line = row;
-    return row != 0;
+    location = candidate;
+    return true;
 }
 
 SyntaxIssue CheckJSONText(std::string_view text, bool comments)

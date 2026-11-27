@@ -1,5 +1,6 @@
 #import "Runner.h"
 #include "ChildProcess.hpp"
+#include "RunTools.hpp"
 #import "Preferences.h"
 #import "Workspace.h"
 
@@ -350,47 +351,8 @@ struct RunTools {
 
 static RunTools ToolsForRun(Language language)
 {
-    switch (language) {
-    case Language::C: return {@"clang", @".c", @"clang"};
-    case Language::Cpp: return {@"clang++", @".cpp", @"clang++"};
-    case Language::Python: return {@"python3", @".py", @"python3"};
-    case Language::Rust: return {@"rustc", @".rs"};
-    case Language::JavaScript: return {@"node", @".js", @"node"};
-    case Language::TypeScript: return {@"node", @".ts"};
-    case Language::JSX: return {@"tsx", @".jsx"};
-    case Language::TSX: return {@"tsx", @".tsx"};
-    case Language::ObjectiveC: return {@"clang", @".m", @"clang"};
-    case Language::ObjectiveCpp: return {@"clang++", @".mm", @"clang++"};
-    case Language::CSharp: return {@"dotnet", @".cs"};
-    case Language::Java: return {@"java", @".java"};
-    case Language::Kotlin: return {@"kotlinc", @".kt"};
-    case Language::Swift: return {@"swiftc", @".swift", @"swiftc"};
-    case Language::Go: return {@"go", @".go", @"gofmt"};
-    case Language::Zig: return {@"zig", @".zig", @"zig"};
-    case Language::Dart: return {@"dart", @".dart"};
-    case Language::Ruby: return {@"ruby", @".rb", @"ruby"};
-    case Language::PHP: return {@"php", @".php", @"php"};
-    case Language::Perl: return {@"perl", @".pl"};
-    case Language::Lua: return {@"lua", @".lua", @"luac"};
-    case Language::Luau: return {@"luau", @".luau"};
-    case Language::Bash: return {@"bash", @".sh", @"bash"};
-    case Language::Zsh: return {@"zsh", @".zsh", @"zsh"};
-    case Language::Fish: return {@"fish", @".fish", @"fish"};
-    case Language::PowerShell: return {@"pwsh", @".ps1"};
-    case Language::R: return {@"Rscript", @".R"};
-    case Language::Julia: return {@"julia", @".jl"};
-    case Language::Scala: return {@"scala", @".scala"};
-    case Language::Groovy: return {@"groovy", @".groovy"};
-    case Language::Haskell: return {@"runghc", @".hs"};
-    case Language::FSharp: return {@"dotnet", @".fsx"};
-    case Language::Elixir: return {@"elixir", @".exs"};
-    case Language::Clojure: return {@"clojure", @".clj"};
-    case Language::VisualBasic: return {@"dotnet", nil};
-    case Language::Assembly: return {@"clang", @".s"};
-    case Language::Odin: return {@"odin", @".odin", @"odin"};
-    case Language::CommonLisp: return {@"sbcl", @".lisp"};
-    default: return {};
-    }
+    const auto tool = ToolForRun(language);
+    return {tool.tool ? @(tool.tool) : nil, tool.suffix ? @(tool.suffix) : nil, tool.check ? @(tool.check) : nil};
 }
 
 static NSString *ToolName(Language language)
@@ -674,20 +636,8 @@ static RunMessage DecodeConsoleString(NSString *source)
 
 static void ReplaceOutputText(RunMessage &message, NSRange range, NSString *replacement)
 {
-    NSUInteger replacementLength = replacement.length;
-    NSUInteger end = NSMaxRange(range);
-    auto offset = [&](NSUInteger index) {
-        if (index <= range.location)
-            return index;
-        if (index < end)
-            return range.location + std::min(index - range.location, replacementLength);
-        return index - range.length + replacementLength;
-    };
-    for (auto &span : message.colorSpans) {
-        NSUInteger start = offset(span.range.location);
-        span.range = {uint32_t(start), uint32_t(offset(span.range.location + span.range.length) - start)};
-    }
-    std::erase_if(message.colorSpans, [](const OutputColorSpan &span) { return !span.range.length; });
+    ShiftOutputColors(message.colorSpans, {uint32_t(range.location), uint32_t(range.length)},
+                      uint32_t(replacement.length));
     message.text = [message.text stringByReplacingCharactersInRange:range withString:replacement];
 }
 
@@ -715,7 +665,7 @@ static RunMessage CompilerMessage(RunMessage message, std::string_view text, con
     if (context.language == Language::Go)
         format = CompilerFormat::Go;
     else if (context.language == Language::CSharp || context.language == Language::FSharp || context.language == Language::VisualBasic)
-        format = CompilerFormat::DotNet;
+        format = CompilerFormat::Parenthesized;
     else if (context.language == Language::Kotlin)
         format = CompilerFormat::Kotlin;
 
@@ -2004,17 +1954,14 @@ static void RunDotNetProject(RunProject project, Language language, NSURL *file,
 
 static NSArray<NSString *> *ScriptArguments(Language language, NSString *path)
 {
-    switch (language) {
-        case Language::Python: return @[@"-B", @"-u", path];
-        case Language::Zig: case Language::Dart: return @[@"run", path];
-        case Language::Kotlin: return @[@"-script", path];
-        case Language::FSharp: return @[@"fsi", @"--exec", path];
-        case Language::PowerShell: return @[@"-NoLogo", @"-NoProfile", @"-File", path];
-        case Language::R: return @[@"--no-save", @"--no-restore", path];
-        case Language::Clojure: return @[@"-M", path];
-        case Language::CommonLisp: return @[@"--script", path];
-        default: return @[path];
-    }
+    auto flags = ScriptRunFlags(language);
+    if (!flags.count)
+        return @[path];
+    NSString *arguments[4];
+    for (unsigned i = 0; i < flags.count; ++i)
+        arguments[i] = @(flags.values[i]);
+    arguments[flags.count] = path;
+    return [NSArray arrayWithObjects:arguments count:flags.count + 1];
 }
 
 static NSArray<NSString *> *NativeSourceArguments(Language language, NSString *path, NSString *program,

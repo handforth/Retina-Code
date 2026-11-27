@@ -11,7 +11,10 @@
 #import "SessionState.h"
 #import "Typing.h"
 #import "VimView.h"
+#include "Comments.hpp"
+#include "Completion.hpp"
 #include "Lexer.hpp"
+#include "PopupColors.h"
 #include "Themes.h"
 
 #import <CoreText/CoreText.h>
@@ -928,40 +931,22 @@ static NSRange LineContents(NSString *text, NSUInteger start)
 - (size_t)completionWords:(std::u16string_view)prefix language:(Language)language results:(std::span<std::u16string_view>)results
 {
     [self finishHighlighting];
-    const auto &words = CompletionWords(language);
-    auto keyword = std::upper_bound(words.begin(), words.end(), prefix);
-    auto name = _names.upper_bound(prefix);
+    std::array<std::u16string_view, WordCompletionLimit> names;
     size_t count = 0;
-    while (count < results.size()) {
-        bool hasKeyword = keyword != words.end() && keyword->starts_with(prefix);
-        bool hasName = name != _names.end() && name->first.starts_with(prefix);
-        if (!hasKeyword && !hasName)
+    for (auto name = _names.upper_bound(prefix); name != _names.end() && count < names.size(); ++name) {
+        if (!name->first.starts_with(prefix))
             break;
-        std::u16string_view word = hasKeyword && (!hasName || *keyword <= name->first) ?
-                                   *keyword : std::u16string_view(name->first);
-        results[count++] = word;
-        if (hasKeyword && *keyword == word)
-            ++keyword;
-        if (hasName && name->first == word)
-            ++name;
+        names[count++] = name->first;
     }
-    return count;
+    return MergeCompletionWords(prefix, language, std::span(names).first(count), results);
 }
 
 - (const std::vector<TypedPair> &)typedPairs { return _typedPairs; }
 
 - (void)didType:(const TypingEdit &)edit
 {
-    if (edit.passedCloser != NSNotFound) {
-        std::erase_if(_typedPairs, [&](const TypedPair &pair) {
-            return edit.passedCloser == NSMaxRange(pair.closing) - 1;
-        });
-    }
-    if (edit.pair && NSMaxRange(edit.pair->closing) <= _storage.length) {
-        if (_typedPairs.size() >= 512)
-            _typedPairs.erase(_typedPairs.begin());
-        _typedPairs.push_back(*edit.pair);
-    }
+    RememberTypedPair(_typedPairs, edit.pair, edit.passedCloser == NSNotFound ? typingNotFound : edit.passedCloser,
+                      _storage.length);
 }
 
 - (void)didTypeInBatch:(const std::vector<TypingEdit> &)edits
@@ -976,11 +961,11 @@ static NSRange LineContents(NSString *text, NSUInteger start)
     std::sort(passed.begin(), passed.end());
     if (!passed.empty()) {
         std::erase_if(_typedPairs, [&](const TypedPair &pair) {
-            return std::binary_search(passed.begin(), passed.end(), NSMaxRange(pair.closing) - 1);
+            return std::binary_search(passed.begin(), passed.end(), pair.closing.end() - 1);
         });
     }
     for (const auto &edit : edits) {
-        if (edit.pair && NSMaxRange(edit.pair->closing) <= _storage.length)
+        if (edit.pair && edit.pair->closing.end() <= _storage.length)
             _typedPairs.push_back(*edit.pair);
     }
     constexpr NSUInteger maxBatchPairs = 20000;
@@ -999,8 +984,7 @@ static NSRange LineContents(NSString *text, NSUInteger start)
     if (_language != Language::Plain && _theme->ink[size_t(ink)] != _theme->ink[size_t(Ink::Text)])
         style[NSForegroundColorAttributeName] = _colors[size_t(ink)];
     if (nonCode) {
-        Ink role = ink == Ink::Comment || ink == Ink::Escape ? ink : Ink::String;
-        style[EditorNonCodeAttribute] = @(NSInteger(role));
+        style[EditorNonCodeAttribute] = @(NSInteger(TypingRole(ink)));
     }
     if (_language != Language::Plain && _italicFont &&
         ((ink == Ink::Type && _theme->italicTypes) || (ink == Ink::Comment && _theme->italicComments)))
@@ -1169,11 +1153,7 @@ static NSRange LineContents(NSString *text, NSUInteger start)
             for (const Token &token : tokens) {
                 size_t ink = size_t(token.ink);
                 NSRange range = NSMakeRange(offset + token.start, token.length);
-                bool nameToken = updateIndex &&
-                    (token.ink == Ink::Text || token.ink == Ink::Name || token.ink == Ink::Type ||
-                     token.ink == Ink::Function || token.ink == Ink::Constant ||
-                     (plain && (token.ink == Ink::Keyword || token.ink == Ink::Control)));
-                if (nameToken && !token.nonCode && token.length > 1 && line[token.start] != u'\'') {
+                if (updateIndex && IsCompletionName(line, token, plain)) {
                     std::u16string_view word = std::u16string_view(line).substr(token.start, token.length);
                     auto name = _names.lower_bound(word);
                     if (name == _names.end() || name->first != word)
@@ -1181,7 +1161,7 @@ static NSRange LineContents(NSString *text, NSUInteger start)
                     ++name->second;
                     names.push_back(name);
                 }
-                bool nonCode = token.nonCode || token.ink == Ink::Comment || token.ink == Ink::String || token.ink == Ink::Escape;
+                bool nonCode = IsNonCodeToken(token);
                 auto &style = _tokenStyles[ink * 2 + nonCode];
                 if (!style)
                     style = [self tokenStyle:token.ink nonCode:nonCode];
@@ -1856,7 +1836,7 @@ static bool IsHideableUnusedWarning(SyntaxBuffer *buffer, NSUInteger offset, NSS
 
 static constexpr CGFloat completionInset = 2;
 static constexpr CGFloat completionKindWidth = 19;
-static constexpr NSUInteger completionLimit = 8;
+static constexpr NSUInteger completionLimit = WordCompletionLimit;
 static constexpr size_t completionCacheLimit = 256;
 
 enum class CompletionKind { Word, Function, Type, Variable, Field, Module, Keyword, Value };
@@ -2607,27 +2587,18 @@ NSArray<NSMenuItem *> *LanguageFeatureCommands()
 - (NSUInteger)vimOffsetAtLine:(NSUInteger)line { return [self.syntax offsetForLine:line]; }
 - (BOOL)vimStructuralCharacterAtOffset:(NSUInteger)offset { return [self.syntax codeAtOffset:offset]; }
 
-- (Vim::Comments)commentsAtOffset:(NSUInteger)offset
+- (CommentSyntax)commentsAtOffset:(NSUInteger)offset
 {
-    Language language = self.syntax.language;
-    if (language == Language::HTML || language == Language::Markdown || language == Language::PHP ||
-        language == Language::JSX || language == Language::TSX) {
-        LexState context = [self.syntax contextAtOffset:offset];
-        language = LanguageInContext(language, context);
-        if (context.mode == LexMode::MarkupText) {
-            if (language == Language::JSX || language == Language::TSX)
-                return {{}, u"{/*", u"*/}"};
-            if (language == Language::PHP)
-                language = Language::HTML;
-        }
-    }
-    const auto &style = InfoForLanguage(language).comments;
-    return {style.line, style.open, style.close};
+    const Language language = self.syntax.language;
+    if (CommentContextDependsOnLexer(language))
+        return CommentsInContext(language, [self.syntax contextAtOffset:offset]);
+    return InfoForLanguage(language).comments;
 }
 
 - (Vim::Comments)vimComments
 {
-    return [self commentsAtOffset:std::min(self.selectedRange.location, self.string.length)];
+    const auto comments = [self commentsAtOffset:std::min(self.selectedRange.location, self.string.length)];
+    return {comments.line, comments.open, comments.close};
 }
 
 - (BOOL)canToggleLineComment
@@ -2652,13 +2623,8 @@ NSArray<NSMenuItem *> *LanguageFeatureCommands()
     if (edits.empty())
         return;
     [self dismissCompletion];
-    auto advance = [](Vim::Text inserted) {
-        // Keep the selection with the code and put an empty block caret between its markers.
-        auto space = inserted.find(u' ');
-        return space == 0 || space == Vim::Text::npos ? Vim::Offset(0) : space + 1;
-    };
     [self applyDocumentEdits:Vim::EditBatch(std::move(edits)) undoName:@"Toggle Line Comment"
-                    options:{.insertionAdvance = advance}];
+                    options:{.insertionAdvance = CommentInsertionAdvance}];
 }
 
 - (BOOL)validateMenuItem:(NSMenuItem *)item
@@ -3099,9 +3065,9 @@ static bool IdentifierAt(NSString *text, NSUInteger offset)
         edit.range.length = nameEnd - edit.range.location;
         if (call != NSNotFound)
             edit.text.resize(call);
-        NSUInteger closing = takesArguments ? NSNotFound :
+        NSUInteger closing = takesArguments ? typingNotFound :
             BracketsAtSelection(self.textStorage, NSMakeRange(opening, 1), false).mate;
-        edit.existingCaret = closing == NSNotFound ? opening + 1 : closing + 1;
+        edit.existingCaret = closing == typingNotFound ? opening + 1 : closing + 1;
         return;
     }
     if (typeEnd != afterName)
@@ -3153,7 +3119,7 @@ static bool IdentifierAt(NSString *text, NSUInteger offset)
         if (edit.newPair != NSNotFound) {
             NSUInteger opening = start + edit.newPair;
             TypingEdit pair{};
-            pair.pair = TypedPair{NSMakeRange(opening, 1), NSMakeRange(opening + 1, 1)};
+            pair.pair = TypedPair{{opening, 1}, {opening + 1, 1}};
             [self.syntax didType:pair];
         }
         return YES;
@@ -4784,7 +4750,7 @@ static bool PointBetweenHoverRects(NSPoint point, NSRect source, NSRect popup)
 
 - (NSRect)visibleBracketRect:(NSUInteger)position
 {
-    if (position == NSNotFound || position >= self.string.length)
+    if (position >= self.string.length)
         return NSZeroRect;
     NSLayoutManager *layout = self.layoutManager;
     NSPoint origin = self.textContainerOrigin;
@@ -4824,7 +4790,7 @@ static bool PointBetweenHoverRects(NSPoint point, NSRect source, NSRect popup)
     [self invalidateBrackets:match];
     [_bracketTimer invalidate];
     _bracketTimer = nil;
-    if (match.mate == NSNotFound)
+    if (match.mate == typingNotFound)
         return;
     _bracketFlashStart = NSProcessInfo.processInfo.systemUptime;
     __weak CodeView *view = self;
@@ -4845,7 +4811,7 @@ static bool PointBetweenHoverRects(NSPoint point, NSRect source, NSRect popup)
 
 - (void)drawBracketMatch:(NSRect)dirty flash:(BOOL)flash
 {
-    if (_brackets.mate == NSNotFound)
+    if (_brackets.mate == typingNotFound)
         return;
     const Theme &theme = *self.theme;
     if (flash) {

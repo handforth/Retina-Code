@@ -9,39 +9,11 @@ static NSAttributedStringKey const outputToneKey = @"RetinaCodeOutputTone";
 static NSAttributedStringKey const outputForegroundKey = @"RetinaCodeTerminalForeground";
 static NSAttributedStringKey const outputBackgroundKey = @"RetinaCodeTerminalBackground";
 
-static NSColor *TerminalColor(uint32_t color, BOOL dark)
-{
-    if (ColorAlpha(color) == 255)
-        return SRGBColor(color);
-    constexpr Col32 darkPalette[] = {
-        rgb(0, 0, 0), rgb(223, 74, 68), rgb(77, 184, 100), rgb(211, 173, 56),
-        rgb(88, 139, 228), rgb(188, 105, 215), rgb(71, 173, 181), rgb(204, 204, 204),
-        rgb(128, 128, 128), rgb(255, 85, 85), rgb(105, 222, 131), rgb(255, 217, 77),
-        rgb(123, 169, 255), rgb(229, 146, 255), rgb(113, 217, 223), rgb(255, 255, 255),
-    };
-    constexpr Col32 lightPalette[] = {
-        rgb(0, 0, 0), rgb(165, 26, 33), rgb(20, 99, 44), rgb(118, 86, 0),
-        rgb(35, 73, 151), rgb(128, 36, 141), rgb(19, 106, 115), rgb(102, 102, 102),
-        rgb(102, 102, 102), rgb(196, 37, 44), rgb(32, 123, 55), rgb(135, 97, 0),
-        rgb(49, 90, 192), rgb(150, 57, 164), rgb(18, 121, 133), rgb(255, 255, 255),
-    };
-    uint32_t index = color - outputPaletteStart;
-    if (index < 16)
-        return SRGBColor((dark ? darkPalette : lightPalette)[index]);
-    if (index < 232) {
-        constexpr uint32_t levels[] = {0, 95, 135, 175, 215, 255};
-        index -= 16;
-        return SRGBColor(rgb(levels[index / 36], levels[index / 6 % 6], levels[index % 6]));
-    }
-    uint32_t gray = 8 + (index - 232) * 10;
-    return SRGBColor(rgb(gray, gray, gray));
-}
-
 static void SetTerminalColor(NSTextStorage *storage, NSRange range, uint32_t color, BOOL dark,
                              NSAttributedStringKey codeKey, NSAttributedStringKey colorKey)
 {
     if (color != defaultOutputColor)
-        [storage addAttributes:@{codeKey:@(color), colorKey:TerminalColor(color, dark)} range:range];
+        [storage addAttributes:@{codeKey:@(color), colorKey:SRGBColor(RunTerminalColor(color, dark))} range:range];
 }
 
 static void RecolorTerminalText(NSTextStorage *storage, BOOL dark, NSAttributedStringKey codeKey,
@@ -51,7 +23,7 @@ static void RecolorTerminalText(NSTextStorage *storage, BOOL dark, NSAttributedS
                          options:NSAttributedStringEnumerationLongestEffectiveRangeNotRequired
                       usingBlock:^(NSNumber *color, NSRange range, BOOL *) {
         if (color)
-            [storage addAttribute:colorKey value:TerminalColor(color.unsignedIntValue, dark) range:range];
+            [storage addAttribute:colorKey value:SRGBColor(RunTerminalColor(color.unsignedIntValue, dark)) range:range];
     }];
 }
 
@@ -649,7 +621,7 @@ static bool OutputLineEnding(unichar character)
     NSRange selection = _text.selectedRange;
     [storage beginEditing];
     for (const auto &message : messages) {
-        NSUInteger tone = message.usesTerminalColors ? NSUInteger(OutputTone::Text) : NSUInteger(message.tone);
+        NSUInteger tone = NSUInteger(VisibleOutputTone(message.tone, message.usesTerminalColors));
         NSAttributedString *text = [[NSAttributedString alloc] initWithString:message.text
             attributes:@{NSFontAttributeName:_font, NSForegroundColorAttributeName:_colors[tone],
                          NSLigatureAttributeName:@0, outputToneKey:@(tone)}];

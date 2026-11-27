@@ -2,6 +2,7 @@
 #import "Chrome.h"
 #import "LanguageServer.h"
 #import "Rendering.h"
+#include "PopupColors.h"
 #include "Themes.h"
 
 #include <algorithm>

@@ -5,9 +5,6 @@
 
 #include "RunText.hpp"
 
-inline constexpr NSUInteger outputScrollbackCharacters = 192 * 1024;
-inline constexpr NSUInteger outputScrollbackLines = 3000;
-
 constexpr NSUInteger OutputScrollbackCharacterLimit(NSUInteger lines)
 {
     if (lines <= outputScrollbackLines)

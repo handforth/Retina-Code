@@ -23,7 +23,7 @@ xcrun --sdk macosx clang++ \
     -isysroot "$sdk" \
     -framework AppKit -framework CoreText -framework CoreGraphics -framework CoreServices \
     "$source_dir/main.mm" "$source_dir/Editor.mm" "$source_dir/Rendering.mm" "$source_dir/Lexer.cpp" "$source_dir/Languages.cpp" \
-    "$source_dir/VimView.mm" "$source_dir/Vim.cpp" "$source_dir/VimMulti.cpp" "$source_dir/Preferences.mm" "$source_dir/Typing.mm" \
+    "$source_dir/VimView.mm" "$source_dir/Vim.cpp" "$source_dir/VimMulti.cpp" "$source_dir/Preferences.mm" "$source_dir/Typing.mm" "$source_dir/Typing.cpp" \
     "$source_dir/Output.mm" "$source_dir/Runner.mm" "$source_dir/Chrome.mm" "$source_dir/Workspace.mm" \
     "$source_dir/FolderSearch.mm" "$source_dir/Starters.mm" "$source_dir/Debugger.mm" "$source_dir/DebugPane.mm" \
     "$source_dir/ChildProcess.cpp" "$source_dir/RunText.cpp" "$source_dir/DebugTransport.cpp" \
