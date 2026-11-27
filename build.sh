@@ -17,22 +17,19 @@ fi
 
 set -x
 mkdir -p "$macos" "$resources"
+
+# One translation unit: main_appkit.mm includes everything else.
 xcrun --sdk macosx clang++ \
     -std=c++20 -fobjc-arc -O2 -Wall -Wextra -Wpedantic \
     -arch arm64 -arch x86_64 -mmacosx-version-min=11.0 \
     -isysroot "$sdk" \
     -framework AppKit -framework CoreText -framework CoreGraphics -framework CoreServices \
-    "$source_dir/main.mm" "$source_dir/Editor.mm" "$source_dir/Rendering.mm" "$source_dir/Lexer.cpp" "$source_dir/Languages.cpp" \
-    "$source_dir/VimView.mm" "$source_dir/Vim.cpp" "$source_dir/VimMulti.cpp" "$source_dir/Preferences.mm" "$source_dir/Typing.mm" "$source_dir/Typing.cpp" \
-    "$source_dir/Output.mm" "$source_dir/Runner.mm" "$source_dir/Chrome.mm" "$source_dir/Workspace.mm" \
-    "$source_dir/FolderSearch.mm" "$source_dir/Starters.mm" "$source_dir/Debugger.mm" "$source_dir/DebugPane.mm" \
-    "$source_dir/ChildProcess.cpp" "$source_dir/RunText.cpp" "$source_dir/DebugTransport.cpp" \
-    "$source_dir/LanguageServerBridge.mm" "$source_dir/LanguageServer.cpp" "$source_dir/LanguageTools.cpp" \
-    "$source_dir/LSPProcess.cpp" "$source_dir/EditorHover.mm" \
+    "$source_dir/main_appkit.mm" \
     -o "$macos/Retina Code"
+
 cp "$project_dir/resources/Info.plist" "$app/Contents/Info.plist"
 cp "$project_dir/THEME_CREDITS.txt" "$resources/THEME_CREDITS.txt"
-cp "$source_dir/LispDebug.lisp" "$resources/LispDebug.lisp"
-cp "$source_dir/AliveLSP.ros" "$resources/AliveLSP.ros"
+cp "$source_dir/mac_appkit/LispDebug.lisp" "$resources/LispDebug.lisp"
+cp "$source_dir/mac_appkit/AliveLSP.ros" "$resources/AliveLSP.ros"
 codesign --force --sign - "$app"
 printf '%s\n' "$app"
