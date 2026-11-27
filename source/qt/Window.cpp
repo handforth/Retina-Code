@@ -22,6 +22,7 @@
 #include <QMessageBox>
 #include <QMimeData>
 #include <QPainter>
+#include <QPlainTextEdit>
 #include <QProxyStyle>
 #include <QPushButton>
 #include <QSaveFile>
@@ -34,7 +35,6 @@
 #include <QStyleOption>
 #include <QTabBar>
 #include <QTabWidget>
-#include <QTextEdit>
 #include <QTimer>
 #include <QUrl>
 #include <QVBoxLayout>
@@ -312,7 +312,6 @@ struct EditorWindow : QMainWindow {
     void tab_changed();
     void tab_close_requested(int index);
     void language_chosen(int row);
-    void run_link_clicked(const QUrl &link);
     void appearance_slider_moved();
     void appearance_reset();
     void save_appearance();
@@ -357,18 +356,24 @@ static QByteArray source_bytes(const TextView &view)
     return text.toUtf8();
 }
 
-static void update_status(EditorWindow &window)
+// The caret's line and column, which change with every move of the caret.
+static void update_position(EditorWindow &window)
 {
     TextView *view = active_view(window);
     if (!view) {
         window.position_label->clear();
-        window.encoding_label->clear();
         return;
     }
 
     uint32_t line = caret_line(*view);
     window.position_label->setText(QStringLiteral("Ln %1, Col %2").arg(line + 1).arg(view->caret - line_start(*view, line) + 1));
-    window.encoding_label->setText(QStringLiteral("UTF-8  ·  %1 px").arg(window.font_size));
+}
+
+// The caret's place, and the encoding and font size, which change only with the tab and the zoom.
+static void update_status(EditorWindow &window)
+{
+    update_position(window);
+    window.encoding_label->setText(active_view(window) ? QStringLiteral("UTF-8  ·  %1 px").arg(window.font_size) : QString());
 }
 
 // The picker shows the tab's language mode. While the tab detects its language, the first row, Auto Detect, names the
@@ -403,7 +408,7 @@ static void view_changed(void *context, TextView &view, uint32_t changes)
 {
     EditorWindow &window = *static_cast<EditorWindow *>(context);
     if (changes & VIEW_CARET_MOVED)
-        update_status(window);
+        update_position(window);
     if (changes & VIEW_MODIFIED_CHANGED)
         window.tabs->setTabText(window.tabs->indexOf(&view), tab_label(view));
     if ((changes & VIEW_LANGUAGE_CHANGED) && &view == active_view(window))
@@ -423,9 +428,15 @@ static TextView *add_tab(EditorWindow &window, const QString &name, const QStrin
     return view;
 }
 
+// Shows a tab and gives it focus. The tab can be in another window, which then comes to the front.
 static void select_tab(EditorWindow &window, TextView *view)
 {
-    window.tabs->setCurrentWidget(view);
+    EditorWindow *owner = static_cast<EditorWindow *>(view->window());
+    owner->tabs->setCurrentWidget(view);
+    if (owner != &window) {
+        owner->raise();
+        owner->activateWindow();
+    }
     view->setFocus();
 }
 
@@ -478,20 +489,27 @@ static QString resolved_path(const QFileInfo &info)
     return canonical.isEmpty() ? info.absoluteFilePath() : canonical;
 }
 
-// The tab that has a file. Qt can keep the caller's spelling of a path on a volume that ignores case, so paths that
-// differ only in case are the same file when the file system says so.
-static TextView *tab_for_path(const EditorWindow &window, const QString &path)
+// The tab that has a file, in this window or another, since two tabs on one file would save over each other. Qt can
+// keep the caller's spelling of a path on a volume that ignores case, so paths that differ only in case are the same
+// file when the file system says so.
+static TextView *tab_for_path(EditorWindow &window, const QString &path)
 {
-    for (int index = 0; index < window.tabs->count(); ++index) {
-        TextView *view = static_cast<TextView *>(window.tabs->widget(index));
-        if (view->file_path == path)
-            return view;
+    for (QWidget *widget : QApplication::topLevelWidgets()) {
+        EditorWindow *each = dynamic_cast<EditorWindow *>(widget);
+        if (!each || (each != &window && !each->isVisible()))
+            continue;
 
-        if (view->file_path.compare(path, Qt::CaseInsensitive) == 0) {
-            std::error_code failure;
-            if (std::filesystem::equivalent(QFileInfo(path).filesystemAbsoluteFilePath(),
-                                            QFileInfo(view->file_path).filesystemAbsoluteFilePath(), failure))
+        for (int index = 0; index < each->tabs->count(); ++index) {
+            TextView *view = static_cast<TextView *>(each->tabs->widget(index));
+            if (view->file_path == path)
                 return view;
+
+            if (view->file_path.compare(path, Qt::CaseInsensitive) == 0) {
+                std::error_code failure;
+                if (std::filesystem::equivalent(QFileInfo(path).filesystemAbsoluteFilePath(),
+                                                QFileInfo(view->file_path).filesystemAbsoluteFilePath(), failure))
+                    return view;
+            }
         }
     }
 
@@ -607,19 +625,13 @@ static bool save_tab(EditorWindow &window, TextView *view, bool choose_path)
             return false;
     }
 
-    // Two tabs can't have one file, in this window or another.
     QFileInfo info(path);
     QString destination = resolved_path(info);
-    if (choose_path) {
-        for (QWidget *widget : QApplication::topLevelWidgets()) {
-            EditorWindow *other_window = dynamic_cast<EditorWindow *>(widget);
-            TextView *other = other_window && other_window->isVisible() ? tab_for_path(*other_window, destination) : nullptr;
-            if (other && other != view) {
-                show_warning(window, QStringLiteral("Could Not Save"),
-                             QStringLiteral("%1 — This file is open in another tab.").arg(QDir::toNativeSeparators(path)), QString());
-                return false;
-            }
-        }
+    TextView *other = choose_path ? tab_for_path(window, destination) : nullptr;
+    if (other && other != view) {
+        show_warning(window, QStringLiteral("Could Not Save"),
+                     QStringLiteral("%1 — This file is open in another tab.").arg(QDir::toNativeSeparators(path)), QString());
+        return false;
     }
 
     QString error = write_file(*view, destination);
@@ -905,13 +917,69 @@ static void update_memory(EditorWindow &window)
 // Running.
 //
 
+// A link in the run's output: "retina-source:current#line:column:encoding" for the file that ran, or a file URL with
+// the same fragment for another file. Columns count characters (0), UTF-8 bytes (1), or UTF-16 units (2).
+static void show_run_location(void *context, const QUrl &link)
+{
+    EditorWindow &window = *static_cast<EditorWindow *>(context);
+    QStringList coordinates = link.fragment().split(u':');
+    if (coordinates.size() != 3)
+        return;
+    int row = coordinates[0].toInt();
+    int column = coordinates[1].toInt();
+    int encoding = coordinates[2].toInt();
+    if (row < 1 || column < 0)
+        return;
+
+    // The file that ran is its tab, or the file again if the tab closed.
+    bool ran = link.scheme() == QLatin1StringView("retina-source");
+    TextView *view = ran ? window.run_view : nullptr;
+    if (!view) {
+        QString path = ran ? window.run_path : link.toLocalFile();
+        if (path.isEmpty())
+            return;
+
+        QString error;
+        view = open_file(window, path, error);
+        if (!view) {
+            show_warning(window, QStringLiteral("Open Diagnostic"), error, QString());
+            return;
+        }
+    }
+
+    // The column as an offset in the line's UTF-16 units.
+    uint32_t line = uint32_t(std::min(row, int(line_count(*view))) - 1);
+    std::u16string_view text = line_text(view->text, line);
+    int remaining = std::max(0, column - 1);
+    int offset = 0;
+    if (encoding == 2) {
+        offset = std::min(remaining, int(text.size()));
+    } else {
+        while (remaining && offset < int(text.size())) {
+            char16_t unit = text[size_t(offset)];
+            bool pair = QChar::isHighSurrogate(unit) && size_t(offset) + 1 < text.size() && QChar::isLowSurrogate(text[size_t(offset) + 1]);
+            int width = encoding != 1 || unit < 0x80 ? 1 : unit < 0x800 ? 2 : pair ? 4 : 3;
+            if (remaining < width)
+                break;
+            remaining -= width;
+            offset += pair ? 2 : 1;
+        }
+    }
+
+    select_tab(window, view);
+    uint32_t position = line_start(*view, line) + uint32_t(offset);
+    set_selection(*view, position, position);
+    center_caret(*view);
+}
+
 static void show_output(EditorWindow &window)
 {
     if (!window.run_pane) {
         window.run_pane = new RunPane(&window);
         window.addDockWidget(Qt::BottomDockWidgetArea, window.run_pane);
         window.resizeDocks({window.run_pane}, {170}, Qt::Vertical);
-        QObject::connect(&window.run_pane->output, &QTextBrowser::anchorClicked, &window, &EditorWindow::run_link_clicked);
+        window.run_pane->link_clicked = show_run_location;
+        window.run_pane->link_context = &window;
     }
 
     window.run_pane->show();
@@ -1089,7 +1157,7 @@ static void new_window(EditorWindow &opener)
 // The Edit menu acts on the output pane, with its own functions, while the pane has focus.
 static void run_edit_menu_command(EditorWindow &window, EditCommand command)
 {
-    QTextEdit *output = qobject_cast<QTextEdit *>(window.focusWidget());
+    QPlainTextEdit *output = qobject_cast<QPlainTextEdit *>(window.focusWidget());
     if (!output) {
         if (active_view(window))
             run_edit_command(*active_view(window), command);
@@ -1170,60 +1238,6 @@ void EditorWindow::language_chosen(int row)
     set_language_mode(*view, Language(language_picker->itemData(row).toInt()));
     update_language_picker(*this);
     view->setFocus();
-}
-
-// A link in the run's output: "retina-source:current#line:column:encoding" for the file that ran, or a file URL with
-// the same fragment for another file. Columns count characters (0), UTF-8 bytes (1), or UTF-16 units (2).
-void EditorWindow::run_link_clicked(const QUrl &link)
-{
-    QStringList coordinates = link.fragment().split(u':');
-    if (coordinates.size() != 3)
-        return;
-    int row = coordinates[0].toInt();
-    int column = coordinates[1].toInt();
-    int encoding = coordinates[2].toInt();
-    if (row < 1 || column < 0)
-        return;
-
-    // The file that ran is its tab, or the file again if the tab closed.
-    bool ran = link.scheme() == QLatin1StringView("retina-source");
-    TextView *view = ran ? run_view : nullptr;
-    if (!view) {
-        QString path = ran ? run_path : link.toLocalFile();
-        if (path.isEmpty())
-            return;
-
-        QString error;
-        view = open_file(*this, path, error);
-        if (!view) {
-            show_warning(*this, QStringLiteral("Open Diagnostic"), error, QString());
-            return;
-        }
-    }
-
-    // The column as an offset in the line's UTF-16 units.
-    uint32_t line = uint32_t(std::min(row, int(line_count(*view))) - 1);
-    std::u16string_view text = line_text(view->text, line);
-    int remaining = std::max(0, column - 1);
-    int offset = 0;
-    if (encoding == 2) {
-        offset = std::min(remaining, int(text.size()));
-    } else {
-        while (remaining && offset < int(text.size())) {
-            char16_t unit = text[size_t(offset)];
-            bool pair = QChar::isHighSurrogate(unit) && size_t(offset) + 1 < text.size() && QChar::isLowSurrogate(text[size_t(offset) + 1]);
-            int width = encoding != 1 || unit < 0x80 ? 1 : unit < 0x800 ? 2 : pair ? 4 : 3;
-            if (remaining < width)
-                break;
-            remaining -= width;
-            offset += pair ? 2 : 1;
-        }
-    }
-
-    select_tab(*this, view);
-    uint32_t position = line_start(*view, line) + uint32_t(offset);
-    set_selection(*view, position, position);
-    center_caret(*view);
 }
 
 // A slider moved: the appearance takes every slider's value, and the tab shows it a moment later, so dragging doesn't

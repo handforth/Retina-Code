@@ -9,6 +9,8 @@
 #include <QInputMethodEvent>
 #include <QKeyEvent>
 #include <QMimeData>
+#include <QMouseEvent>
+#include <QPlainTextEdit>
 #include <QProcess>
 #include <QScrollBar>
 #include <QStandardPaths>
@@ -16,7 +18,7 @@
 #include <QTemporaryDir>
 #include <QTemporaryFile>
 #include <QTextBlock>
-#include <QTextBrowser>
+#include <QUrl>
 
 #include <algorithm>
 #include <limits>
@@ -34,6 +36,12 @@
 #include "../RunText.hpp"
 #include "../RunTools.hpp"
 
+#ifdef Q_OS_WIN
+static const bool ON_WINDOWS = true;
+#else
+static const bool ON_WINDOWS = false;
+#endif
+
 static const size_t RUN_LINE_LIMIT = 64 * 1024;    // output lines longer than this are left out
 static const int RUN_INPUT_LIMIT = 16 * 1024;      // the most that can be typed for the program before Return
 #ifdef Q_OS_MAC
@@ -42,8 +50,8 @@ static const Qt::KeyboardModifier END_OF_INPUT_MODIFIER = Qt::MetaModifier;    /
 static const Qt::KeyboardModifier END_OF_INPUT_MODIFIER = Qt::ControlModifier;
 #endif
 
-// What the process running now does. On Windows, a C or C++ run first finds a compiler, a process per step: vswhere
-// finds Visual Studio, vcvars64.bat gives MSVC's environment, and a probe checks that clang on PATH builds with it.
+// What the process running now does. On Windows, a C or C++ run first finds a compiler, a process per step: clang on
+// PATH builds a probe, and when it can't, vswhere finds Visual Studio and vcvars64.bat gives MSVC's environment.
 enum RunStage { RUN_IDLE, RUN_BUILD, RUN_PROGRAM, RUN_FIND_MSVC, RUN_LOAD_MSVC, RUN_PROBE_CLANG };
 
 // A stream of output: the line it has so far, and the terminal colors it set.
@@ -54,13 +62,16 @@ struct RunStream {
 
 struct RunPane;
 
-// The output, which takes typing after the program's output while the program can read it.
-struct RunOutput : QTextBrowser {
+// The output, which takes typing after the program's output while the program can read it. It's a QPlainTextEdit, so
+// it lays out only the lines it shows.
+struct RunOutput : QPlainTextEdit {
     RunPane *pane = nullptr;
 
     void keyPressEvent(QKeyEvent *event) override;
     void inputMethodEvent(QInputMethodEvent *event) override;
     void insertFromMimeData(const QMimeData *source) override;
+    void mouseMoveEvent(QMouseEvent *event) override;
+    void mouseReleaseEvent(QMouseEvent *event) override;
     void update_input();
 };
 
@@ -86,6 +97,10 @@ struct RunPane : QDockWidget {
 #ifdef Q_OS_WIN
     void *job = nullptr;
 #endif
+
+    // Who hears about a click on a link in the output: the window, which shows the place it names.
+    void (*link_clicked)(void *context, const QUrl &link) = nullptr;
+    void *link_context = nullptr;
 
     explicit RunPane(QWidget *parent);
     ~RunPane() override;
@@ -117,16 +132,10 @@ static QString tool_path(QStringView name, QString *extra_path)
         return program;
 
     bool rust = name == u"rustc";
-#ifdef Q_OS_WIN
-    if (!rust)
+    if (ON_WINDOWS && !rust)
         return QString();
-    QString home = QDir::fromNativeSeparators(qEnvironmentVariable("USERPROFILE"));
-    if (!QDir::isAbsolutePath(home))
-        home = QDir::homePath();
-#else
-    QString home = QDir::homePath();
-#endif
 
+    QString home = QDir::homePath();
     QStringList folders;
     if (rust) {
         QString cargo = QDir::fromNativeSeparators(qEnvironmentVariable("CARGO_HOME"));
@@ -727,9 +736,9 @@ static void build_c_family(RunPane &pane, const QString &program)
 }
 
 #ifdef Q_OS_WIN
-// Finds the C or C++ compiler, then builds with it. The first run of each looks for MSVC, in the environment the app
-// started with or with vswhere and vcvars64.bat, and tries clang on PATH with MSVC's headers and libraries. Each of
-// those steps is a process, and this runs again when it ends.
+// Finds the C or C++ compiler, then builds with it. The first run of each tries clang on PATH, which finds Visual
+// Studio's headers and libraries itself, and looks for MSVC's cl only when clang can't build: in the environment the
+// app started with, or with vswhere and vcvars64.bat. Each step is a process, and this runs again when it ends.
 static void find_windows_compiler(RunPane &pane, bool step_worked)
 {
     bool cpp = pane.language == Language::Cpp;
@@ -747,6 +756,12 @@ static void find_windows_compiler(RunPane &pane, bool step_worked)
             return;
         }
 
+        if (pane.stage == RUN_PROBE_CLANG && step_worked &&
+            QFileInfo(QDir(pane.temporary->path()).filePath(QStringLiteral("probe.exe"))).isFile()) {
+            compiler.program = pane.process.program();
+            compiler.msvc = false;
+        }
+
         // vswhere names vcvars64.bat, and "set" after it prints MSVC's environment, in UTF-16 with /u so paths
         // outside the code page come through.
         if (pane.stage == RUN_FIND_MSVC && step_worked && msvc_compiler.program.isEmpty()) {
@@ -762,42 +777,34 @@ static void find_windows_compiler(RunPane &pane, bool step_worked)
         }
         if (pane.stage == RUN_LOAD_MSVC && step_worked && msvc_compiler.program.isEmpty())
             msvc_compiler = find_msvc(read_windows_environment(output));
-        if (pane.stage == RUN_PROBE_CLANG && step_worked && compiler.program.isEmpty() &&
-            QFileInfo(QDir(pane.temporary->path()).filePath(QStringLiteral("probe.exe"))).isFile()) {
-            compiler.program = pane.process.program();
-            compiler.environment = pane.process.processEnvironment();
-            compiler.msvc = false;
-        }
     }
 
-    // MSVC, the first time.
-    if (pane.stage == RUN_IDLE && compiler.program.isEmpty()) {
-        if (msvc_compiler.program.isEmpty() && !qEnvironmentVariableIsEmpty("INCLUDE") && !qEnvironmentVariableIsEmpty("LIB"))
+    // clang, the first time, when it's on PATH. A clang there can still be missing headers, a linker, or a runtime,
+    // so it builds a probe first.
+    QString clang = compiler.program.isEmpty() && pane.stage == RUN_IDLE ? tool_path(cpp ? u"clang++" : u"clang", nullptr) : QString();
+    if (!clang.isEmpty()) {
+        append_status(pane, QStringLiteral("Preparing C/C++ toolchain…"), OutputTone::Text);
+        QStringList arguments = {QStringLiteral("-x"), cpp ? QStringLiteral("c++") : QStringLiteral("c"),
+                                 cpp ? QStringLiteral("-std=c++20") : QStringLiteral("-std=c17"),
+                                 QStringLiteral("-"), QStringLiteral("-o"), QStringLiteral("probe.exe")};
+        launch(pane, clang, arguments, RUN_PROBE_CLANG, pane.temporary->path());
+        return;
+    }
+
+    // MSVC otherwise.
+    bool msvc_searched = pane.stage == RUN_FIND_MSVC || pane.stage == RUN_LOAD_MSVC;
+    if (compiler.program.isEmpty() && msvc_compiler.program.isEmpty() && !msvc_searched) {
+        if (!qEnvironmentVariableIsEmpty("INCLUDE") && !qEnvironmentVariableIsEmpty("LIB"))
             msvc_compiler = find_msvc(QProcessEnvironment::systemEnvironment());
         QString installer = qEnvironmentVariable("ProgramFiles(x86)");
         QString vswhere = QDir(installer).filePath(QStringLiteral("Microsoft Visual Studio/Installer/vswhere.exe"));
         if (msvc_compiler.program.isEmpty() && !installer.isEmpty() && QFileInfo(vswhere).isFile()) {
-            append_status(pane, QStringLiteral("Preparing C/C++ toolchain…"), OutputTone::Text);
+            if (pane.stage == RUN_IDLE)
+                append_status(pane, QStringLiteral("Preparing C/C++ toolchain…"), OutputTone::Text);
             QStringList arguments = {QStringLiteral("-latest"), QStringLiteral("-products"), QStringLiteral("*"), QStringLiteral("-requires"),
                                      QStringLiteral("Microsoft.VisualStudio.Component.VC.Tools.x86.x64"), QStringLiteral("-utf8"),
                                      QStringLiteral("-find"), QStringLiteral("VC\\Auxiliary\\Build\\vcvars64.bat")};
             launch(pane, vswhere, arguments, RUN_FIND_MSVC, QFileInfo(vswhere).absolutePath());
-            return;
-        }
-    }
-
-    // clang, when it's on PATH. A compiler there can still be missing its headers, linker, or runtime, so it builds a
-    // probe first.
-    if (compiler.program.isEmpty() && pane.stage != RUN_PROBE_CLANG) {
-        QString clang = tool_path(cpp ? u"clang++" : u"clang", nullptr);
-        if (!clang.isEmpty()) {
-            if (pane.stage == RUN_IDLE)
-                append_status(pane, QStringLiteral("Preparing C/C++ toolchain…"), OutputTone::Text);
-            pane.process.setProcessEnvironment(msvc_compiler.environment);
-            QStringList arguments = {QStringLiteral("-x"), cpp ? QStringLiteral("c++") : QStringLiteral("c"),
-                                     cpp ? QStringLiteral("-std=c++20") : QStringLiteral("-std=c17"),
-                                     QStringLiteral("-"), QStringLiteral("-o"), QStringLiteral("probe.exe")};
-            launch(pane, clang, arguments, RUN_PROBE_CLANG, pane.temporary->path());
             return;
         }
     }
@@ -840,41 +847,33 @@ static void run_file(RunPane &pane, Language language, const QString &file, cons
     bool kotlin_build = language == Language::Kotlin && extension != QStringLiteral("kts");
     bool build = is_c_family(language) || language == Language::Rust || language == Language::Go || language == Language::Swift ||
                  language == Language::Odin || language == Language::Assembly || kotlin_build;
-#ifdef Q_OS_WIN
-    bool find_compiler = language == Language::C || language == Language::Cpp;
-#else
-    bool find_compiler = false;
-#endif
+    bool find_compiler = ON_WINDOWS && (language == Language::C || language == Language::Cpp);
 
-    // The tool. On Windows, Python is the py launcher, or python, but not the Microsoft Store's stand-ins for them in
-    // WindowsApps, which open the Store.
+    // The tool. On Windows, Python is the py launcher or python, from the folders on PATH but WindowsApps, where the
+    // Microsoft Store puts stand-ins for them that open the Store. It writes UTF-8 only with -X utf8.
     QString tool = QString::fromLatin1(spec.tool);
     QString program;
     QString extra_path;
     QStringList arguments;
     if (language == Language::CSharp && extension == QStringLiteral("csx"))
         tool = QStringLiteral("csi");
-    else if (language == Language::TypeScript)
+    if (language == Language::TypeScript)
         program = tool_path(u"tsx", &extra_path);
-#ifdef Q_OS_WIN
-    if (language == Language::Python) {
-        program = tool_path(u"py", nullptr);
-        if (program.contains(QLatin1StringView("/Microsoft/WindowsApps/"), Qt::CaseInsensitive))
-            program.clear();
+    if (ON_WINDOWS && language == Language::Python) {
+        QStringList folders;
+        for (const QString &folder : qEnvironmentVariable("PATH").split(u';', Qt::SkipEmptyParts)) {
+            if (!QDir::fromNativeSeparators(folder).contains(QLatin1StringView("/Microsoft/WindowsApps"), Qt::CaseInsensitive))
+                folders.append(folder);
+        }
+        program = QStandardPaths::findExecutable(QStringLiteral("py"), folders);
         if (!program.isEmpty())
             arguments.append(QStringLiteral("-3"));
         else
-            program = tool_path(u"python", nullptr);
-    }
-#endif
-    if (program.isEmpty() && !find_compiler)
-        program = tool_path(tool, &extra_path);
-#ifdef Q_OS_WIN
-    if (language == Language::Python && program.contains(QLatin1StringView("/Microsoft/WindowsApps/"), Qt::CaseInsensitive))
-        program.clear();
-    if (language == Language::Python)
+            program = QStandardPaths::findExecutable(QStringLiteral("python"), folders);
         arguments.append({QStringLiteral("-X"), QStringLiteral("utf8")});
-#endif
+    } else if (program.isEmpty() && !find_compiler) {
+        program = tool_path(tool, &extra_path);
+    }
     if (program.isEmpty() && !find_compiler) {
         append_status(pane, QStringLiteral("%1 was not found. Install it or add it to PATH.").arg(tool), OutputTone::Error);
         return;
@@ -926,11 +925,7 @@ static void run_file(RunPane &pane, Language language, const QString &file, cons
         return;
     }
 
-#ifdef Q_OS_WIN
-    QString executable_name = kotlin_build ? QStringLiteral("program.jar") : QStringLiteral("program.exe");
-#else
-    QString executable_name = kotlin_build ? QStringLiteral("program.jar") : QStringLiteral("program");
-#endif
+    QString executable_name = kotlin_build ? QStringLiteral("program.jar") : ON_WINDOWS ? QStringLiteral("program.exe") : QStringLiteral("program");
     pane.executable = QDir(pane.temporary->path()).filePath(executable_name);
     if (is_c_family(language)) {
 #ifdef Q_OS_WIN
@@ -973,12 +968,11 @@ RunPane::RunPane(QWidget *parent) : QDockWidget(QStringLiteral("Output"), parent
     setWidget(&output);
 
     output.pane = this;
+    output.setReadOnly(true);
     output.setAcceptDrops(false);
-    output.setAcceptRichText(false);
-    output.setOpenLinks(false);
-    output.setOpenExternalLinks(false);
     output.setUndoRedoEnabled(false);
-    output.setLineWrapMode(QTextEdit::NoWrap);
+    output.setLineWrapMode(QPlainTextEdit::NoWrap);
+    output.viewport()->setMouseTracking(true);
     QFont font = QFontDatabase::systemFont(QFontDatabase::FixedFont);
 #ifdef Q_OS_WIN
     font.setFamily(QStringLiteral("Consolas"));
@@ -986,8 +980,8 @@ RunPane::RunPane(QWidget *parent) : QDockWidget(QStringLiteral("Output"), parent
 #endif
     font.setPixelSize(13);
     output.setFont(font);
-    QObject::connect(&output, &QTextEdit::cursorPositionChanged, &output, &RunOutput::update_input);
-    QObject::connect(&output, &QTextEdit::selectionChanged, &output, &RunOutput::update_input);
+    QObject::connect(&output, &QPlainTextEdit::cursorPositionChanged, &output, &RunOutput::update_input);
+    QObject::connect(&output, &QPlainTextEdit::selectionChanged, &output, &RunOutput::update_input);
 
 #ifdef Q_OS_UNIX
     QProcess::UnixProcessParameters parameters;
@@ -1116,17 +1110,14 @@ void RunPane::process_error(QProcess::ProcessError error)
     append_status(*this, process.errorString(), OutputTone::Error);
 }
 
-// The output is read-only except at the program's input. Making it editable drops the flag that lets links be
-// clicked, so it goes back on, and typing at the input's start takes no color from the output before it.
+// The output is read-only except at the program's input, and typing at the input's start takes no color from the
+// output before it.
 void RunOutput::update_input()
 {
     QTextCursor cursor = textCursor();
     bool read_only = pane->input_start.isNull() || cursor.selectionStart() < pane->input_start.position();
-    if (read_only != isReadOnly()) {
+    if (read_only != isReadOnly())
         setReadOnly(read_only);
-        if (!read_only)
-            setTextInteractionFlags(textInteractionFlags() | Qt::LinksAccessibleByMouse);
-    }
     if (!read_only && !cursor.hasSelection() && cursor.position() == pane->input_start.position())
         setCurrentCharFormat(QTextCharFormat());
 }
@@ -1148,7 +1139,7 @@ static bool input_fits(const RunOutput &output, int added, int removed)
 void RunOutput::keyPressEvent(QKeyEvent *event)
 {
     if (pane->input_start.isNull()) {
-        QTextBrowser::keyPressEvent(event);
+        QPlainTextEdit::keyPressEvent(event);
         return;
     }
 
@@ -1188,7 +1179,7 @@ void RunOutput::keyPressEvent(QKeyEvent *event)
             return;
         }
     }
-    QTextEdit::keyPressEvent(event);
+    QPlainTextEdit::keyPressEvent(event);
 }
 
 void RunOutput::inputMethodEvent(QInputMethodEvent *event)
@@ -1202,7 +1193,7 @@ void RunOutput::inputMethodEvent(QInputMethodEvent *event)
     int start = cursor.selectionStart() + event->replacementStart();
     if (start >= pane->input_start.position() && start + event->replacementLength() < document()->characterCount() - selection &&
         input_fits(*this, int(event->commitString().size()), selection + event->replacementLength()))
-        QTextEdit::inputMethodEvent(event);
+        QPlainTextEdit::inputMethodEvent(event);
 }
 
 void RunOutput::insertFromMimeData(const QMimeData *source)
@@ -1217,4 +1208,20 @@ void RunOutput::insertFromMimeData(const QMimeData *source)
         cursor.insertText(text, QTextCharFormat());
         setTextCursor(cursor);
     }
+}
+
+// Links show the pointing hand, and a click on one that selects nothing opens the place it names.
+void RunOutput::mouseMoveEvent(QMouseEvent *event)
+{
+    QPlainTextEdit::mouseMoveEvent(event);
+    bool link = !anchorAt(event->position().toPoint()).isEmpty();
+    viewport()->setCursor(link ? Qt::PointingHandCursor : Qt::IBeamCursor);
+}
+
+void RunOutput::mouseReleaseEvent(QMouseEvent *event)
+{
+    QPlainTextEdit::mouseReleaseEvent(event);
+    QString link = anchorAt(event->position().toPoint());
+    if (event->button() == Qt::LeftButton && !link.isEmpty() && !textCursor().hasSelection() && pane->link_clicked)
+        pane->link_clicked(pane->link_context, QUrl(link));
 }
