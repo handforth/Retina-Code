@@ -3034,7 +3034,7 @@ static bool IdentifierAt(NSString *text, NSUInteger offset)
     NSUInteger at = self.selectedRange.location;
     if (at && ![self.syntax codeAtOffset:at - 1])
         return;
-    if (language == Language::Rust ? [self.syntax contextAtOffset:at].names.rustImport :
+    if (language == Language::Rust ? [self.syntax contextAtOffset:at].names.rust_import :
         ImportStatementAt(source, at, language))
         return;
 
