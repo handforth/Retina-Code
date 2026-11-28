@@ -1,0 +1,43 @@
+# Builds both frontends on every push: Qt on Windows, macOS and Linux, and AppKit on macOS.
+# Qt is the same 6.12.1 the build scripts expect, from Qt's own packages through aqtinstall.
+name: Build
+
+on: push
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Qt
+        run: pipx run --spec aqtinstall aqt install-qt windows desktop 6.12.1 win64_msvc2022_64 --outputdir C:\Qt
+      - name: Find Visual Studio
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          "VCVARS=$vs\VC\Auxiliary\Build\vcvars64.bat" >> $env:GITHUB_ENV
+      - name: Build Qt
+        shell: cmd
+        env:
+          QT: C:\Qt\6.12.1\msvc2022_64
+        run: build.bat
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Qt
+        run: pipx run --spec aqtinstall aqt install-qt linux desktop 6.12.1 linux_gcc_64 --outputdir "$HOME/Qt"
+      - name: Build Qt
+        run: ./build_linux_qt.sh
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build AppKit
+        run: ./build.sh
+      - name: Install Qt
+        run: pipx run --spec aqtinstall aqt install-qt mac desktop 6.12.1 clang_64 --outputdir "$HOME/Qt"
+      - name: Build Qt
+        run: ./build_mac_qt.sh

@@ -1,8 +1,8 @@
 @echo off
 rem Builds the Qt frontend for Windows into build\RetinaCode.exe.
-rem Edit these two paths if Qt or Visual Studio is installed somewhere else.
-set QT=C:\Qt\6.12.1\msvc2022_64
-set VCVARS=C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat
+rem Edit these two paths if Qt or Visual Studio is installed somewhere else, or set them before running this.
+if not defined QT set QT=C:\Qt\6.12.1\msvc2022_64
+if not defined VCVARS set VCVARS=C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat
 
 setlocal
 cd /d "%~dp0"
