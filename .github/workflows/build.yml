@@ -15,19 +15,20 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       # aqtinstall doesn't read the per-compiler folders Qt uses on Windows yet, so this takes qtbase from Qt's
-      # server, which unpacks to C:\Qt\6.12.1\msvc2022_64.
+      # server and unpacks it under C:\Qt.
       - name: Install Qt
         run: |
           curl -fsSL -o qtbase.7z https://download.qt.io/online/qtsdkrepository/windows_x86/desktop/qt6_6121/qt6_6121_msvc2022_64/qt.qt6.6121.win64_msvc2022_64/6.12.1-0-202611180427qtbase-Windows-Windows_11_24H2-MSVC2022-Windows-Windows_11_24H2-X86_64.7z 2>&1 | tee -a log.txt
           7z x -y -o'C:\Qt' qtbase.7z 2>&1 | tail -n 5 | tee -a log.txt; exit ${PIPESTATUS[0]}
-      - name: Find Visual Studio
+      - name: Find Qt and Visual Studio
         shell: pwsh
         run: |
+          $qt = (Get-ChildItem C:\Qt -Recurse -Directory -Filter QtCore | Where-Object { $_.Parent.Name -eq 'include' } | Select-Object -First 1).Parent.Parent.FullName
           $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          "QT=$qt" >> $env:GITHUB_ENV
           "VCVARS=$vs\VC\Auxiliary\Build\vcvars64.bat" >> $env:GITHUB_ENV
+          "Qt is in $qt" | Tee-Object -Append log.txt
       - name: Build Qt
-        env:
-          QT: C:\Qt\6.12.1\msvc2022_64
         run: cmd //c build.bat 2>&1 | tee -a log.txt; exit ${PIPESTATUS[0]}
       - name: Show the log
         if: failure()
