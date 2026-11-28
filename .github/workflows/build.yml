@@ -1,6 +1,6 @@
 # Builds both frontends on every push: Qt on Windows, macOS and Linux, and AppKit on macOS.
 # Qt is the same 6.12.1 the build scripts expect, from Qt's own packages through aqtinstall.
-# Every step writes to log.txt, and a failed job shows the log's end as an annotation on the run.
+# Every step writes to log.txt, and a failed job shows the log's errors, or else its end, as an annotation on the run.
 name: Build
 
 on: push
@@ -32,7 +32,7 @@ jobs:
         run: cmd //c build.bat 2>&1 | tee -a log.txt; exit ${PIPESTATUS[0]}
       - name: Show the log
         if: failure()
-        run: tail -n 60 log.txt | awk 'BEGIN { printf "::error::" } { gsub(/%/, "%25"); gsub(/\r/, ""); printf "%s%%0A", $0 }'
+        run: (grep -E 'error:' log.txt || tail -n 60 log.txt) | head -n 60 | cut -c1-220 | awk 'BEGIN { printf "::error::" } { gsub(/%/, "%25"); gsub(/\r/, ""); printf "%s%%0A", $0 }'
 
   linux:
     runs-on: ubuntu-latest
@@ -47,7 +47,7 @@ jobs:
         run: ./build_linux_qt.sh 2>&1 | tee -a log.txt; exit ${PIPESTATUS[0]}
       - name: Show the log
         if: failure()
-        run: tail -n 60 log.txt | awk 'BEGIN { printf "::error::" } { gsub(/%/, "%25"); gsub(/\r/, ""); printf "%s%%0A", $0 }'
+        run: (grep -E 'error:' log.txt || tail -n 60 log.txt) | head -n 60 | cut -c1-220 | awk 'BEGIN { printf "::error::" } { gsub(/%/, "%25"); gsub(/\r/, ""); printf "%s%%0A", $0 }'
 
   macos:
     runs-on: macos-latest
@@ -61,4 +61,4 @@ jobs:
         run: ./build_mac_qt.sh 2>&1 | tee -a log.txt; exit ${PIPESTATUS[0]}
       - name: Show the log
         if: failure()
-        run: tail -n 60 log.txt | awk 'BEGIN { printf "::error::" } { gsub(/%/, "%25"); gsub(/\r/, ""); printf "%s%%0A", $0 }'
+        run: (grep -E 'error:' log.txt || tail -n 60 log.txt) | head -n 60 | cut -c1-220 | awk 'BEGIN { printf "::error::" } { gsub(/%/, "%25"); gsub(/\r/, ""); printf "%s%%0A", $0 }'
