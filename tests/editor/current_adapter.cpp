@@ -6,6 +6,7 @@
 #include "TextBuffer.cpp"
 #include "Typing.cpp"
 #include "RunText.cpp"
+#include "Run.cpp"
 #include "qt/RunPane.cpp"
 #include "qt/TextView.cpp"
 #include "qt/Window.cpp"

@@ -989,7 +989,7 @@ static void show_output(EditorWindow &window)
 // snapshot of its text.
 static void run_current_file(EditorWindow &window)
 {
-    if (window.run_pane && window.run_pane->stage != RUN_IDLE) {
+    if (window.run_pane && run_going(*window.run_pane)) {
         stop_run(*window.run_pane);
         return;
     }

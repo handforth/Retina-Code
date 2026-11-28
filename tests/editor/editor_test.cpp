@@ -2072,7 +2072,8 @@ static void run_events_briefly()
     loop.exec();
 }
 
-// Lets a run go on until its output shows the text, for at most a minute.
+// Lets a run go on until its output shows the text, for at most a minute. "xited with code" matches the reference
+// editor's "Exited with code" and the current one's "Process exited with code".
 static void wait_for_output(QWidget *window, const char *text)
 {
     QWidget *output = window_output(window);
@@ -2326,7 +2327,7 @@ static int run_window(const char *output_path)
     const char *programs[] = {"eof.py", "trace.py", "sleep.py", "hello.c", "bad.c"};
     drop_files(window, programs, 5);
     select_tab(window, "notes.txt");
-    trigger(window, "&Run Current File");
+    run_and_wait(window, "cannot be run");
     record_window(window, "run plain text");
 
     select_tab(window, "ask.py");
@@ -2338,7 +2339,7 @@ static int run_window(const char *output_path)
     type_text(output, QStringLiteral("Byron"));
     record_window(window, "type input");
     send_key(output, Qt::Key_Return, Qt::NoModifier, key_text(Qt::Key_Return));
-    wait_for_output(window, "Exited with code");
+    wait_for_output(window, "xited with code");
     record_window(window, "run with input");
 
     select_tab(window, "eof.py");
@@ -2347,21 +2348,21 @@ static int run_window(const char *output_path)
     send_key(output, Qt::Key_Return, Qt::NoModifier, key_text(Qt::Key_Return));
     type_text(output, QStringLiteral("de"));
     send_key(output, Qt::Key_D, Qt::ControlModifier, QString(QChar(4)));
-    wait_for_output(window, "Exited with code");
+    wait_for_output(window, "xited with code");
     record_window(window, "end of input");
 
     select_tab(window, "trace.py");
-    run_and_wait(window, "Exited with code");
+    run_and_wait(window, "xited with code");
     record_window(window, "traceback");
     click_link(window, "retina-source");
     record_window(window, "click the traceback");
     adapter_set_selection(current_editor(window), 0, 0);
     type_text(current_editor(window), QStringLiteral("# changed\n"));
-    run_and_wait(window, "Exited with code");
+    run_and_wait(window, "xited with code");
     record_window(window, "traceback from unsaved changes");
 
     select_tab(window, "hello.c");
-    run_and_wait(window, "Exited with code");
+    run_and_wait(window, "xited with code");
     record_window(window, "build and run");
     select_tab(window, "bad.c");
     run_and_wait(window, "Build failed");
@@ -2457,15 +2458,15 @@ static int run_run_bench()
     QElapsedTimer timer;
     timer.start();
     select_tab(window, "hello.c");
-    run_and_wait(window, "Exited with code");
+    run_and_wait(window, "xited with code");
     double first_ms = elapsed_ms(timer);
-    run_and_wait(window, "Exited with code");
+    run_and_wait(window, "xited with code");
     printf("C build and run: first %.0f ms, second %.0f ms\n", first_ms, elapsed_ms(timer));
 
     select_tab(window, "flood.py");
     double before = private_megabytes();
     timer.restart();
-    run_and_wait(window, "Exited with code");
+    run_and_wait(window, "xited with code");
     double flood_ms = elapsed_ms(timer);
     QTextDocument *document = output_document(window_output(window));
     printf("200,000 lines of output: %.0f ms, %d lines kept, %.1f MB more private\n", flood_ms, document->blockCount(),

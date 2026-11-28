@@ -9,6 +9,7 @@
 #include "TextBuffer.cpp"
 #include "Typing.cpp"
 #include "RunText.cpp"
+#include "Run.cpp"
 
 // Qt platform layer.
 #include "qt/RunPane.cpp"
