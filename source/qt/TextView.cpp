@@ -249,6 +249,17 @@ public:
     bool occurrence_word;         // as a whole word, when it started from the word at the caret
     uint32_t occurrence_end;      // where it looks from next
 
+    // Vim mode: Vim's state, which every key goes through while it's on, with the caret at its cursor.
+    bool vim_on;
+    bool vim_editing;             // a key is going through Vim, which keeps its state in step with its own edits
+    Vim::State vim;
+    uint32_t vim_step;            // the undo record Vim's change in progress starts at
+    uint32_t vim_step_caret;      // where undoing that change puts the caret
+    bool vim_action_waiting;      // Vim asked the window for vim_action, which it runs once the key is done
+    Vim::Action vim_action;
+    std::u16string vim_action_text;
+    bool vim_action_force;
+
     // Typing rules and brackets.
     Indentation indentation;
     std::vector<TypedPair> typed_pairs;
@@ -303,6 +314,7 @@ protected:
 static const uint32_t VIEW_CARET_MOVED = 1;
 static const uint32_t VIEW_MODIFIED_CHANGED = 2;
 static const uint32_t VIEW_LANGUAGE_CHANGED = 4;
+static const uint32_t VIEW_VIM_ACTION = 8;
 
 // What the Edit menu can do.
 enum class EditCommand : uint8_t { Undo, Redo, Cut, Copy, Paste, SelectAll };
@@ -1147,6 +1159,10 @@ static void react_to_text_change(TextView &view)
     uint32_t from = text.changed.start, removed = text.changed.old_length, added = text.changed.new_length;
     text.changed.start = NO_POSITION;
     view.text_version += 1;
+
+    // Vim follows edits it didn't make itself.
+    if (view.vim_on && !view.vim_editing)
+        Vim::ForeignEdit(view.vim, {from, from + removed}, added);
 
     // Typed pairs and bracket positions follow the text, and any that the change touched go.
     TypingRange edited = {from, removed};
@@ -2679,10 +2695,455 @@ static void handle_key(TextView &view, QKeyEvent *event)
     ensure_caret_visible(view);
 }
 
+//
+// Vim mode. Vim.cpp does the work: the editor gives it the text through a Vim::Host, feeds it every key, and shows
+// its cursor as the caret. Its edits go into TextBuffer's undo history, and a Vim change that spans keys, like
+// everything typed in one insert, becomes one undo step once it's done.
+//
+
+static Vim::Registers vim_registers;    // shared by every editor, as Vim's registers are
+
+// Vim's Control key: Control, which on macOS Qt calls Meta.
+#ifdef Q_OS_MAC
+static const Qt::KeyboardModifier VIM_CONTROL = Qt::MetaModifier;
+#else
+static const Qt::KeyboardModifier VIM_CONTROL = Qt::ControlModifier;
+#endif
+
+// The Control keys Vim takes from the window's shortcuts. On Windows and Linux the shortcuts that other editors give
+// Control+C, Z, S, N, T and the rest stay the window's; on macOS shortcuts use Command, so Vim takes every one.
+static bool is_vim_control_key(const QKeyEvent &event)
+{
+    if ((event.modifiers() & (VIM_CONTROL | Qt::AltModifier)) != VIM_CONTROL)
+        return false;
+    int key = event.key();
+#ifdef Q_OS_MAC
+    return (key >= Qt::Key_A && key <= Qt::Key_Z) || key == Qt::Key_BracketLeft;
+#else
+    switch (key) {
+        case Qt::Key_A: case Qt::Key_B: case Qt::Key_D: case Qt::Key_E: case Qt::Key_F: case Qt::Key_G: case Qt::Key_I:
+        case Qt::Key_O: case Qt::Key_R: case Qt::Key_U: case Qt::Key_V: case Qt::Key_W: case Qt::Key_X: case Qt::Key_Y:
+        case Qt::Key_BracketLeft:
+            return true;
+        default:
+            return false;
+    }
+#endif
+}
+
+static TextView &vim_view(void *context)
+{
+    return *static_cast<TextView *>(context);
+}
+
+static Vim::Offset vim_length(void *context)
+{
+    return vim_view(context).text.units.size();
+}
+
+static Vim::Offset vim_line_count(void *context)
+{
+    return vim_view(context).text.lines.size();
+}
+
+static Vim::Offset vim_line_at(void *context, Vim::Offset at)
+{
+    return line_of_offset(vim_view(context).text, uint32_t(at));
+}
+
+static Vim::Offset vim_line_start(void *context, Vim::Offset line)
+{
+    const TextBuffer &text = vim_view(context).text;
+    return line < text.lines.size() ? text.lines[line].start : text.units.size();
+}
+
+static void vim_read(void *context, Vim::Range range, char16_t *output)
+{
+    memcpy(output, vim_view(context).text.units.data() + range.first, range.size() * sizeof(char16_t));
+}
+
+// The character a unit belongs to, as the reader sees it: a surrogate pair, or a letter and its accents. Vim asks only
+// for units past ASCII.
+static Vim::Range vim_cluster(void *context, Vim::Offset at)
+{
+    TextView &view = vim_view(context);
+    uint32_t line = line_of_offset(view.text, uint32_t(at));
+    uint32_t start = line_start(view, line);
+    std::u16string_view units = line_text(view.text, line);
+    if (at >= start + units.size())
+        return {at, at + 1};
+
+    QTextBoundaryFinder finder(QTextBoundaryFinder::Grapheme, reinterpret_cast<const QChar *>(units.data()), qsizetype(units.size()));
+    finder.setPosition(qsizetype(at - start));
+    qsizetype first = finder.isAtBoundary() ? finder.position() : finder.toPreviousBoundary();
+    finder.setPosition(qsizetype(at - start));
+    qsizetype last = finder.toNextBoundary();
+    return {start + Vim::Offset(first), start + Vim::Offset(last)};
+}
+
+static void vim_replace(void *context, Vim::Range range, Vim::Text text)
+{
+    replace_text(vim_view(context).text, uint32_t(range.first), uint32_t(range.size()), text);
+}
+
+// Makes the records since Vim's change began one undo step.
+static void close_vim_step(TextView &view)
+{
+    join_undo_steps(view.text, view.vim_step, view.text.undo_position, view.vim_step_caret);
+    view.vim_step = view.text.undo_position;
+}
+
+// Vim calls this after the first edit of a change, which is the newest record: the records before it are the last
+// change, and this one starts at it.
+static void vim_record_undo(void *context, std::shared_ptr<Vim::Change> change)
+{
+    TextView &view = vim_view(context);
+    uint32_t first = view.text.undo_position - 1;
+    join_undo_steps(view.text, view.vim_step, first, view.vim_step_caret);
+    view.vim_step = first;
+    view.vim_step_caret = uint32_t(change->before);
+}
+
+static std::optional<Vim::Offset> vim_undo(void *context, bool redo)
+{
+    TextView &view = vim_view(context);
+    close_vim_step(view);
+    uint32_t caret = redo ? redo_text_change(view.text) : undo_text_change(view.text);
+    view.vim_step = view.text.undo_position;
+    if (caret == NO_POSITION)
+        return std::nullopt;
+    return caret;
+}
+
+// Text copied with a line break at its end pastes as whole lines.
+static std::optional<Vim::Register> vim_read_clipboard(void *)
+{
+    QString text = QApplication::clipboard()->text();
+    normalize_line_breaks(text);
+    if (text.isEmpty())
+        return std::nullopt;
+
+    Vim::Register value;
+    value.text.assign(view_of(text));
+    value.kind = text.endsWith(u'\n') ? Vim::Kind::Line : Vim::Kind::Character;
+    return value;
+}
+
+static void vim_write_clipboard(void *, Vim::Text text)
+{
+    QApplication::clipboard()->setText(qstring_of(text));
+}
+
+// Vim's search turns its patterns into Perl's, which Qt's expressions read with ^ and $ at every line. A match counts
+// when it starts in the range; going backwards, the last one does. The expression is kept, since highlighting
+// matches searches for the same one many times.
+static std::optional<Vim::Match> vim_find(void *context, Vim::Text pattern, Vim::Range range, bool backwards, bool ignore_case,
+                                          bool captures)
+{
+    static QRegularExpression expression;
+    QRegularExpression::PatternOptions options = QRegularExpression::MultilineOption | QRegularExpression::UseUnicodePropertiesOption;
+    if (ignore_case)
+        options |= QRegularExpression::CaseInsensitiveOption;
+    QString wanted = qstring_of(pattern);
+    if (expression.pattern() != wanted || expression.patternOptions() != options) {
+        expression.setPattern(wanted);
+        expression.setPatternOptions(options);
+    }
+
+    const std::vector<char16_t> &units = vim_view(context).text.units;
+    QStringView subject(units.data(), qsizetype(units.size()));
+    QRegularExpressionMatch found;
+    QRegularExpressionMatchIterator matches = expression.globalMatchView(subject, qsizetype(range.first));
+    while (matches.hasNext()) {
+        QRegularExpressionMatch match = matches.next();
+        if (Vim::Offset(match.capturedStart()) >= range.last)
+            break;
+        found = match;
+        if (!backwards)
+            break;
+    }
+    if (!found.hasMatch())
+        return std::nullopt;
+
+    Vim::Match result;
+    result.range = {Vim::Offset(found.capturedStart()), Vim::Offset(found.capturedEnd())};
+    for (int group = 1; captures && group <= found.lastCapturedIndex(); ++group) {
+        if (found.capturedStart(group) < 0)
+            result.groups.push_back({Vim::NoOffset, Vim::NoOffset});
+        else
+            result.groups.push_back({Vim::Offset(found.capturedStart(group)), Vim::Offset(found.capturedEnd(group))});
+    }
+    return result;
+}
+
+// The lines that fit in the viewport from the top one, a line cut off at the bottom left out.
+static Vim::Range vim_viewport(void *context)
+{
+    TextView &view = vim_view(context);
+    int height = view.viewport()->height(), y = 0;
+    uint32_t line = view.top_line;
+    while (line < line_count(view) && y + line_block_height(view, line) <= height)
+        y += line_block_height(view, line++);
+    return {view.top_line, line > view.top_line ? line : view.top_line + 1};
+}
+
+static void vim_scroll(void *context, Vim::Offset row)
+{
+    TextView &view = vim_view(context);
+    set_top_line(view, uint32_t(row < line_count(view) ? row : line_count(view) - 1), 0);
+}
+
+// Saving and closing are the window's, which runs them once the key is done.
+static void vim_action(void *context, Vim::Action action, Vim::Text value, bool force)
+{
+    TextView &view = vim_view(context);
+    view.vim_action_waiting = true;
+    view.vim_action = action;
+    view.vim_action_text.assign(value);
+    view.vim_action_force = force;
+    notify_window(view, VIEW_VIM_ACTION);
+}
+
+static Vim::Host vim_host(TextView &view)
+{
+    Vim::Host host = {};
+    host.context = host.document = &view;
+    host.length = vim_length;
+    host.lineCount = vim_line_count;
+    host.lineAt = vim_line_at;
+    host.lineStart = vim_line_start;
+    host.read = vim_read;
+    host.cluster = vim_cluster;
+    host.replace = vim_replace;
+    host.recordUndo = vim_record_undo;
+    host.undo = vim_undo;
+    host.readClipboard = vim_read_clipboard;
+    host.writeClipboard = vim_write_clipboard;
+    host.find = vim_find;
+    host.viewport = vim_viewport;
+    host.scroll = vim_scroll;
+    host.action = vim_action;
+    return host;
+}
+
+// What Vim highlights from the viewport's first line to its last: the visual selection, and matches while searching.
+static std::vector<Vim::Range> vim_highlights(TextView &view)
+{
+    if (!view.vim_on)
+        return {};
+
+    Vim::Range rows = vim_viewport(&view);
+    uint32_t last_row = uint32_t(rows.last < line_count(view) ? rows.last : line_count(view) - 1);
+    Vim::Range visible = {line_start(view, uint32_t(rows.first)), line_end(view, last_row)};
+    Vim::Host host = vim_host(view);
+    std::vector<Vim::Range> ranges = Vim::Selected(view.vim, host, visible).ranges;
+    std::vector<Vim::Range> matches = Vim::SearchHighlights(view.vim, host, visible);
+    ranges.insert(ranges.end(), matches.begin(), matches.end());
+    return ranges;
+}
+
+// The caret goes where Vim's cursor is. It's drawn as a block outside insert mode.
+static void show_vim_state(TextView &view)
+{
+    uint32_t cursor = uint32_t(view.vim.cursor < text_length(view) ? view.vim.cursor : text_length(view));
+    set_selection(view, cursor, cursor);
+}
+
+// Vim's edits during one key make one undo group, so none merges with another, and the editor hears about them
+// together afterwards.
+static void begin_vim_edit(TextView &view)
+{
+    if (!view.vim.change || view.vim_step > view.text.undo_position)
+        view.vim_step = view.text.undo_position;
+    begin_undo_group(view.text, view.caret);
+    view.vim_editing = true;
+}
+
+static void end_vim_edit(TextView &view)
+{
+    end_undo_group(view.text);
+    if (!view.vim.change)
+        close_vim_step(view);
+    react_to_text_change(view);
+    view.vim_editing = false;
+    show_vim_state(view);
+}
+
+static void feed_vim(TextView &view, Vim::Key key, std::u16string_view text)
+{
+    begin_vim_edit(view);
+    Vim::Feed(view.vim, vim_host(view), vim_registers, key, text);
+    end_vim_edit(view);
+}
+
+// The caret moved without Vim, by the mouse or by a command of the window's: Vim's cursor goes there, and a selection
+// becomes visual mode.
+static void sync_vim_to_caret(TextView &view)
+{
+    if (view.caret == view.anchor && view.caret == view.vim.cursor)
+        return;
+
+    Vim::MouseSelection(view.vim, vim_host(view), {selection_start(view), selection_end(view)}, view.caret < view.anchor);
+    if (!view.vim.change)
+        close_vim_step(view);
+    show_vim_state(view);
+}
+
+// The Edit menu in Vim mode works on Vim's selection and registers, as in the AppKit editor.
+static void run_vim_edit_command(TextView &view, EditCommand command)
+{
+    bool insert = Vim::IsInsert(view.vim.mode);
+    switch (command) {
+        case EditCommand::Undo:
+        case EditCommand::Redo:
+            // Outside insert mode these are Vim's u and Control+R. In insert mode, what was typed so far is a step.
+            if (!insert) {
+                feed_vim(view, command == EditCommand::Redo ? Vim::Key(18) : Vim::Key('u'), {});
+            } else {
+                begin_vim_edit(view);
+                Vim::FinishChange(view.vim);
+                std::optional<Vim::Offset> caret = vim_undo(&view, command == EditCommand::Redo);
+                if (caret)
+                    Vim::SetCursor(view.vim, vim_host(view), *caret);
+                end_vim_edit(view);
+            }
+            break;
+
+        case EditCommand::Cut:
+        case EditCommand::Copy:
+            if (Vim::IsVisual(view.vim.mode)) {
+                begin_vim_edit(view);
+                Vim::CopySelection(view.vim, vim_host(view), vim_registers, command == EditCommand::Cut);
+                end_vim_edit(view);
+            }
+            break;
+
+        case EditCommand::Paste:
+            if (insert || view.vim.mode == Vim::Mode::Command) {
+                QString pasted = QApplication::clipboard()->text();
+                normalize_line_breaks(pasted);
+                feed_vim(view, Vim::Key::Paste, view_of(pasted));
+            } else {
+                feed_vim(view, Vim::Key('"'), {});
+                feed_vim(view, Vim::Key('+'), {});
+                feed_vim(view, Vim::Key('p'), {});
+            }
+            break;
+
+        case EditCommand::SelectAll:
+            begin_vim_edit(view);
+            Vim::SelectAll(view.vim, vim_host(view));
+            end_vim_edit(view);
+            break;
+    }
+}
+
+// Vim's keys for the keys Qt reports. Keys that type text are Key::None here.
+static Vim::Key vim_key(const QKeyEvent &event, bool visual)
+{
+    int key = event.key();
+    if (is_vim_control_key(event))
+        return key == Qt::Key_BracketLeft ? Vim::Key::Escape : Vim::Key(key - Qt::Key_A + 1);
+
+    bool alt = event.modifiers() & Qt::AltModifier;
+    switch (key) {
+        case Qt::Key_Escape: return Vim::Key::Escape;
+        case Qt::Key_Return: case Qt::Key_Enter: return Vim::Key::Enter;
+        case Qt::Key_Tab: return event.modifiers() & Qt::ShiftModifier ? Vim::Key::Backtab : Vim::Key::Tab;
+        case Qt::Key_Backtab: return Vim::Key::Backtab;
+        case Qt::Key_Backspace: return visual ? Vim::Key::Delete : Vim::Key::Backspace;
+        case Qt::Key_Delete: return Vim::Key::Delete;
+        case Qt::Key_Left: return alt ? Vim::Key::WordLeft : Vim::Key::Left;
+        case Qt::Key_Right: return alt ? Vim::Key::WordRight : Vim::Key::Right;
+        case Qt::Key_Up: return Vim::Key::Up;
+        case Qt::Key_Down: return Vim::Key::Down;
+        case Qt::Key_Home: return Vim::Key::Home;
+        case Qt::Key_End: return Vim::Key::End;
+        case Qt::Key_PageUp: return Vim::Key::PageUp;
+        case Qt::Key_PageDown: return Vim::Key::PageDown;
+        default: return Vim::Key::None;
+    }
+}
+
+// Typed text goes to insert mode, the command line, and r and f as it is. In the other modes it's a key.
+static void feed_vim_text(TextView &view, std::u16string_view typed)
+{
+    const Vim::State &vim = view.vim;
+    bool as_text = Vim::IsInsert(vim.mode) || vim.mode == Vim::Mode::Command || vim.mode == Vim::Mode::Confirm ||
+                   vim.prefix == Vim::Prefix::Replace || vim.prefix == Vim::Prefix::Find;
+    if (!as_text && typed.size() == 1)
+        feed_vim(view, Vim::Key(typed[0]), {});
+    else
+        feed_vim(view, Vim::Key::Text, typed);
+}
+
+// A key in Vim mode. The Edit menu's keys do what the menu does, other Control and Command keys do what they do
+// without Vim, and keys that are neither Vim's nor type anything do nothing.
+static bool handle_vim_key(TextView &view, QKeyEvent *event)
+{
+    // In EditCommand's order.
+    static const QKeySequence::StandardKey EDIT_KEYS[] = {QKeySequence::Undo, QKeySequence::Redo, QKeySequence::Cut,
+                                                          QKeySequence::Copy, QKeySequence::Paste, QKeySequence::SelectAll};
+
+    Vim::Key key = vim_key(*event, Vim::IsVisual(view.vim.mode));
+    if (key != Vim::Key::None) {
+        // Shift and an arrow selects from Normal mode, as in the AppKit editor.
+        bool arrow = key == Vim::Key::Left || key == Vim::Key::Right || key == Vim::Key::Up || key == Vim::Key::Down;
+        if (arrow && view.vim.mode == Vim::Mode::Normal && (event->modifiers() & Qt::ShiftModifier))
+            feed_vim(view, Vim::Key('v'), {});
+        feed_vim(view, key, {});
+        return true;
+    }
+
+    for (int index = 0; index < 6; ++index) {
+        if (event->matches(EDIT_KEYS[index])) {
+            run_vim_edit_command(view, EditCommand(index));
+            return true;
+        }
+    }
+    if (event->modifiers() & (Qt::ControlModifier | Qt::MetaModifier))
+        return false;
+    if (is_acceptable_input(*event))
+        feed_vim_text(view, view_of(event->text()));
+    return true;
+}
+
+// Turning Vim mode on starts it with the editor's indentation, and a selection becomes visual mode. Turning it off
+// keeps a visual selection when it's one range.
+static void set_vim_mode(TextView &view, bool on)
+{
+    if (view.vim_on == on)
+        return;
+
+    clear_cursors(view);
+    view.vim_on = on;
+    if (on) {
+        view.vim = Vim::State();
+        view.vim.tabStop = unsigned(view.indentation.tabWidth);
+        view.vim.shiftWidth = unsigned(view.indentation.width);
+        view.vim.expandTab = !view.indentation.tabs;
+        view.vim_step = view.text.undo_position;
+        Vim::MouseSelection(view.vim, vim_host(view), {selection_start(view), selection_end(view)}, view.caret < view.anchor);
+        show_vim_state(view);
+    } else {
+        close_vim_step(view);
+        std::vector<Vim::Range> ranges = Vim::Selected(view.vim, vim_host(view)).ranges;
+        if (ranges.size() == 1)
+            set_selection(view, uint32_t(ranges[0].first), uint32_t(ranges[0].last));
+        else
+            set_selection(view, view.caret, view.caret);
+    }
+}
+
 // QPlainTextEdit's undo(), redo(), cut(), copy(), paste(), and selectAll(), which the Edit menu calls. Unlike the
 // keys for them, cutting and selecting all from the menu leave the view where it is.
 static void run_edit_command(TextView &view, EditCommand command)
 {
+    if (view.vim_on) {
+        run_vim_edit_command(view, command);
+        return;
+    }
+
     // Copy, Cut, and Paste act on every cursor; the others leave only the primary one.
     if (!view.cursors.empty()) {
         if (command == EditCommand::Copy || command == EditCommand::Cut)
@@ -2805,7 +3266,7 @@ static void handle_mouse_press(TextView &view, QMouseEvent *event)
     commit_preedit(view);
 
     // Alt and a click adds a cursor, or takes one away; any other click leaves one cursor.
-    if (event->modifiers() == Qt::AltModifier) {
+    if (event->modifiers() == Qt::AltModifier && !view.vim_on) {
         add_cursor_at(view, hit_test(view, point));
         return;
     }
@@ -3069,7 +3530,8 @@ static size_t first_cursor_from(const TextView &view, uint32_t at)
     return low;
 }
 
-static QList<QTextLayout::FormatRange> line_selections(TextView &view, uint32_t line, bool caret_as_block)
+static QList<QTextLayout::FormatRange> line_selections(TextView &view, uint32_t line, bool caret_as_block,
+                                                       const std::vector<Vim::Range> &vim_ranges)
 {
     QList<QTextLayout::FormatRange> selections;
     uint32_t start = line_start(view, line);
@@ -3103,6 +3565,11 @@ static QList<QTextLayout::FormatRange> line_selections(TextView &view, uint32_t 
         const Cursor &cursor = view.cursors[index];
         int first = int(cursor_start(cursor)) - int(start), last = int(cursor_end(cursor)) - int(start);
         if (!cursor.primary && first < last && last > 0)
+            selections.append({first, last - first, selected});
+    }
+    for (Vim::Range range : vim_ranges) {
+        int first = int(range.first) - int(start), last = int(range.last) - int(start);
+        if (first < length && last > 0 && first < last)
             selections.append({first, last - first, selected});
     }
 
@@ -3197,6 +3664,8 @@ static void paint_text(TextView &view, QPaintEvent *event)
     painter.setPen(view.palette().text().color());
 
     int caret_position = painted_caret_position(view);
+    bool block_caret = view.overwrite || (view.vim_on && !Vim::IsInsert(view.vim.mode));
+    std::vector<Vim::Range> vim_ranges = vim_highlights(view);
     for (uint32_t line = view.top_line; line < line_count(view); ++line) {
         // A line not laid out yet is laid out once, both to measure it and to draw it.
         QTextLayout layout(QString(), view.code_font, view.viewport());
@@ -3213,8 +3682,8 @@ static void paint_text(TextView &view, QPaintEvent *event)
 
             int start = int(line_start(view, line)), end = int(line_end(view, line));
             bool draw_caret = caret_position >= start && caret_position <= end;
-            bool caret_as_block = draw_caret && view.overwrite && caret_position != end;
-            layout.draw(&painter, offset, line_selections(view, line, caret_as_block), dirty);
+            bool caret_as_block = draw_caret && block_caret && caret_position != end;
+            layout.draw(&painter, offset, line_selections(view, line, caret_as_block, vim_ranges), dirty);
 
             if ((draw_caret && !caret_as_block) || (caret_position < -1 && composing_on(view, line))) {
                 int at = caret_position < -1 ? layout.preeditAreaPosition() - (caret_position + 2) : caret_position - start;
@@ -3741,6 +4210,11 @@ TextView::TextView(const QString &view_name, const QString &units, const QString
     theme = &view_theme;
     appearance = view_appearance;
 
+    vim_on = vim_editing = false;
+    vim_step = vim_step_caret = 0;
+    vim_action_waiting = vim_action_force = false;
+    vim_action = Vim::Action::Save;
+
     completion = nullptr;
     completion_words.line = NO_POSITION;
     completion_start = completion_end = 0;
@@ -3790,9 +4264,12 @@ TextView::TextView(const QString &view_name, const QString &units, const QString
 
 bool TextView::event(QEvent *event)
 {
-    // The editor takes the keys it edits with before the window's shortcuts get them.
-    if (event->type() == QEvent::ShortcutOverride && QInputControl::isCommonTextEditShortcut(static_cast<QKeyEvent *>(event)))
-        event->accept();
+    // The editor takes the keys it edits with before the window's shortcuts get them, and Vim takes its Control keys.
+    if (event->type() == QEvent::ShortcutOverride) {
+        QKeyEvent *key = static_cast<QKeyEvent *>(event);
+        if (QInputControl::isCommonTextEditShortcut(key) || (vim_on && is_vim_control_key(*key)))
+            event->accept();
+    }
 
     return QAbstractScrollArea::event(event);
 }
@@ -3826,6 +4303,16 @@ void TextView::scrollContentsBy(int dx, int)
 
 void TextView::keyPressEvent(QKeyEvent *event)
 {
+    if (vim_on) {
+        dismiss_completion(*this);
+        sync_vim_to_caret(*this);
+        if (handle_vim_key(*this, event))
+            event->accept();
+        else
+            handle_key(*this, event);
+        return;
+    }
+
     if (!cursors.empty()) {
         dismiss_completion(*this);
         if (handle_cursors_key(*this, event)) {
@@ -3877,6 +4364,11 @@ void TextView::keyPressEvent(QKeyEvent *event)
 void TextView::inputMethodEvent(QInputMethodEvent *event)
 {
     dismiss_completion(*this);
+    if (vim_on && event->preeditString().isEmpty() && !event->commitString().isEmpty()) {
+        feed_vim_text(*this, view_of(event->commitString()));
+        event->accept();
+        return;
+    }
     QString committed = event->commitString();
     if (committed.size() == 1 && MayCompleteCharacter(committed.front().unicode()) && event->preeditString().isEmpty() &&
         !event->replacementStart() && !event->replacementLength() &&
@@ -3947,9 +4439,13 @@ QVariant TextView::inputMethodQuery(Qt::InputMethodQuery query) const
     }
 }
 
+// In Vim mode a click puts Vim's cursor there, and a selection made with the mouse becomes visual mode once the button
+// comes up.
 void TextView::mousePressEvent(QMouseEvent *event)
 {
     handle_mouse_press(*this, event);
+    if (vim_on && caret == anchor)
+        sync_vim_to_caret(*this);
 }
 
 // Dragging a selection past the viewport's edge starts scrolling, as QPlainTextEdit's autoScrollTimer did.
@@ -3973,6 +4469,8 @@ void TextView::mouseReleaseEvent(QMouseEvent *event)
         auto_scroll.stop();
         ensure_caret_visible(*this);
     }
+    if (vim_on)
+        sync_vim_to_caret(*this);
 }
 
 void TextView::mouseDoubleClickEvent(QMouseEvent *event)

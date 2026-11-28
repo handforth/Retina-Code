@@ -396,6 +396,16 @@ void mark_text_saved(TextBuffer &text)
     text.modified = false;
 }
 
+void join_undo_steps(TextBuffer &text, uint32_t first, uint32_t last, uint32_t caret)
+{
+    if (first >= last || last > text.undo_records.size())
+        return;
+    text.undo_records[first].continues = false;
+    text.undo_records[first].caret = caret;
+    for (uint32_t index = first + 1; index < last; ++index)
+        text.undo_records[index].continues = true;
+}
+
 // Undo takes back the records of one step from the last, and puts the caret after the text it put back, or where the
 // step's group began.
 uint32_t undo_text_change(TextBuffer &text)

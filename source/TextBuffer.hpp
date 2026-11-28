@@ -88,6 +88,10 @@ uint32_t redo_text_change(TextBuffer &text);
 
 void mark_text_saved(TextBuffer &text);
 
+// Makes the records from first to last, last left out, one undo step, which undo ends with the caret at caret. Vim
+// mode uses it for its changes, which span keys.
+void join_undo_steps(TextBuffer &text, uint32_t first, uint32_t last, uint32_t caret);
+
 // The line an offset is on. The offset of a '\n' is on the line the '\n' ends.
 uint32_t line_of_offset(const TextBuffer &text, uint32_t offset);
 

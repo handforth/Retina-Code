@@ -271,10 +271,13 @@ enum Command {
     COMMAND_CURSOR_ABOVE, COMMAND_CURSOR_BELOW, COMMAND_CURSORS_TO_LINE_ENDS, COMMAND_NEXT_OCCURRENCE, COMMAND_ALL_OCCURRENCES,
     COMMAND_UNDO_CURSORS,
     COMMAND_ZOOM_IN, COMMAND_ZOOM_OUT, COMMAND_RESET_ZOOM, COMMAND_THEME, COMMAND_TEXT_APPEARANCE, COMMAND_OUTPUT,
+    COMMAND_VIM_MODE,
 };
 
-// The theme every window shows. A window's hidden tabs take it up when they're next shown.
+// The theme every window shows, and whether its tabs are in Vim mode. A window's hidden tabs take them up when they're
+// next shown.
 static const Theme *current_theme;
+static bool vim_mode;
 
 struct EditorWindow : QMainWindow {
     QTabWidget *tabs = nullptr;
@@ -283,6 +286,7 @@ struct EditorWindow : QMainWindow {
     QLabel *encoding_label = nullptr;
     QLabel *memory_label = nullptr;          // on Windows only
     int memory_timer = 0;
+    QAction *vim_mode_action = nullptr;
 
     TextAppearance appearance;
     int font_size = 15;
@@ -318,6 +322,7 @@ struct EditorWindow : QMainWindow {
     void appearance_reset();
     void save_appearance();
     void open_dropped_files();
+    void run_vim_action();
 };
 
 //
@@ -371,6 +376,8 @@ static void update_position(EditorWindow &window)
     QString position = QStringLiteral("Ln %1, Col %2").arg(line + 1).arg(view->caret - line_start(*view, line) + 1);
     if (!view->cursors.empty())
         position += QStringLiteral("  ·  %1 cursors").arg(view->cursors.size());
+    if (view->vim_on)
+        position += QStringLiteral("  ·  ") + qstring_of(Vim::Status(view->vim));
     window.position_label->setText(position);
 }
 
@@ -400,8 +407,11 @@ static void update_language_picker(EditorWindow &window)
 static void show_active_tab(EditorWindow &window)
 {
     TextView *view = active_view(window);
-    if (view)
+    if (view) {
         apply_appearance(*view, *current_theme, window.appearance);
+        set_vim_mode(*view, vim_mode);
+    }
+    window.vim_mode_action->setChecked(vim_mode);
     window.setWindowTitle(view ? view->name + QStringLiteral(" — Retina Code") : QStringLiteral("Retina Code"));
     update_language_picker(window);
     update_status(window);
@@ -418,6 +428,8 @@ static void view_changed(void *context, TextView &view, uint32_t changes)
         window.tabs->setTabText(window.tabs->indexOf(&view), tab_label(view));
     if ((changes & VIEW_LANGUAGE_CHANGED) && &view == active_view(window))
         update_language_picker(window);
+    if (changes & VIEW_VIM_ACTION)
+        QTimer::singleShot(0, &window, &EditorWindow::run_vim_action);
 }
 
 static TextView *add_tab(EditorWindow &window, const QString &name, const QString &text, const QString &source_path,
@@ -690,9 +702,10 @@ static bool confirm_close(EditorWindow &window)
     return true;
 }
 
-static void close_tab(EditorWindow &window, TextView *view)
+// Closes a tab, after asking about its changes unless ask is false.
+static void close_tab(EditorWindow &window, TextView *view, bool ask)
 {
-    if (!confirm_close_tab(window, view))
+    if (ask && !confirm_close_tab(window, view))
         return;
 
     if (window.run_view == view)
@@ -1045,6 +1058,7 @@ static EditorWindow *create_window(const EditorWindow *opener)
     } else {
         QSettings settings(QStringLiteral("Retina Code"), QStringLiteral("Qt Prototype"));
         current_theme = &find_theme(byte_view(settings.value(QStringLiteral("EditorTheme")).toByteArray()));
+        vim_mode = settings.value(QStringLiteral("VimMode"), false).toBool();
         settings.beginGroup(QStringLiteral("TextAppearance"));
         for (const AppearanceControl &control : APPEARANCE_CONTROLS) {
             int &value = window->appearance.*control.value;
@@ -1144,6 +1158,9 @@ static EditorWindow *create_window(const EditorWindow *opener)
     view_menu->addSeparator();
     add_command(view_menu, "&Text Appearance…", COMMAND_TEXT_APPEARANCE, none, QKeySequence::UnknownKey);
     add_command(view_menu, "&Output", COMMAND_OUTPUT, none, QKeySequence::UnknownKey);
+    view_menu->addSeparator();
+    window->vim_mode_action = add_command(view_menu, "&Vim Mode", COMMAND_VIM_MODE, none, QKeySequence::UnknownKey);
+    window->vim_mode_action->setCheckable(true);
 
     QObject::connect(window->menuBar(), &QMenuBar::triggered, window, &EditorWindow::command_chosen);
     QObject::connect(window->tabs, &QTabWidget::currentChanged, window, &EditorWindow::tab_changed);
@@ -1204,7 +1221,7 @@ void EditorWindow::command_chosen(QAction *action)
 
         case COMMAND_CLOSE_TAB:
             if (view)
-                close_tab(*this, view);
+                close_tab(*this, view, true);
             break;
 
         case COMMAND_UNDO: run_edit_menu_command(*this, EditCommand::Undo); break;
@@ -1223,18 +1240,18 @@ void EditorWindow::command_chosen(QAction *action)
 
         case COMMAND_CURSOR_ABOVE:
         case COMMAND_CURSOR_BELOW:
-            if (view)
+            if (view && !view->vim_on)
                 add_cursors_vertically(*view, action->data().toInt() == COMMAND_CURSOR_BELOW);
             break;
 
         case COMMAND_CURSORS_TO_LINE_ENDS:
-            if (view)
+            if (view && !view->vim_on)
                 add_cursors_to_line_ends(*view);
             break;
 
         case COMMAND_NEXT_OCCURRENCE:
         case COMMAND_ALL_OCCURRENCES:
-            if (view) {
+            if (view && !view->vim_on) {
                 add_occurrences(*view, action->data().toInt() == COMMAND_ALL_OCCURRENCES);
                 ensure_caret_visible(*view);
             }
@@ -1259,6 +1276,17 @@ void EditorWindow::command_chosen(QAction *action)
         case COMMAND_THEME: show_theme_picker(*this); break;
         case COMMAND_TEXT_APPEARANCE: show_text_appearance(*this); break;
         case COMMAND_OUTPUT: show_output(*this); break;
+
+        // Vim mode is on for every tab or none, and every window shows it now.
+        case COMMAND_VIM_MODE:
+            vim_mode = action->isChecked();
+            QSettings(QStringLiteral("Retina Code"), QStringLiteral("Qt Prototype")).setValue(QStringLiteral("VimMode"), vim_mode);
+            for (QWidget *widget : QApplication::topLevelWidgets()) {
+                EditorWindow *window = dynamic_cast<EditorWindow *>(widget);
+                if (window)
+                    show_active_tab(*window);
+            }
+            break;
     }
 }
 
@@ -1269,7 +1297,7 @@ void EditorWindow::tab_changed()
 
 void EditorWindow::tab_close_requested(int index)
 {
-    close_tab(*this, static_cast<TextView *>(tabs->widget(index)));
+    close_tab(*this, static_cast<TextView *>(tabs->widget(index)), true);
 }
 
 void EditorWindow::language_chosen(int row)
@@ -1439,4 +1467,45 @@ void EditorWindow::open_dropped_files()
     QStringList paths = dropped_paths;
     dropped_paths.clear();
     open_files(*this, paths);
+}
+
+// Vim's :w, :wq, :q, :sav, :bn and :bp. They wait for the key that typed them to finish, since closing a tab deletes
+// its view.
+void EditorWindow::run_vim_action()
+{
+    TextView *view = nullptr;
+    for (int index = 0; index < tabs->count() && !view; ++index) {
+        TextView *tab = static_cast<TextView *>(tabs->widget(index));
+        if (tab->vim_action_waiting)
+            view = tab;
+    }
+    if (!view)
+        return;
+
+    view->vim_action_waiting = false;
+    int index = tabs->indexOf(view), count = tabs->count();
+    switch (view->vim_action) {
+        case Vim::Action::Save: save_tab(*this, view, false); break;
+        case Vim::Action::SaveAs: save_tab(*this, view, true); break;
+        case Vim::Action::Close: close_tab(*this, view, !view->vim_action_force); break;
+        case Vim::Action::NextWindow: tabs->setCurrentIndex((index + 1) % count); break;
+        case Vim::Action::PreviousWindow: tabs->setCurrentIndex((index + count - 1) % count); break;
+
+        case Vim::Action::SaveClose:
+            if (save_tab(*this, view, false))
+                close_tab(*this, view, false);
+            break;
+
+        // :w with a name writes a copy there, next to the file.
+        case Vim::Action::WriteCopy: {
+            QString path = QFileInfo(view->file_path).dir().absoluteFilePath(qstring_of(view->vim_action_text));
+            QString error = write_file(*view, path);
+            if (!error.isEmpty())
+                show_warning(*this, QStringLiteral("Could Not Save"), QStringLiteral("%1 — %2").arg(QDir::toNativeSeparators(path), error), QString());
+            break;
+        }
+
+        default:
+            break;
+    }
 }
