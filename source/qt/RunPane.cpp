@@ -103,7 +103,7 @@ static void read_channel(RunJob &job, QProcess &process, QProcess::ProcessChanne
 
 // Runs the child to its end. It goes into a group of its own, so stopping it stops what it started too: a job
 // object on Windows that kills its processes when it closes, and on Unix a session of its own.
-int run_child(RunJob &job, const RunChild &child)
+int run_child(RunJob &job, const ChildCommand &child)
 {
     QProcess process;
     process.setProgram(utf8_string(child.program));
@@ -290,7 +290,7 @@ static void insert_text(QTextCursor &cursor, const QString &text, int first, int
 
 // A link for a message's place: "retina-source:current" for the file that ran, or the file's URL for another file,
 // with "line:column:encoding" as the fragment. The window reads it.
-static QString message_link(const RunLog &log, const RunMessage &message)
+static QString message_link(const RunLog &log, const RunLine &message)
 {
     QUrl link;
     if (message.current_source) {
@@ -321,7 +321,7 @@ static void show_run_output(RunPane &pane)
 
     QPalette palette = pane.output.palette();
     bool dark = palette.color(QPalette::Base).lightness() < 128;
-    for (const RunMessage &message : log.messages) {
+    for (const RunLine &message : log.messages) {
         // The text in its tone, then its colors, then the link over it.
         QString text = utf8_string(std::string_view(log.text).substr(message.text_start, message.text_length));
         int start = cursor.position();

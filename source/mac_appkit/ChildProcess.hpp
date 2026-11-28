@@ -54,4 +54,3 @@ bool PathHasFolder(std::string_view path, std::string_view folder);
 bool IsExecutable(const char *path);
 bool ExecutableIn(std::string &path, std::string_view directory, std::string_view name);
 bool ExecutableOnPath(std::string &path, std::string_view search, std::string_view name);
-bool FindParentFile(std::string &path, std::string_view directory, std::string_view limit, std::string_view name);

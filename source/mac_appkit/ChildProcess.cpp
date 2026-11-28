@@ -380,28 +380,3 @@ bool ExecutableOnPath(std::string &path, std::string_view search, std::string_vi
 
     return false;
 }
-
-bool FindParentFile(std::string &path, std::string_view directory, std::string_view limit, std::string_view name)
-{
-    while (directory.size() > 1 && directory.back() == '/')
-        directory.remove_suffix(1);
-    while (limit.size() > 1 && limit.back() == '/')
-        limit.remove_suffix(1);
-
-    while (!directory.empty()) {
-        JoinPath(path, directory, name);
-        struct stat info;
-        if (stat(path.c_str(), &info) == 0 && S_ISREG(info.st_mode))
-            return true;
-        if (directory == limit || directory == "/")
-            break;
-
-        size_t slash = directory.rfind('/');
-        if (slash == directory.npos)
-            break;
-
-        directory = directory.substr(0, slash ? slash : 1);
-    }
-
-    return false;
-}
