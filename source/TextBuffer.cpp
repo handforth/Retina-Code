@@ -157,43 +157,8 @@ static void lex_lines(TextBuffer &text, uint32_t first_line, uint32_t last_chang
 }
 
 //
-// Qt's string. QTextDocumentPrivate keeps the document as fragments of its string: runs of units that sit side by
-// side there, with each line break in a fragment of its own. This follows how its insert_string, insert_block, move,
-// and unite split and join those fragments.
+// Changes.
 //
-
-static uint32_t qt_position(const TextBuffer &text, uint32_t at)
-{
-    return text.qt_positions[at] & ~QT_FRAGMENT_START;
-}
-
-static bool starts_qt_fragment(const TextBuffer &text, uint32_t at)
-{
-    return (text.qt_positions[at] & QT_FRAGMENT_START) != 0;
-}
-
-static void set_qt_fragment_start(TextBuffer &text, uint32_t at, bool starts)
-{
-    text.qt_positions[at] = starts ? text.qt_positions[at] | QT_FRAGMENT_START : text.qt_positions[at] & ~QT_FRAGMENT_START;
-}
-
-// Marks the fragments after a change left inserted_length new units at start. Qt splits its fragments where it
-// changes them, and each inserted line and line break begins a fragment. Then it joins the fragment just before the
-// change with the one that now starts there, when neither holds a line break and their text sits side by side.
-static void mark_qt_fragments(TextBuffer &text, uint32_t start, uint32_t inserted_length)
-{
-    uint32_t end = start + inserted_length;
-    for (uint32_t at = start; at < end; ++at)
-        set_qt_fragment_start(text, at, at == start || text.units[at] == u'\n' || text.units[at - 1] == u'\n');
-
-    if (end < text.units.size())
-        set_qt_fragment_start(text, end, true);
-
-    bool joins = start > 0 && start < text.units.size() && text.units[start - 1] != u'\n' && text.units[start] != u'\n' &&
-                 qt_position(text, start - 1) + 1 == qt_position(text, start);
-    if (joins)
-        set_qt_fragment_start(text, start, false);
-}
 
 // Merges one insertion or removal into the changed range, as QTextDocumentPrivate::adjustDocumentChangesAndCursors
 // does. The range grows to cover both, along with any text between them.
@@ -231,33 +196,23 @@ void note_document_change(TextChange &change, uint32_t start, uint32_t length)
     change.new_length += grown;
 }
 
-// Replaces the units in [start, start + length) with inserted, and keeps the rest in step: Qt's string and fragments,
-// the line starts, and the lexer states. In Qt's string, the inserted text counts up from qt_text_position and its
-// line breaks from qt_separator_position. Recording the change for undo is up to the caller.
-static void change_text(TextBuffer &text, uint32_t start, uint32_t length, std::u16string_view inserted,
-                        uint32_t qt_text_position, uint32_t qt_separator_position)
+// Replaces the units in [start, start + length) with inserted, and keeps the line starts and lexer states in step.
+// Recording the change for undo is up to the caller.
+static void change_text(TextBuffer &text, uint32_t start, uint32_t length, std::u16string_view inserted)
 {
     uint32_t first_line = line_of_offset(text, start);
     uint32_t last_line = line_of_offset(text, start + length);
 
-    // The units after the change, with their places in Qt's string, move to just after the inserted ones.
+    // The units after the change move to just after the inserted ones.
     size_t old_size = text.units.size();
     size_t new_size = old_size - length + inserted.size();
     size_t moved_count = old_size - start - length;
-    if (new_size > old_size) {
+    if (new_size > old_size)
         text.units.resize(new_size);
-        text.qt_positions.resize(new_size);
-    }
-
     memmove(text.units.data() + start + inserted.size(), text.units.data() + start + length, moved_count * sizeof(char16_t));
-    memmove(text.qt_positions.data() + start + inserted.size(), text.qt_positions.data() + start + length,
-            moved_count * sizeof(uint32_t));
     memcpy(text.units.data() + start, inserted.data(), inserted.size() * sizeof(char16_t));
-
-    if (new_size < old_size) {
+    if (new_size < old_size)
         text.units.resize(new_size);
-        text.qt_positions.resize(new_size);
-    }
 
     // Lines that started inside the removed units go, and each inserted '\n' starts a new line. The last of the
     // changed lines ends where last_line ended, so it takes that line's end state for lex_lines to compare against.
@@ -271,20 +226,14 @@ static void change_text(TextBuffer &text, uint32_t start, uint32_t length, std::
     else
         text.lines.erase(changed_lines + inserted_line_count, changed_lines + removed_line_count);
 
-    // Each inserted unit gets its place in Qt's string, and each line break starts its line.
     uint32_t line = first_line + 1;
     for (uint32_t at = 0; at < inserted.size(); ++at) {
         if (inserted[at] == u'\n') {
-            text.qt_positions[start + at] = qt_separator_position++;
             text.lines[line] = {start + at + 1, NOT_LEXED};
             line += 1;
-        } else {
-            text.qt_positions[start + at] = qt_text_position + at;
         }
     }
-
     text.lines[first_line + inserted_line_count].end_state = end_state_after_change;
-    mark_qt_fragments(text, start, uint32_t(inserted.size()));
 
     // Qt notes the removal and the insertion one after the other.
     if (length)
@@ -304,17 +253,10 @@ static void change_text(TextBuffer &text, uint32_t start, uint32_t length, std::
 void set_text(TextBuffer &text, std::u16string_view units, Language language)
 {
     text.units.clear();
-    text.qt_positions.clear();
     text.lines.assign(1, TextLine{0, NOT_LEXED});
     text.language = language;
-    text.changed.start = NO_POSITION;
-    text.lexed_end_line = NO_POSITION;
     forget_lex_states(text);
-
-    // QTextDocument::setPlainText stores the text with insertText.
-    uint32_t size = uint32_t(units.size());
-    change_text(text, 0, 0, units, 0, size);
-    text.qt_string_length = size + uint32_t(text.lines.size() - 1);
+    change_text(text, 0, 0, units);
 
     text.undo_records.clear();
     text.undo_text.clear();
@@ -339,97 +281,85 @@ void set_text_language(TextBuffer &text, Language language)
 }
 
 //
-// Undo history. The rules are Qt's, from QTextDocumentPrivate::appendUndoItem, QTextUndoCommand::tryMerge, and
-// QTextDocumentPrivate::undoRedo in Qt 6.
+// Undo history.
 //
 
-// Qt updates whether the text is modified only after a change made outside a group, and its merging rules read that.
+// The text is modified once undo can't reach the saved text without stepping, as of the last change made outside a
+// group. Typing merges only while it's modified, so undo always stops at the saved text.
 static void note_whether_modified(TextBuffer &text)
 {
     text.modified = text.undo_position != text.saved_undo_position;
 }
 
-static void append_undo_record(TextBuffer &text, UndoKind kind, uint32_t start, std::u16string_view changed, uint32_t qt_position)
+static bool has_line_break(std::u16string_view units)
 {
-    UndoRecord record;
-    record.start = start;
-    record.length = uint32_t(changed.size());
-    record.text_at = uint32_t(text.undo_text.size());
-    record.qt_position = qt_position;
-    record.kind = kind;
-    record.grouped = text.undo_group_depth > 0;
-    record.ends_group = false;
-
-    text.undo_text.insert(text.undo_text.end(), changed.begin(), changed.end());
-    text.undo_records.push_back(record);
-    text.undo_position += 1;
+    return units.find(u'\n') != std::u16string_view::npos;
 }
 
-// Extends the last record with a change that continues it, both in the document and in Qt's string: typing on at the
-// end of an insertion, Delete at the start of a removal, or Backspace just before it. Line breaks are a different kind
-// of change in Qt, which never merges.
-static bool merge_undo_record(TextBuffer &text, UndoRecord &last, UndoKind kind, uint32_t start, std::u16string_view changed,
-                              uint32_t qt_position)
+// Extends the newest change with one that goes on from it: typing on at the end of what it inserted, or Delete at
+// the start of what it removed or Backspace just before it. Typing also goes on from a group, as after a bracket that
+// closes itself, so undo takes back the pair and what was typed in it together. Nothing goes on across a line break.
+static bool merge_undo_record(TextBuffer &text, UndoRecord &last, uint32_t start, std::u16string_view removed, std::u16string_view inserted)
 {
-    if (last.kind != kind || text.undo_text[last.text_at] == u'\n' || changed[0] == u'\n')
-        return false;
+    std::u16string_view last_removed(text.undo_text.data() + last.text_at, last.removed_length);
+    std::u16string_view last_inserted(text.undo_text.data() + last.text_at + last.removed_length, last.inserted_length);
+    uint32_t removed_length = uint32_t(removed.size());
+    bool typing = removed.empty() && !inserted.empty() && last.inserted_length && !has_line_break(last_inserted) && !has_line_break(inserted);
+    bool deleting = inserted.empty() && !last.inserted_length && !last.grouped && !has_line_break(last_removed) && !has_line_break(removed);
+    bool typed_on = typing && start == last.start + last.inserted_length;
+    bool deleted_forward = deleting && start == last.start;
+    bool deleted_backward = deleting && start + removed_length == last.start;
 
-    uint32_t changed_length = uint32_t(changed.size());
-    bool typed_on = kind == UndoKind::Insertion && start == last.start + last.length &&
-                    qt_position == last.qt_position + last.length;
-    bool deleted_forward = kind == UndoKind::Removal && start == last.start && qt_position == last.qt_position + last.length;
-    bool deleted_backward = kind == UndoKind::Removal && start + changed_length == last.start &&
-                            qt_position + changed_length == last.qt_position;
-
-    // The last record's text is at the end of undo_text, so it can grow in place.
-    if (typed_on || deleted_forward) {
-        text.undo_text.insert(text.undo_text.end(), changed.begin(), changed.end());
+    // The last record's text is at the end of undo_text, the removed units first.
+    if (typed_on) {
+        text.undo_text.insert(text.undo_text.end(), inserted.begin(), inserted.end());
+        last.inserted_length += uint32_t(inserted.size());
+    } else if (deleted_forward) {
+        text.undo_text.insert(text.undo_text.end(), removed.begin(), removed.end());
+        last.removed_length += removed_length;
     } else if (deleted_backward) {
-        text.undo_text.insert(text.undo_text.begin() + last.text_at, changed.begin(), changed.end());
+        text.undo_text.insert(text.undo_text.begin() + last.text_at, removed.begin(), removed.end());
+        last.removed_length += removed_length;
         last.start = start;
-        last.qt_position = qt_position;
     } else {
         return false;
     }
-
-    last.length += changed_length;
     return true;
 }
 
-// Records one change.
-static void record_change(TextBuffer &text, UndoKind kind, uint32_t start, std::u16string_view changed, uint32_t qt_position)
+static void record_change(TextBuffer &text, uint32_t start, std::u16string_view removed, std::u16string_view inserted)
 {
-    // A change drops whatever could have been redone, along with the saved point if it was among that.
-    if (text.undo_position < text.undo_records.size()) {
+    // A change drops whatever could have been redone, along with the saved point if it was among that. Then it
+    // starts a record of its own: only the newest change made goes on.
+    bool newest = text.undo_position == text.undo_records.size();
+    if (!newest) {
         const UndoRecord *last = text.undo_position ? &text.undo_records[text.undo_position - 1] : nullptr;
-        text.undo_text.resize(last ? last->text_at + last->length : 0);
+        text.undo_text.resize(last ? last->text_at + last->removed_length + last->inserted_length : 0);
         text.undo_records.resize(text.undo_position);
-
         if (text.saved_undo_position > text.undo_position)
             text.saved_undo_position = NO_POSITION;
     }
 
-    // Before a group's first change away from the caret it began at, a caret record keeps that caret for undo.
-    if (text.undo_group_depth > 0 && text.undo_group_caret != NO_POSITION && text.undo_group_caret != start) {
-        append_undo_record(text, UndoKind::Caret, text.undo_group_caret, {}, 0);
-        text.undo_group_caret = NO_POSITION;
-    }
+    bool grouped = text.undo_group_depth > 0;
+    if (!grouped && newest && text.modified && text.undo_position > 0 &&
+        merge_undo_record(text, text.undo_records[text.undo_position - 1], start, removed, inserted))
+        return;
 
-    // Qt merges only while the text is modified, and only inside one open group, between two changes outside groups,
-    // or when typing goes on after a group.
-    if (text.modified && text.undo_position > 0) {
-        UndoRecord &last = text.undo_records[text.undo_position - 1];
-        bool grouped = text.undo_group_depth > 0;
-        bool same_open_group = last.grouped && grouped && !last.ends_group;
-        bool both_outside_groups = !last.grouped && !grouped;
-        bool typing_after_group = kind == UndoKind::Insertion && last.kind == UndoKind::Insertion && last.grouped && !grouped;
+    // Inside a group, the changes after its first undo with it, and the first keeps the caret the group began at
+    // when that isn't where the change is.
+    UndoRecord record;
+    record.start = start;
+    record.removed_length = uint32_t(removed.size());
+    record.inserted_length = uint32_t(inserted.size());
+    record.text_at = uint32_t(text.undo_text.size());
+    record.grouped = grouped;
+    record.continues = grouped && text.undo_position > text.undo_group_first;
+    record.caret = grouped && !record.continues && text.undo_group_caret != start ? text.undo_group_caret : NO_POSITION;
 
-        if ((same_open_group || both_outside_groups || typing_after_group) &&
-            merge_undo_record(text, last, kind, start, changed, qt_position))
-            return;
-    }
-
-    append_undo_record(text, kind, start, changed, qt_position);
+    text.undo_text.insert(text.undo_text.end(), removed.begin(), removed.end());
+    text.undo_text.insert(text.undo_text.end(), inserted.begin(), inserted.end());
+    text.undo_records.push_back(record);
+    text.undo_position += 1;
 }
 
 void replace_text(TextBuffer &text, uint32_t start, uint32_t length, std::u16string_view inserted)
@@ -437,56 +367,27 @@ void replace_text(TextBuffer &text, uint32_t start, uint32_t length, std::u16str
     if (!length && inserted.empty())
         return;
 
-    // Qt records a removal as one change for each of its fragments. Each one is gone before the next is removed, so
-    // they are all at start.
-    uint32_t piece_start = start;
-    for (uint32_t at = start + 1; at <= start + length; ++at) {
-        if (at == start + length || starts_qt_fragment(text, at)) {
-            std::u16string_view piece(text.units.data() + piece_start, at - piece_start);
-            record_change(text, UndoKind::Removal, start, piece, qt_position(text, piece_start));
-            piece_start = at;
-        }
-    }
-
-    // insertText puts the whole text at the end of Qt's string, and then a separator for each of its line breaks.
-    uint32_t inserted_length = uint32_t(inserted.size());
-    change_text(text, start, length, inserted, text.qt_string_length, text.qt_string_length + inserted_length);
-    text.qt_string_length += inserted_length + count_line_breaks(inserted);
-
-    // Qt records an insertion as one change for each line's text and each line break.
-    piece_start = 0;
-    for (uint32_t at = 1; at <= inserted.size(); ++at) {
-        if (at == inserted.size() || inserted[at] == u'\n' || inserted[at - 1] == u'\n') {
-            record_change(text, UndoKind::Insertion, start + piece_start, inserted.substr(piece_start, at - piece_start),
-                          qt_position(text, start + piece_start));
-            piece_start = at;
-        }
-    }
-
+    // The removed units go into the history before the change overwrites them.
+    record_change(text, start, std::u16string_view(text.units.data() + start, length), inserted);
+    change_text(text, start, length, inserted);
     if (text.undo_group_depth == 0)
         note_whether_modified(text);
 }
 
 void begin_undo_group(TextBuffer &text, uint32_t caret)
 {
-    if (text.undo_group_depth == 0)
+    if (text.undo_group_depth == 0) {
         text.undo_group_caret = caret;
-
+        text.undo_group_first = text.undo_position;
+    }
     text.undo_group_depth += 1;
 }
 
 void end_undo_group(TextBuffer &text)
 {
     text.undo_group_depth -= 1;
-    if (text.undo_group_depth > 0)
-        return;
-
-    // The last record ends the group. A group that changed nothing leaves the record before it as it was.
-    if (text.undo_position > 0 && text.undo_records[text.undo_position - 1].grouped)
-        text.undo_records[text.undo_position - 1].ends_group = true;
-
-    text.undo_group_caret = NO_POSITION;
-    note_whether_modified(text);
+    if (text.undo_group_depth == 0)
+        note_whether_modified(text);
 }
 
 void mark_text_saved(TextBuffer &text)
@@ -495,71 +396,39 @@ void mark_text_saved(TextBuffer &text)
     text.modified = false;
 }
 
-// True when the records on both sides of an undo position belong to one group, so undo or redo goes on past it.
-static bool group_continues(const TextBuffer &text, uint32_t position)
-{
-    return position > 0 && position < text.undo_records.size() &&
-           text.undo_records[position].grouped && text.undo_records[position - 1].grouped &&
-           !text.undo_records[position - 1].ends_group;
-}
-
-// Applies a record forwards for redo or backwards for undo, and tracks where Qt puts the caret: where text was
-// removed, or after the text put back. When several records put text back at the same place, it goes after all of it.
-static void apply_undo_record(TextBuffer &text, const UndoRecord &record, bool forwards, uint32_t &edit_start, uint32_t &edit_length)
-{
-    if (record.kind == UndoKind::Caret) {
-        edit_start = record.start;
-        edit_length = 0;
-        return;
-    }
-
-    // Qt puts a record's text back where it was in its string. A record is either text or one line break, so its
-    // position serves for both.
-    std::u16string_view record_text(text.undo_text.data() + record.text_at, record.length);
-    bool puts_text_back = (record.kind == UndoKind::Insertion) == forwards;
-    if (puts_text_back) {
-        change_text(text, record.start, 0, record_text, record.qt_position, record.qt_position);
-        if (edit_start != record.start)
-            edit_length = 0;
-        edit_start = record.start;
-        edit_length += record.length;
-    } else {
-        change_text(text, record.start, record.length, {}, 0, 0);
-        edit_start = record.start;
-        edit_length = 0;
-
-        // Undo and redo take out a line break without joining the fragments on either side of it.
-        if (record_text[0] == u'\n' && record.start < text.units.size())
-            set_qt_fragment_start(text, record.start, true);
-    }
-}
-
+// Undo takes back the records of one step from the last, and puts the caret after the text it put back, or where the
+// step's group began.
 uint32_t undo_text_change(TextBuffer &text)
 {
     if (text.undo_position == 0)
         return NO_POSITION;
 
-    uint32_t edit_start = NO_POSITION, edit_length = 0;
+    const UndoRecord *record;
     do {
         text.undo_position -= 1;
-        apply_undo_record(text, text.undo_records[text.undo_position], false, edit_start, edit_length);
-    } while (group_continues(text, text.undo_position));
+        record = &text.undo_records[text.undo_position];
+        std::u16string_view removed(text.undo_text.data() + record->text_at, record->removed_length);
+        change_text(text, record->start, record->inserted_length, removed);
+    } while (record->continues);
 
     note_whether_modified(text);
-    return edit_start + edit_length;
+    return record->caret != NO_POSITION ? record->caret : record->start + record->removed_length;
 }
 
+// Redo makes the records of one step again, and puts the caret after the last text it inserted.
 uint32_t redo_text_change(TextBuffer &text)
 {
     if (text.undo_position == text.undo_records.size())
         return NO_POSITION;
 
-    uint32_t edit_start = NO_POSITION, edit_length = 0;
+    const UndoRecord *record;
     do {
-        apply_undo_record(text, text.undo_records[text.undo_position], true, edit_start, edit_length);
+        record = &text.undo_records[text.undo_position];
+        std::u16string_view inserted(text.undo_text.data() + record->text_at + record->removed_length, record->inserted_length);
+        change_text(text, record->start, record->removed_length, inserted);
         text.undo_position += 1;
-    } while (group_continues(text, text.undo_position));
+    } while (text.undo_position < text.undo_records.size() && text.undo_records[text.undo_position].continues);
 
     note_whether_modified(text);
-    return edit_start + edit_length;
+    return record->start + record->inserted_length;
 }

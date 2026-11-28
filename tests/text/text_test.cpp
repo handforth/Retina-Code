@@ -4,8 +4,10 @@
 //                                 QTextDocument side by side, the way QPlainTextEdit makes them
 //   text_test bench <folder>...   load, typing, and lexing times and memory, for a large text made from the files
 //
-// After every step, check compares the text, the caret after undo and redo, and whether the text counts as
-// modified. It also checks the buffer's line starts and lexer states against a fresh pass over its text.
+// After every edit, check compares the buffer's text with the document's. Undo and redo run on the buffer alone and
+// must bring back the text it had at that point of its history, which the check remembers by hash; the document then
+// starts over from the buffer's text. The check also checks the buffer's line starts and lexer states against a fresh
+// pass over its text, and that it counts as modified exactly when its history isn't at the saved point.
 
 // The shared code comes before Qt's headers, as in main_qt.cpp, because Qt defines words like slots as macros.
 #include "Languages.cpp"
@@ -132,7 +134,16 @@ struct EditSession {
     QTextDocument document;
     QTextCursor cursor;
     uint32_t anchor, caret;
+    std::vector<uint64_t> history;    // the hash of the text at each point of the undo history
 };
+
+static uint64_t hash_text(const TextBuffer &text)
+{
+    uint64_t hash = 14695981039346656037ull;
+    for (char16_t unit : text.units)
+        hash = (hash ^ unit) * 1099511628211ull;
+    return hash;
+}
 
 static uint32_t selection_start(const EditSession &session)
 {
@@ -313,9 +324,9 @@ static void move_caret(EditSession &session)
 struct EditReport {
     uint64_t steps;
     uint64_t undo_steps;
-    uint64_t text_differences;      // after undo or redo, the two disagreed on what text came back
-    uint64_t caret_differences;
-    uint64_t modified_differences;
+    uint64_t text_differences;      // an edit left the buffer's text different from the document's
+    uint64_t undo_differences;      // undo or redo brought back text the history didn't have there
+    uint64_t modified_differences;  // the buffer counted as modified, or not, against its history
     uint64_t inconsistent;          // the buffer's own lines or lexer states were wrong, which is a bug in it
     uint64_t checked_lines;
     int printed;
@@ -337,6 +348,7 @@ static void start_session(EditSession &session, const QString &units, Language l
     session.document.setPlainText(units);
     session.document.setModified(false);
     set_text(session.text, view_of(units), language);
+    session.history.assign(1, hash_text(session.text));
     collapse_selection(session, 0);
 }
 
@@ -352,7 +364,6 @@ static void run_random_edits(const TestFile &file, uint32_t seed, uint32_t step_
     for (uint64_t step = 0; step < step_count; ++step) {
         const char *operation = "";
         bool undid_or_redid = false;
-        uint32_t qt_caret = 0, buffer_caret = 0;
 
         uint32_t roll = next_random() % 100;
         if (roll < 34) {
@@ -392,19 +403,17 @@ static void run_random_edits(const TestFile &file, uint32_t seed, uint32_t step_
             operation = undo ? "undo" : "redo";
             undid_or_redid = true;
 
-            QTextCursor undo_cursor(&session->document);
-            undo_cursor.setPosition(int(session->caret));
-            if (undo)
-                session->document.undo(&undo_cursor);
-            else
-                session->document.redo(&undo_cursor);
-            qt_caret = uint32_t(undo_cursor.position());
+            uint32_t caret = undo ? undo_text_change(session->text) : redo_text_change(session->text);
+            if (caret != NO_POSITION && hash_text(session->text) != session->history[session->text.undo_position]) {
+                report.undo_differences += 1;
+                report_difference(report, file, step, operation, "the text isn't what the history had there");
+            }
+            if (caret > session->text.units.size())
+                caret = session->caret > session->text.units.size() ? uint32_t(session->text.units.size()) : session->caret;
 
-            buffer_caret = undo ? undo_text_change(session->text) : redo_text_change(session->text);
-            if (buffer_caret == NO_POSITION)
-                buffer_caret = session->caret;
-
-            collapse_selection(*session, qt_caret);
+            QString units = QString::fromUtf16(session->text.units.data(), qsizetype(session->text.units.size()));
+            session->document.setPlainText(units);
+            collapse_selection(*session, caret);
             report.undo_steps += 1;
         } else {
             operation = "save";
@@ -419,14 +428,16 @@ static void run_random_edits(const TestFile &file, uint32_t seed, uint32_t step_
             report_difference(report, file, step, operation, "the text differs");
         }
 
-        if (undid_or_redid && same_text && qt_caret != buffer_caret) {
-            report.caret_differences += 1;
-            report_difference(report, file, step, operation, "the caret differs");
+        // An edit makes the history's present point what the text is now, and drops what could have been redone along
+        // with the buffer's records of it. Moves and saves leave both as they were.
+        if (!undid_or_redid) {
+            session->history.resize(session->text.undo_records.size() + 1);
+            session->history[session->text.undo_position] = hash_text(session->text);
         }
 
-        if (session->document.isModified() != session->text.modified) {
+        if (session->text.modified != (session->text.undo_position != session->text.saved_undo_position)) {
             report.modified_differences += 1;
-            report_difference(report, file, step, operation, "they disagree on whether the text is modified");
+            report_difference(report, file, step, operation, "it counts as modified against its history");
         }
 
         report.checked_lines += session->text.lines.size();
@@ -436,7 +447,7 @@ static void run_random_edits(const TestFile &file, uint32_t seed, uint32_t step_
         }
 
         // After a difference, both start over from Qt's text, so one difference doesn't make every later step differ.
-        if (!same_text || session->document.isModified() != session->text.modified) {
+        if (!same_text) {
             QString document_text = session->document.toRawText();
             document_text.replace(QChar::ParagraphSeparator, u'\n');
             start_session(*session, document_text, session->text.language);
@@ -456,11 +467,12 @@ static int run_check(int folder_count, char **folders)
 
     printf("%zu files, %llu steps, %llu of them undo or redo\n", files.size(), (unsigned long long)report.steps,
            (unsigned long long)report.undo_steps);
-    printf("differences from QTextDocument: text %llu, caret %llu, modified %llu\n", (unsigned long long)report.text_differences,
-           (unsigned long long)report.caret_differences, (unsigned long long)report.modified_differences);
+    printf("text different from QTextDocument's: %llu, undo or redo to the wrong text: %llu, modified wrongly: %llu\n",
+           (unsigned long long)report.text_differences, (unsigned long long)report.undo_differences,
+           (unsigned long long)report.modified_differences);
     printf("lines checked against a fresh lexer pass: %llu, wrong: %llu steps\n", (unsigned long long)report.checked_lines,
            (unsigned long long)report.inconsistent);
-    return report.inconsistent ? 1 : 0;
+    return report.inconsistent || report.undo_differences || report.modified_differences ? 1 : 0;
 }
 
 //
@@ -497,9 +509,8 @@ static int run_bench(int folder_count, char **folders)
     double buffer_megabytes = private_megabytes() - before;
 
     printf("TextBuffer: loads and lexes in %.1f ms, %.1f MB private\n", load_ms, buffer_megabytes);
-    printf("  units %.1f MB, Qt string positions %.1f MB, lines %.1f MB, %zu distinct lexer states %.2f MB\n",
-           double(text->units.capacity()) * 2 / 1e6, double(text->qt_positions.capacity()) * 4 / 1e6,
-           double(text->lines.capacity()) * sizeof(TextLine) / 1e6, text->lex_states.size(),
+    printf("  units %.1f MB, lines %.1f MB, %zu distinct lexer states %.2f MB\n",
+           double(text->units.capacity()) * 2 / 1e6, double(text->lines.capacity()) * sizeof(TextLine) / 1e6, text->lex_states.size(),
            double(text->lex_states.capacity()) * sizeof(LexState) / 1e6);
 
     before = private_megabytes();

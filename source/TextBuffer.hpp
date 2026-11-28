@@ -6,12 +6,9 @@
 //
 // Lines are separated by '\n' alone. The file layer turns other line endings into '\n' when it loads a file.
 //
-// The undo history works exactly as QTextDocument's does, so undo behaves as it did in the QPlainTextEdit editor.
-// Qt keeps all the text it is ever given in one internal string that only grows, and the document is a list of
-// fragments of that string. It merges two undo records only when their text sits side by side in that string, so the
-// buffer keeps track of where Qt would have put each unit. Every edit is made the way QTextCursor::insertText makes
-// it, which stores the inserted text and then a separator for each of its line breaks. Enter through insertBlock
-// stores its line break differently, but no undo rule can tell the two apart.
+// The undo history is a list of changes, each of them where it starts, the units it removed, and the units it
+// inserted. Typing on, Backspace, and Delete merge into the change before them, so undo takes back a run of them at
+// once, the way editors do. Changes made inside a group undo as one step.
 
 #include "Lexer.hpp"
 
@@ -26,19 +23,16 @@ struct TextLine {
     uint32_t end_state;    // index in TextBuffer::lex_states of the lexer state after the line
 };
 
-enum class UndoKind : uint8_t { Insertion, Removal, Caret };
-
-// One change in the undo history, the same as one of Qt's undo commands: a line break on its own, or text from one
-// line that sits side by side in Qt's string. Its text is kept in TextBuffer::undo_text. A caret record has no text:
-// it holds where the caret was when an undo group began, so undoing the group puts the caret back there.
+// One change in the undo history: the units at [start, start + removed_length) were the removed ones, which the
+// inserted ones replaced. Both are in TextBuffer::undo_text at text_at, the removed units first.
 struct UndoRecord {
     uint32_t start;
-    uint32_t length;
-    uint32_t text_at;        // offset of the text in undo_text
-    uint32_t qt_position;    // where the text starts in Qt's string
-    UndoKind kind;
-    bool grouped;            // made inside an undo group, which undo and redo treat as one step
-    bool ends_group;         // the last record of its group
+    uint32_t removed_length;
+    uint32_t inserted_length;
+    uint32_t text_at;
+    uint32_t caret;          // where undoing the step puts the caret, when its group began away from its first change
+    bool grouped;            // made inside an undo group
+    bool continues;          // undoes and redoes with the record before it, as one group
 };
 
 // A range of changed text, merged the way QTextDocument reports an edit: where it starts, how many units it held, and
@@ -57,10 +51,6 @@ struct TextBuffer {
     uint32_t lex_state_limit;                                    // states no line uses are dropped when there are this many
     std::vector<Token> tokens;                                   // scratch for lexing
 
-    // Where Qt would keep each unit in its string, with QT_FRAGMENT_START set on units that begin one of its fragments.
-    std::vector<uint32_t> qt_positions;
-    uint32_t qt_string_length;
-
     TextChange changed;          // what changed since the editor last looked
     uint32_t lexed_end_line;     // the last line lexed again for those changes, or NO_POSITION
 
@@ -69,11 +59,10 @@ struct TextBuffer {
     uint32_t undo_position;          // records before this are done, the rest can be redone
     uint32_t saved_undo_position;    // undo_position when the text was saved, or NO_POSITION once undo can't get back there
     uint32_t undo_group_depth;
-    uint32_t undo_group_caret;       // the caret when the outermost group began, until the group's first change away from it
+    uint32_t undo_group_caret;       // the caret when the outermost group began
+    uint32_t undo_group_first;       // the record the outermost group's changes start at
     bool modified;                   // the text differs from the saved text, as of the last change made outside a group
 };
-
-constexpr uint32_t QT_FRAGMENT_START = 0x80000000u;
 
 // Replaces all the text and starts a new undo history, with the new text counted as saved.
 void set_text(TextBuffer &text, std::u16string_view units, Language language);
@@ -81,8 +70,7 @@ void set_text(TextBuffer &text, std::u16string_view units, Language language);
 // Lexes every line again for another language.
 void set_text_language(TextBuffer &text, Language language);
 
-// Replaces the units in [start, start + length) with inserted, as QTextCursor::insertText does. Undo gets the records
-// Qt would make, and each one merges into the record before it when Qt's would.
+// Replaces the units in [start, start + length) with inserted, and records the change for undo.
 void replace_text(TextBuffer &text, uint32_t start, uint32_t length, std::u16string_view inserted);
 
 // Marks [start, start + length) as changed without changing its text, as QTextDocumentPrivate::documentChange does
