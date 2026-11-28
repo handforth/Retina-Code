@@ -7,6 +7,7 @@
 // two on hundreds of renders and thousands of key presses at six display scales.
 
 #include "../Completion.hpp"
+#include "../Cursors.hpp"
 #include "../PopupColors.h"
 #include "../TextBuffer.hpp"
 #include "../Typing.hpp"
@@ -239,6 +240,14 @@ public:
     QTextOption text_option;
     QTextCharFormat code_formats[size_t(Ink::Count)];
     QTextCharFormat non_code_formats[size_t(Ink::Count)];
+
+    // More than one cursor: all of them, sorted and apart, with the primary one's selection in caret and anchor too.
+    // Empty with one cursor.
+    std::vector<Cursor> cursors;
+    std::vector<std::vector<Cursor>> cursor_history;    // the cursors before each command that added some
+    std::u16string occurrence;    // what Add Next Occurrence looks for
+    bool occurrence_word;         // as a whole word, when it started from the word at the caret
+    uint32_t occurrence_end;      // where it looks from next
 
     // Typing rules and brackets.
     Indentation indentation;
@@ -1530,6 +1539,7 @@ static void select_all(TextView &view)
 // QWidgetTextControl::undo and redo: the caret goes where QTextDocument puts it.
 static void undo_or_redo(TextView &view, bool redo)
 {
+    view.cursors.clear();
     uint32_t caret = redo ? redo_text_change(view.text) : undo_text_change(view.text);
     if (caret != NO_POSITION)
         set_caret(view, caret, false);
@@ -1541,6 +1551,19 @@ static void undo_or_redo(TextView &view, bool redo)
 // Typing rules.
 //
 
+// The lexer state at a place in its line, which typing rules read for characters and Enter.
+static LexState typing_context(TextView &view, TypingKey key, uint32_t at)
+{
+    LexState context = {};
+    if (key == TypingKey::Character || key == TypingKey::Enter) {
+        uint32_t line = line_of_offset(view.text, at);
+        context = lex_state_before_line(view.text, line);
+        std::u16string_view prefix = line_text(view.text, line).substr(0, at - line_start(view, line));
+        tokenize_line(prefix, lexing_language(view), context, view.tokens, false);
+    }
+    return context;
+}
+
 // The typing rules' plan for a key, applied as one undo step that starts at the caret.
 static bool apply_typing(TextView &view, TypingKey key, char16_t character)
 {
@@ -1549,15 +1572,7 @@ static bool apply_typing(TextView &view, TypingKey key, char16_t character)
 
     TypingSource source = typing_source(view);
     uint32_t at = selection_start(view);
-    LexState context = {};
-    if (key == TypingKey::Character || key == TypingKey::Enter) {
-        uint32_t line = line_of_offset(view.text, at);
-        context = lex_state_before_line(view.text, line);
-        std::u16string_view prefix = line_text(view.text, line).substr(0, at - line_start(view, line));
-        tokenize_line(prefix, lexing_language(view), context, view.tokens, false);
-    }
-
-    std::optional<TypingPlan> plan = PlanTyping(source, view.text.language, context, view.indentation, view.typed_pairs,
+    std::optional<TypingPlan> plan = PlanTyping(source, view.text.language, typing_context(view, key, at), view.indentation, view.typed_pairs,
                                                 {at, size_t(selection_end(view) - at)}, key, character);
     if (!plan)
         return false;
@@ -2213,6 +2228,384 @@ static bool is_acceptable_input(const QKeyEvent &event)
            (ch.isHighSurrogate() && text.size() > 1 && text.at(1).isLowSurrogate()) || ch == u'\t';
 }
 
+//
+// More than one cursor. The primary cursor's selection stays in caret and anchor, so everything else in the editor
+// works on it as on a single cursor. Moving and editing go through every cursor and then put the primary one back.
+//
+
+// The cursors as a list, starting one from the caret when there's only it.
+static void begin_cursors(TextView &view)
+{
+    if (view.cursors.empty())
+        view.cursors.push_back({view.anchor, view.caret, float(view.caret_x), true});
+}
+
+// Merges the cursors, puts the primary one in caret and anchor, and goes back to a single cursor when one is left.
+static void publish_cursors(TextView &view)
+{
+    merge_cursors(view.cursors);
+    for (const Cursor &cursor : view.cursors) {
+        if (cursor.primary) {
+            view.anchor = cursor.anchor;
+            view.caret = cursor.head;
+            view.caret_x = cursor.goal;
+        }
+    }
+    if (view.cursors.size() == 1)
+        view.cursors.clear();
+    view.caret_on = view.focused;
+    caret_moved(view);
+}
+
+static void clear_cursors(TextView &view)
+{
+    view.occurrence.clear();
+    if (view.cursors.empty())
+        return;
+    view.cursors.clear();
+    caret_moved(view);
+}
+
+// The cursors before a command that adds some, which Undo Cursor Change goes back to.
+static void save_cursors(TextView &view)
+{
+    if (view.cursor_history.size() == 24)
+        view.cursor_history.erase(view.cursor_history.begin());
+    view.cursor_history.push_back(view.cursors);
+    if (view.cursors.empty())
+        view.cursor_history.back().push_back({view.anchor, view.caret, float(view.caret_x), true});
+}
+
+// Add Cursor Above and Below: a caret a line up or down from each cursor, where Up and Down would take it.
+static void add_cursors_vertically(TextView &view, bool down)
+{
+    save_cursors(view);
+    begin_cursors(view);
+    uint32_t caret = view.caret, anchor = view.anchor;
+    qreal caret_x = view.caret_x;
+    size_t count = view.cursors.size();
+    view.cursors.reserve(count * 2);
+    for (size_t index = 0; index < count && view.cursors.size() < CURSOR_LIMIT; ++index) {
+        view.caret = view.anchor = view.cursors[index].head;
+        view.caret_x = view.cursors[index].goal;
+        uint32_t line = caret_line(view);
+        move_caret(view, down ? CaretMove::Down : CaretMove::Up, false);
+        view.cursors[index].goal = float(view.caret_x);
+        if (caret_line(view) != line)
+            view.cursors.push_back({view.caret, view.caret, float(view.caret_x), false});
+    }
+    view.caret = caret;
+    view.anchor = anchor;
+    view.caret_x = caret_x;
+    publish_cursors(view);
+}
+
+// Add Next Occurrence and Select All Occurrences: the selected text, or the word at the caret, selected again where
+// it comes next after the last one added, going around past the end, or everywhere.
+static void add_occurrences(TextView &view, bool all)
+{
+    std::u16string_view units(view.text.units.data(), view.text.units.size());
+    uint32_t size = uint32_t(units.size());
+    save_cursors(view);
+    begin_cursors(view);
+
+    // The first time, the primary cursor's selection is what to look for, or the word around it, which that time
+    // only gets selected.
+    if (view.occurrence.empty()) {
+        uint32_t start = selection_start(view), end = selection_end(view);
+        bool word = start == end;
+        while (word && start > 0 && is_word_unit(units[start - 1]))
+            --start;
+        while (word && end < size && is_word_unit(units[end]))
+            ++end;
+        if (start == end) {
+            view.cursor_history.pop_back();
+            publish_cursors(view);
+            return;
+        }
+        view.occurrence.assign(units.substr(start, end - start));
+        view.occurrence_word = word;
+        view.occurrence_end = end;
+        if (word) {
+            for (Cursor &cursor : view.cursors) {
+                if (cursor.primary)
+                    cursor = {start, end, -1, true};
+            }
+            if (!all) {
+                publish_cursors(view);
+                return;
+            }
+        }
+    }
+
+    // Each match is a new cursor. Merging drops the ones the cursors already select.
+    uint32_t length = uint32_t(view.occurrence.size());
+    if (all) {
+        uint32_t at = find_occurrence(units, view.occurrence, 0, size, view.occurrence_word);
+        for (; at != OCCURRENCE_NOT_FOUND && view.cursors.size() < CURSOR_LIMIT; at = find_occurrence(units, view.occurrence, at + length, size, view.occurrence_word))
+            view.cursors.push_back({at, at + length, -1, false});
+    } else {
+        // The next match that no cursor selects yet, going around once.
+        uint32_t from = view.occurrence_end < size ? view.occurrence_end : size;
+        uint32_t at = find_occurrence(units, view.occurrence, from, size, view.occurrence_word);
+        if (at == OCCURRENCE_NOT_FOUND)
+            at = find_occurrence(units, view.occurrence, 0, from, view.occurrence_word);
+        bool taken = true;
+        for (uint32_t tries = 0; taken && at != OCCURRENCE_NOT_FOUND && tries < view.cursors.size(); ++tries) {
+            taken = false;
+            for (const Cursor &cursor : view.cursors)
+                taken |= cursor_start(cursor) == at && cursor_end(cursor) == at + length;
+            if (taken) {
+                at = find_occurrence(units, view.occurrence, at + length, size, view.occurrence_word);
+                if (at == OCCURRENCE_NOT_FOUND)
+                    at = find_occurrence(units, view.occurrence, 0, size, view.occurrence_word);
+            }
+        }
+        if (at != OCCURRENCE_NOT_FOUND && !taken && view.cursors.size() < CURSOR_LIMIT) {
+            view.cursors.push_back({at, at + length, -1, false});
+            view.occurrence_end = at + length;
+        }
+    }
+    publish_cursors(view);
+}
+
+// Add Cursors to Line Ends: a caret at the end of every line each selection covers.
+static void add_cursors_to_line_ends(TextView &view)
+{
+    save_cursors(view);
+    begin_cursors(view);
+    std::vector<Cursor> ends;
+    for (const Cursor &cursor : view.cursors) {
+        uint32_t start = cursor_start(cursor), end = cursor_end(cursor);
+        uint32_t first = line_of_offset(view.text, start), last = line_of_offset(view.text, end > start ? end - 1 : start);
+        for (uint32_t line = first; line <= last && ends.size() < CURSOR_LIMIT; ++line) {
+            uint32_t at = line_end(view, line);
+            ends.push_back({at, at, -1, ends.empty()});
+        }
+    }
+    view.cursors.swap(ends);
+    view.occurrence.clear();
+    publish_cursors(view);
+}
+
+static void undo_cursor_change(TextView &view)
+{
+    if (view.cursor_history.empty())
+        return;
+
+    view.cursors.swap(view.cursor_history.back());
+    view.cursor_history.pop_back();
+    uint32_t size = text_length(view);
+    for (Cursor &cursor : view.cursors) {
+        cursor.anchor = cursor.anchor < size ? cursor.anchor : size;
+        cursor.head = cursor.head < size ? cursor.head : size;
+    }
+    view.occurrence.clear();
+    publish_cursors(view);
+    ensure_caret_visible(view);
+}
+
+// Alt and a click adds a caret there, or takes away the cursor already there.
+static void add_cursor_at(TextView &view, uint32_t position)
+{
+    save_cursors(view);
+    begin_cursors(view);
+    size_t found = view.cursors.size();
+    for (size_t index = 0; index < view.cursors.size(); ++index) {
+        if (cursor_start(view.cursors[index]) <= position && position <= cursor_end(view.cursors[index]))
+            found = index;
+    }
+    if (found < view.cursors.size() && view.cursors.size() > 1) {
+        bool primary = view.cursors[found].primary;
+        view.cursors.erase(view.cursors.begin() + ptrdiff_t(found));
+        view.cursors[0].primary |= primary;
+    } else if (found == view.cursors.size() && view.cursors.size() < CURSOR_LIMIT) {
+        view.cursors.push_back({position, position, -1, false});
+    }
+    view.occurrence.clear();
+    publish_cursors(view);
+}
+
+// Moves every cursor the way the key moves the caret.
+static bool move_cursors_for_key(TextView &view, QKeyEvent *event)
+{
+    const KeyMove *found = nullptr;
+    for (const KeyMove &key_move : KEY_MOVES) {
+        if (event->matches(key_move.key)) {
+            found = &key_move;
+            break;
+        }
+    }
+    if (!found)
+        return false;
+
+    for (Cursor &cursor : view.cursors) {
+        view.caret = cursor.head;
+        view.anchor = cursor.anchor;
+        view.caret_x = cursor.goal;
+        CaretMove move = found->move;
+        uint32_t line = caret_line(view);
+        if (found->key == QKeySequence::SelectPreviousLine && line == 0)
+            move = CaretMove::Start;
+        if (found->key == QKeySequence::SelectNextLine && line + 1 == line_count(view))
+            move = CaretMove::End;
+        move_caret(view, move, found->keep_anchor);
+        cursor = {view.anchor, view.caret, float(view.caret_x), cursor.primary};
+    }
+    view.occurrence.clear();
+    publish_cursors(view);
+    ensure_caret_visible(view);
+    return true;
+}
+
+// Where one cursor's edit goes and where its selection ends up, in the text as that edit alone leaves it.
+struct CursorTyping {
+    uint32_t start, removed, inserted;
+    uint32_t selection_start, selection_end;
+};
+
+// Types, deletes, or pastes at every cursor at once: each cursor's edit planned against the same text, through the
+// typing rules when they apply, then made from the last to the first as one undo step. A paste with a line for each
+// cursor gives each its line.
+static void edit_cursors(TextView &view, TypingKey key, std::u16string_view typed, bool forward_delete, bool paste)
+{
+    std::u16string_view units(view.text.units.data(), view.text.units.size());
+    TypingSource source = typing_source(view);
+    std::vector<Vim::Text> parts = paste ? Vim::ClipboardParts(typed, view.cursors.size()) : std::vector<Vim::Text>();
+    bool rules = !forward_delete && !paste && (key != TypingKey::Character || (typed.size() == 1 && MayCompleteCharacter(typed[0])));
+
+    std::vector<Vim::CursorEdit> changes;
+    std::vector<CursorTyping> planned;
+    changes.reserve(view.cursors.size());
+    planned.reserve(view.cursors.size());
+    for (size_t index = 0; index < view.cursors.size(); ++index) {
+        uint32_t start = cursor_start(view.cursors[index]), end = cursor_end(view.cursors[index]);
+        std::optional<TypingPlan> plan;
+        if (rules)
+            plan = PlanTyping(source, view.text.language, typing_context(view, key, start), view.indentation, {}, {start, end - start}, key,
+                              typed.empty() ? 0 : typed[0]);
+
+        CursorTyping typing;
+        std::u16string text;
+        if (plan) {
+            typing.start = uint32_t(plan->range.location);
+            typing.removed = uint32_t(plan->range.length);
+            text = plan->text;
+            typing.selection_start = uint32_t(plan->selection.location);
+            typing.selection_end = uint32_t(plan->selection.end());
+        } else {
+            // Without a selection, Backspace takes the character before, a surrogate pair whole, and Delete the one after.
+            if ((key == TypingKey::Backspace || forward_delete) && start == end) {
+                if (forward_delete)
+                    end = next_position(view, end, QTextLayout::SkipCharacters);
+                else if (start > 0)
+                    start -= start > 1 && QChar::isLowSurrogate(units[start - 1]) && QChar::isHighSurrogate(units[start - 2]) ? 2 : 1;
+            } else if (key == TypingKey::Enter) {
+                text = u"\n";
+            } else if (key == TypingKey::Tab) {
+                text = u"\t";
+            } else if (key == TypingKey::Character) {
+                text = parts.size() == view.cursors.size() ? parts[index] : typed;
+            }
+            typing.start = start;
+            typing.removed = end - start;
+            typing.selection_start = typing.selection_end = start + uint32_t(text.size());
+        }
+        typing.inserted = uint32_t(text.size());
+        if (typing.removed || !text.empty())
+            changes.push_back({{typing.start, typing.start + typing.removed}, text});
+        planned.push_back(typing);
+    }
+
+    // The edits, from the last to the first so each one's place is still where it was planned.
+    Vim::EditBatch batch(std::move(changes));
+    if (!batch.edits.empty()) {
+        begin_undo_group(view.text, view.caret);
+        for (size_t index = batch.edits.size(); index-- > 0;) {
+            const Vim::CursorEdit &edit = batch.edits[index];
+            replace_text(view.text, uint32_t(edit.range.first), uint32_t(edit.range.size()), edit.text);
+        }
+        end_undo_group(view.text);
+    }
+
+    for (size_t index = 0; index < view.cursors.size(); ++index) {
+        const CursorTyping &typing = planned[index];
+        Cursor &cursor = view.cursors[index];
+        cursor.anchor = position_after_typing(typing.selection_start, typing.start, typing.removed, typing.inserted, batch);
+        cursor.head = position_after_typing(typing.selection_end, typing.start, typing.removed, typing.inserted, batch);
+        cursor.goal = -1;
+    }
+    view.typed_pairs.clear();
+    view.occurrence.clear();
+    react_to_text_change(view);
+    publish_cursors(view);
+    ensure_caret_visible(view);
+}
+
+// Copy puts each cursor's selection on its own line, which Paste gives back one to each cursor.
+static void copy_cursors(TextView &view)
+{
+    std::u16string copied;
+    bool selected = false;
+    for (size_t index = 0; index < view.cursors.size(); ++index) {
+        uint32_t start = cursor_start(view.cursors[index]), end = cursor_end(view.cursors[index]);
+        if (index)
+            copied += u'\n';
+        copied.append(view.text.units.data() + start, end - start);
+        selected |= start != end;
+    }
+    if (selected)
+        QApplication::clipboard()->setText(qstring_of(copied));
+}
+
+static void paste_at_cursors(TextView &view)
+{
+    const QMimeData *mime = QApplication::clipboard()->mimeData();
+    QString pasted = mime ? mime->text() : QString();
+    normalize_line_breaks(pasted);
+    if (!pasted.isEmpty())
+        edit_cursors(view, TypingKey::Character, view_of(pasted), false, true);
+}
+
+// The keys that act on every cursor. Any other key leaves only the primary cursor and acts on it.
+static bool handle_cursors_key(TextView &view, QKeyEvent *event)
+{
+    Qt::KeyboardModifiers modifiers = event->modifiers() & (Qt::ShiftModifier | Qt::ControlModifier | Qt::AltModifier | Qt::MetaModifier);
+    bool plain = !(modifiers & ~Qt::ShiftModifier);
+    if (event->key() == Qt::Key_Escape && !modifiers) {
+        clear_cursors(view);
+        return true;
+    }
+    if (move_cursors_for_key(view, event))
+        return true;
+
+    if (plain && event->key() == Qt::Key_Backspace)
+        edit_cursors(view, TypingKey::Backspace, {}, false, false);
+    else if (event->matches(QKeySequence::Delete))
+        edit_cursors(view, TypingKey::Character, {}, true, false);
+    else if (plain && (event->key() == Qt::Key_Return || event->key() == Qt::Key_Enter))
+        edit_cursors(view, TypingKey::Enter, {}, false, false);
+    else if (plain && (event->key() == Qt::Key_Backtab || (event->key() == Qt::Key_Tab && modifiers)))
+        edit_cursors(view, TypingKey::Backtab, {}, false, false);
+    else if (!modifiers && event->key() == Qt::Key_Tab)
+        edit_cursors(view, TypingKey::Tab, {}, false, false);
+    else if (event->matches(QKeySequence::Copy))
+        copy_cursors(view);
+    else if (event->matches(QKeySequence::Cut)) {
+        copy_cursors(view);
+        edit_cursors(view, TypingKey::Character, {}, false, false);
+    } else if (event->matches(QKeySequence::Paste))
+        paste_at_cursors(view);
+    else if (is_acceptable_input(*event))
+        edit_cursors(view, TypingKey::Character, view_of(event->text()), false, false);
+    else {
+        clear_cursors(view);
+        return false;
+    }
+    view.caret_on = true;
+    return true;
+}
+
 // QPlainTextEdit::keyPressEvent and QWidgetTextControlPrivate::keyPressEvent.
 static void handle_key(TextView &view, QKeyEvent *event)
 {
@@ -2290,6 +2683,19 @@ static void handle_key(TextView &view, QKeyEvent *event)
 // keys for them, cutting and selecting all from the menu leave the view where it is.
 static void run_edit_command(TextView &view, EditCommand command)
 {
+    // Copy, Cut, and Paste act on every cursor; the others leave only the primary one.
+    if (!view.cursors.empty()) {
+        if (command == EditCommand::Copy || command == EditCommand::Cut)
+            copy_cursors(view);
+        if (command == EditCommand::Cut)
+            edit_cursors(view, TypingKey::Character, {}, false, false);
+        if (command == EditCommand::Paste)
+            paste_at_cursors(view);
+        if (command == EditCommand::Copy || command == EditCommand::Cut || command == EditCommand::Paste)
+            return;
+        clear_cursors(view);
+    }
+
     switch (command) {
         case EditCommand::Undo:
         case EditCommand::Redo:
@@ -2397,6 +2803,13 @@ static void handle_mouse_press(TextView &view, QMouseEvent *event)
 
     view.press_point = point;
     commit_preedit(view);
+
+    // Alt and a click adds a cursor, or takes one away; any other click leaves one cursor.
+    if (event->modifiers() == Qt::AltModifier) {
+        add_cursor_at(view, hit_test(view, point));
+        return;
+    }
+    clear_cursors(view);
 
     if (view.triple_click.isActive() && (point - view.triple_click_point).manhattanLength() < QApplication::startDragDistance()) {
         move_caret(view, CaretMove::StartOfLine, false);
@@ -2539,6 +2952,7 @@ static uint32_t offset_after_edit(uint32_t at, uint32_t start, uint32_t end, uin
 // QWidgetTextControlPrivate::inputMethodEvent.
 static void handle_input_method(TextView &view, QInputMethodEvent *event)
 {
+    clear_cursors(view);
     QString current_preedit = composing_on(view, caret_line(view)) ? view.preedit : QString();
     bool getting_input = !event->commitString().isEmpty() || event->preeditString() != current_preedit || event->replacementLength() > 0;
     if (!getting_input && event->attributes().isEmpty()) {
@@ -2641,6 +3055,20 @@ static void handle_input_method(TextView &view, QInputMethodEvent *event)
 
 // The selections Qt drew under a line's text: the current line's background, the selected text, and in overwrite mode
 // the character under the caret drawn as a block.
+// The first cursor that ends at or after a place, which painting a line looks from.
+static size_t first_cursor_from(const TextView &view, uint32_t at)
+{
+    size_t low = 0, high = view.cursors.size();
+    while (low < high) {
+        size_t middle = (low + high) / 2;
+        if (cursor_end(view.cursors[middle]) < at)
+            low = middle + 1;
+        else
+            high = middle;
+    }
+    return low;
+}
+
 static QList<QTextLayout::FormatRange> line_selections(TextView &view, uint32_t line, bool caret_as_block)
 {
     QList<QTextLayout::FormatRange> selections;
@@ -2657,19 +3085,25 @@ static QList<QTextLayout::FormatRange> line_selections(TextView &view, uint32_t 
         selections.append(current);
     }
 
+    // The selection, and the other cursors' selections when there are more cursors.
+    QPalette::ColorGroup group = view.focused ? QPalette::Active : QPalette::Inactive;
+    QTextCharFormat selected;
+    selected.setBackground(view.palette().brush(group, QPalette::Highlight));
+    selected.setForeground(view.palette().brush(group, QPalette::HighlightedText));
+    QStyleOption option;
+    option.initFrom(view.viewport());
+    if (view.style()->styleHint(QStyle::SH_RichText_FullWidthSelection, &option, view.viewport()))
+        selected.setProperty(QTextFormat::FullWidthSelection, true);
+
     int selected_start = int(selection_start(view)) - int(start);
     int selected_end = int(selection_end(view)) - int(start);
-    if (selected_start < length && selected_end > 0 && selected_end > selected_start) {
-        QPalette::ColorGroup group = view.focused ? QPalette::Active : QPalette::Inactive;
-        QTextLayout::FormatRange selected = {selected_start, selected_end - selected_start, QTextCharFormat()};
-        selected.format.setBackground(view.palette().brush(group, QPalette::Highlight));
-        selected.format.setForeground(view.palette().brush(group, QPalette::HighlightedText));
-
-        QStyleOption option;
-        option.initFrom(view.viewport());
-        if (view.style()->styleHint(QStyle::SH_RichText_FullWidthSelection, &option, view.viewport()))
-            selected.format.setProperty(QTextFormat::FullWidthSelection, true);
-        selections.append(selected);
+    if (selected_start < length && selected_end > 0 && selected_end > selected_start)
+        selections.append({selected_start, selected_end - selected_start, selected});
+    for (size_t index = first_cursor_from(view, start); index < view.cursors.size() && cursor_start(view.cursors[index]) < start + uint32_t(length); ++index) {
+        const Cursor &cursor = view.cursors[index];
+        int first = int(cursor_start(cursor)) - int(start), last = int(cursor_end(cursor)) - int(start);
+        if (!cursor.primary && first < last && last > 0)
+            selections.append({first, last - first, selected});
     }
 
     if (caret_as_block) {
@@ -2721,11 +3155,18 @@ static void paint_text_weight(TextView &view, QPainter &painter, const QPaintEve
             int start = int(line_start(view, line));
             int selected_start = qMax(0, int(selection_start(view)) - start);
             int selected_end = qMin(int(line_text(view.text, line).size()), int(selection_end(view)) - start);
-            if (selected_start < selected_end) {
-                QPalette::ColorGroup group = view.focused ? QPalette::Active : QPalette::Inactive;
-                QTextCharFormat format;
-                format.setForeground(view.palette().brush(group, QPalette::HighlightedText));
+            QPalette::ColorGroup group = view.focused ? QPalette::Active : QPalette::Inactive;
+            QTextCharFormat format;
+            format.setForeground(view.palette().brush(group, QPalette::HighlightedText));
+            if (selected_start < selected_end)
                 selections.append({selected_start, selected_end - selected_start, format});
+            int line_length = int(line_text(view.text, line).size());
+            for (size_t index = first_cursor_from(view, uint32_t(start)); index < view.cursors.size() &&
+                 int(cursor_start(view.cursors[index])) < start + line_length; ++index) {
+                const Cursor &cursor = view.cursors[index];
+                int first = qMax(0, int(cursor_start(cursor)) - start), last = qMin(line_length, int(cursor_end(cursor)) - start);
+                if (!cursor.primary && first < last)
+                    selections.append({first, last - first, format});
             }
 
             painter.setOpacity(side_opacity);
@@ -2778,6 +3219,14 @@ static void paint_text(TextView &view, QPaintEvent *event)
             if ((draw_caret && !caret_as_block) || (caret_position < -1 && composing_on(view, line))) {
                 int at = caret_position < -1 ? layout.preeditAreaPosition() - (caret_position + 2) : caret_position - start;
                 layout.drawCursor(&painter, offset, at, CARET_WIDTH);
+            }
+
+            // The other cursors' carets blink with the caret.
+            for (size_t index = first_cursor_from(view, uint32_t(start)); caret_position >= 0 && index < view.cursors.size() &&
+                 cursor_start(view.cursors[index]) <= uint32_t(end); ++index) {
+                const Cursor &cursor = view.cursors[index];
+                if (!cursor.primary && cursor.head >= uint32_t(start) && cursor.head <= uint32_t(end))
+                    layout.drawCursor(&painter, offset, int(cursor.head) - start, CARET_WIDTH);
             }
         }
 
@@ -3377,6 +3826,14 @@ void TextView::scrollContentsBy(int dx, int)
 
 void TextView::keyPressEvent(QKeyEvent *event)
 {
+    if (!cursors.empty()) {
+        dismiss_completion(*this);
+        if (handle_cursors_key(*this, event)) {
+            event->accept();
+            return;
+        }
+    }
+
     bool open = completion && completion->isVisible();
     Qt::KeyboardModifiers modifiers = event->modifiers() & (Qt::ShiftModifier | Qt::ControlModifier | Qt::AltModifier | Qt::MetaModifier);
     if (open && !modifiers) {

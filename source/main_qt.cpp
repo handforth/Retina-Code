@@ -8,6 +8,9 @@
 #include "Lexer.cpp"
 #include "TextBuffer.cpp"
 #include "Typing.cpp"
+#include "Vim.cpp"
+#include "VimMulti.cpp"
+#include "Cursors.cpp"
 #include "RunText.cpp"
 #include "Run.cpp"
 

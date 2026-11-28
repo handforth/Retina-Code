@@ -268,6 +268,8 @@ enum Command {
     COMMAND_NEW_TAB, COMMAND_NEW_WINDOW, COMMAND_OPEN, COMMAND_SAVE, COMMAND_SAVE_AS, COMMAND_CLOSE_TAB, COMMAND_RUN, COMMAND_EXIT,
     COMMAND_UNDO, COMMAND_REDO, COMMAND_CUT, COMMAND_COPY, COMMAND_PASTE, COMMAND_SELECT_ALL, COMMAND_TOGGLE_COMMENT,
     COMMAND_SHOW_COMPLETIONS,
+    COMMAND_CURSOR_ABOVE, COMMAND_CURSOR_BELOW, COMMAND_CURSORS_TO_LINE_ENDS, COMMAND_NEXT_OCCURRENCE, COMMAND_ALL_OCCURRENCES,
+    COMMAND_UNDO_CURSORS,
     COMMAND_ZOOM_IN, COMMAND_ZOOM_OUT, COMMAND_RESET_ZOOM, COMMAND_THEME, COMMAND_TEXT_APPEARANCE, COMMAND_OUTPUT,
 };
 
@@ -366,7 +368,10 @@ static void update_position(EditorWindow &window)
     }
 
     uint32_t line = caret_line(*view);
-    window.position_label->setText(QStringLiteral("Ln %1, Col %2").arg(line + 1).arg(view->caret - line_start(*view, line) + 1));
+    QString position = QStringLiteral("Ln %1, Col %2").arg(line + 1).arg(view->caret - line_start(*view, line) + 1);
+    if (!view->cursors.empty())
+        position += QStringLiteral("  ·  %1 cursors").arg(view->cursors.size());
+    window.position_label->setText(position);
 }
 
 // The caret's place, and the encoding and font size, which change only with the tab and the zoom.
@@ -1115,6 +1120,17 @@ static EditorWindow *create_window(const EditorWindow *opener)
     add_command(edit_menu, "Show &Completions", COMMAND_SHOW_COMPLETIONS, QKeySequence(Qt::CTRL | Qt::Key_Space), QKeySequence::UnknownKey);
 #endif
 
+    // The keys are Visual Studio Code's. On macOS Qt::CTRL is Command and Qt::ALT is Option.
+    QMenu *selection_menu = window->menuBar()->addMenu(QStringLiteral("&Selection"));
+    add_command(selection_menu, "Add Cursor &Above", COMMAND_CURSOR_ABOVE, QKeySequence(Qt::CTRL | Qt::ALT | Qt::Key_Up), QKeySequence::UnknownKey);
+    add_command(selection_menu, "Add Cursor &Below", COMMAND_CURSOR_BELOW, QKeySequence(Qt::CTRL | Qt::ALT | Qt::Key_Down), QKeySequence::UnknownKey);
+    add_command(selection_menu, "Add Cursors to &Line Ends", COMMAND_CURSORS_TO_LINE_ENDS, QKeySequence(Qt::SHIFT | Qt::ALT | Qt::Key_I),
+                QKeySequence::UnknownKey);
+    add_command(selection_menu, "Add &Next Occurrence", COMMAND_NEXT_OCCURRENCE, QKeySequence(Qt::CTRL | Qt::Key_D), QKeySequence::UnknownKey);
+    add_command(selection_menu, "Select All &Occurrences", COMMAND_ALL_OCCURRENCES, QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_L),
+                QKeySequence::UnknownKey);
+    add_command(selection_menu, "&Undo Cursor Change", COMMAND_UNDO_CURSORS, QKeySequence(Qt::CTRL | Qt::Key_U), QKeySequence::UnknownKey);
+
     // Zoom In takes Control+= too, the same key without Shift on most layouts.
     QMenu *view_menu = window->menuBar()->addMenu(QStringLiteral("&View"));
     QAction *zoom_in = add_command(view_menu, "Zoom &In", COMMAND_ZOOM_IN, none, QKeySequence::ZoomIn);
@@ -1199,12 +1215,39 @@ void EditorWindow::command_chosen(QAction *action)
         case COMMAND_SELECT_ALL: run_edit_menu_command(*this, EditCommand::SelectAll); break;
 
         case COMMAND_TOGGLE_COMMENT:
-            if (view)
+            if (view) {
+                clear_cursors(*view);
                 toggle_line_comment(*view);
+            }
+            break;
+
+        case COMMAND_CURSOR_ABOVE:
+        case COMMAND_CURSOR_BELOW:
+            if (view)
+                add_cursors_vertically(*view, action->data().toInt() == COMMAND_CURSOR_BELOW);
+            break;
+
+        case COMMAND_CURSORS_TO_LINE_ENDS:
+            if (view)
+                add_cursors_to_line_ends(*view);
+            break;
+
+        case COMMAND_NEXT_OCCURRENCE:
+        case COMMAND_ALL_OCCURRENCES:
+            if (view) {
+                add_occurrences(*view, action->data().toInt() == COMMAND_ALL_OCCURRENCES);
+                ensure_caret_visible(*view);
+            }
+            break;
+
+        case COMMAND_UNDO_CURSORS:
+            if (view)
+                undo_cursor_change(*view);
             break;
 
         case COMMAND_SHOW_COMPLETIONS:
             if (view) {
+                clear_cursors(*view);
                 view->setFocus(Qt::ShortcutFocusReason);
                 show_completions(*view, 0);
             }

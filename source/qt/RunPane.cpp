@@ -55,6 +55,7 @@ struct RunOutput : QPlainTextEdit {
     void insertFromMimeData(const QMimeData *source) override;
     void mouseMoveEvent(QMouseEvent *event) override;
     void mouseReleaseEvent(QMouseEvent *event) override;
+    bool event(QEvent *event) override;
     void update_input();
 };
 
@@ -614,6 +615,19 @@ void RunOutput::insertFromMimeData(const QMimeData *source)
         cursor.insertText(text, QTextCharFormat());
         setTextCursor(cursor);
     }
+}
+
+// While the program reads, the end of input key is the output's, not the window's Add Next Occurrence.
+bool RunOutput::event(QEvent *event)
+{
+    if (event->type() == QEvent::ShortcutOverride && !pane->input_start.isNull()) {
+        QKeyEvent *key = static_cast<QKeyEvent *>(event);
+        if (key->key() == Qt::Key_D && key->modifiers() == END_OF_INPUT_MODIFIER) {
+            event->accept();
+            return true;
+        }
+    }
+    return QPlainTextEdit::event(event);
 }
 
 // Links show the pointing hand, and a click on one that selects nothing opens the place it names.
