@@ -14,8 +14,12 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v5
+      # aqtinstall doesn't read the per-compiler folders Qt uses on Windows yet, so this takes qtbase from Qt's
+      # server, which unpacks to C:\Qt\6.12.1\msvc2022_64.
       - name: Install Qt
-        run: pipx run --spec aqtinstall aqt install-qt windows desktop 6.12.1 win64_msvc2022_64 --outputdir 'C:\Qt' 2>&1 | tee -a log.txt; exit ${PIPESTATUS[0]}
+        run: |
+          curl -fsSL -o qtbase.7z https://download.qt.io/online/qtsdkrepository/windows_x86/desktop/qt6_6121/qt6_6121_msvc2022_64/qt.qt6.6121.win64_msvc2022_64/6.12.1-0-202611180427qtbase-Windows-Windows_11_24H2-MSVC2022-Windows-Windows_11_24H2-X86_64.7z 2>&1 | tee -a log.txt
+          7z x -y -o'C:\Qt' qtbase.7z 2>&1 | tail -n 5 | tee -a log.txt; exit ${PIPESTATUS[0]}
       - name: Find Visual Studio
         shell: pwsh
         run: |
@@ -35,6 +39,9 @@ jobs:
       - uses: actions/checkout@v5
       - name: Install Qt
         run: pipx run --spec aqtinstall aqt install-qt linux desktop 6.12.1 linux_gcc_64 --outputdir "$HOME/Qt" 2>&1 | tee -a log.txt; exit ${PIPESTATUS[0]}
+      # Qt's libraries link against the system's OpenGL and keyboard libraries, which the runner doesn't have.
+      - name: Install libraries
+        run: sudo apt-get install -y libegl1 libgl1 libopengl0 libxkbcommon0 2>&1 | tee -a log.txt; exit ${PIPESTATUS[0]}
       - name: Build Qt
         run: ./build_linux_qt.sh 2>&1 | tee -a log.txt; exit ${PIPESTATUS[0]}
       - name: Show the log
